@@ -996,7 +996,18 @@ ASAN_TEST_EXECUTABLES := $(addprefix $(ASAN_APP_DIR)/,$(addsuffix $(EXE_EXTENSIO
 # LD_PRELOAD for its own reasons (libgtk3-nocsd, for instance) puts something
 # ahead of it and every sanitized binary refuses to start, so put the runtime
 # back in front rather than discarding whatever the user had set.
+#
+# Under clang there is no such runtime to put first: clang links its sanitizer
+# runtime into each executable, and `clang -print-file-name=libasan.so` answers
+# with the bare name, which the loader then resolves to GCC's libasan and
+# refuses with "incompatible ASan runtimes". Measured with this library's tests:
+# a clang ASan build runs clean with LD_PRELOAD set to libgtk3-nocsd.
+ASAN_CC_IS_CLANG := $(shell $(CC) -dM -E -x c /dev/null 2>/dev/null | grep -c __clang__)
+ifeq ($(ASAN_CC_IS_CLANG),0)
 ASAN_RUNTIME := $(shell $(CC) -print-file-name=libasan.so 2>/dev/null)
+else
+ASAN_RUNTIME :=
+endif
 
 test-asan: ## Build with ASan+UBSan and run the test suite
 test-asan: $(ASAN_TEST_EXECUTABLES)
