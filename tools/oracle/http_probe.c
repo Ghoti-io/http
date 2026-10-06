@@ -44,12 +44,15 @@
  * process, and a GoogleTest binary cannot be piped into a comparison.
  */
 
-#define _POSIX_C_SOURCE 200809L
-
 #include <ghoti.io/http/http.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 typedef struct {
   char * data;
@@ -245,14 +248,49 @@ static void run_case(const char * id, int is_response, const char * method,
   free(r.body.data);
 }
 
+// One line, any length, without getline (which Windows has not got, and which
+// -std=c17 does not declare under mingw). Returns its length without the
+// newline, or -1 at the end of input with nothing read.
+static long read_line(char ** line, size_t * cap, FILE * in) {
+  size_t len = 0;
+  for (;;) {
+    if (*cap - len < 2) {
+      size_t grown = *cap ? *cap * 2 : 4096;
+      char * bigger = realloc(*line, grown);
+      if (!bigger) {
+        fputs("http_probe: out of memory\n", stderr);
+        exit(2);
+      }
+      *line = bigger;
+      *cap = grown;
+    }
+    if (!fgets(*line + len, (int)(*cap - len), in)) {
+      break;
+    }
+    len += strlen(*line + len);
+    if (len > 0 && (*line)[len - 1] == '\n') {
+      (*line)[--len] = '\0';
+      return (long)len;
+    }
+  }
+  if (len == 0) {
+    return -1;
+  }
+  (*line)[len] = '\0';
+  return (long)len;
+}
+
 int main(void) {
+#ifdef _WIN32
+  // The answers are compared byte for byte with another platform's: no CRLF
+  // translation on either stream.
+  _setmode(_fileno(stdin), _O_BINARY);
+  _setmode(_fileno(stdout), _O_BINARY);
+#endif
   char * line = NULL;
   size_t cap = 0;
-  ssize_t got;
-  while ((got = getline(&line, &cap, stdin)) > 0) {
-    if (line[got - 1] == '\n') {
-      line[--got] = '\0';
-    }
+  long got;
+  while ((got = read_line(&line, &cap, stdin)) >= 0) {
     char * f[5];
     char * at = line;
     int i;

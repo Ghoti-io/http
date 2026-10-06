@@ -813,8 +813,27 @@ def all_cases(seed=1, count=2500, fuzz_dir=None):
     return cases
 
 
+def dump(path, cases):
+    """The corpus in http_probe's input format, both ways of feeding it: one
+    line per (case, split). tools/xarch/http.sh and tools/xwin/http.sh run the
+    probe built for each target over this file."""
+    with open(path, "w") as out:
+        for c in cases:
+            for split in ("whole", "byte"):
+                out.write("%d\t%s\t%s\t%s\t%s\n" % (
+                    c["id"], c["kind"], c["method"], split, c["data"].hex()))
+
+
 if __name__ == "__main__":
+    import argparse
     import collections
-    cs = all_cases()
+    ap = argparse.ArgumentParser(description="Summarise the corpus, or write it for http_probe.")
+    ap.add_argument("--dump", metavar="FILE", help="write http_probe input to FILE")
+    ap.add_argument("--count", type=int, default=250000)
+    ap.add_argument("--seed", type=int, default=1)
+    args = ap.parse_args()
+    cs = all_cases(args.seed, args.count)
+    if args.dump:
+        dump(args.dump, cs)
     c = collections.Counter(x["tag"].split(":")[0] for x in cs)
-    print(len(cs), dict(c))
+    print(len(cs), "cases", dict(c) if not args.dump else "written to " + args.dump)
