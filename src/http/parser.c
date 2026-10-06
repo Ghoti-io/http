@@ -53,7 +53,6 @@ typedef enum {
 
 typedef enum {
   SZ_DIGITS,  // hex digits
-  SZ_BWS,     // whitespace before an extension
   SZ_EXT,     // inside the extensions
   SZ_LF       // the CR has been read
 } SizeState;
@@ -502,9 +501,12 @@ static int hex_value(unsigned char c) {
 }
 
 // A chunk-size line is judged a byte at a time with no buffer:
-//   chunk-size [ BWS ";" extensions ] CRLF
-// Whitespace is allowed only where a ";" must follow it, so "5 \r\n" is
-// refused as the grammar has it rather than guessed at.
+//   chunk-size [ ";" extensions ] CRLF
+// No whitespace is allowed before the ";". RFC 9112 section 7.1.1 writes BWS
+// there, but "5 ;a" is the shape llhttp, h11 and Go's net/http all refuse (the
+// differential in tools/oracle found it was the one chunk-size form this
+// library took that none of them did), and a chunk-size line is exactly where
+// parsers have disagreed about framing, so it is refused.
 static GHTTP_Result chunk_size_byte(GHTTP_Parser * p, unsigned char c) {
   if (c == '\0') {
     return GHTTP_ERR_CORRUPT;
@@ -516,7 +518,7 @@ static GHTTP_Result chunk_size_byte(GHTTP_Parser * p, unsigned char c) {
     return GHTTP_OK; // the caller sees sz == SZ_LF and finishes the line
   }
   if (c == '\r') {
-    if (p->sz == SZ_BWS || (p->sz == SZ_DIGITS && p->sz_digits == 0)) {
+    if (p->sz == SZ_DIGITS && p->sz_digits == 0) {
       return GHTTP_ERR_CORRUPT;
     }
     p->sz = SZ_LF;
@@ -543,21 +545,8 @@ static GHTTP_Result chunk_size_byte(GHTTP_Parser * p, unsigned char c) {
         p->sz = SZ_EXT;
         return GHTTP_OK;
       }
-      if (c == ' ' || c == '\t') {
-        p->sz = SZ_BWS;
-        return GHTTP_OK;
-      }
       return GHTTP_ERR_CORRUPT;
     }
-    case SZ_BWS:
-      if (c == ' ' || c == '\t') {
-        return GHTTP_OK;
-      }
-      if (c == ';') {
-        p->sz = SZ_EXT;
-        return GHTTP_OK;
-      }
-      return GHTTP_ERR_CORRUPT;
     case SZ_EXT:
       if (c == '\n' || (c < 0x20 && c != '\t') || c == 0x7f) {
         return GHTTP_ERR_CORRUPT;

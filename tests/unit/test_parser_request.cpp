@@ -420,6 +420,7 @@ TEST(RequestChunked, RefusesMalformedSizeLines) {
       crlf("POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n");
   for (const char * line : {"\r\n", "x\r\n", "-1\r\n", "+1\r\n", "0x5\r\n",
            "5x\r\n", " 5\r\n", "5 \r\n", "5\t\r\n", "5 x\r\n", "5;\x01\r\n",
+           "5 ;a=b\r\n", "5\t;a\r\n", "5  ;\r\n",
            "5\n", "5\rx", "5;a\nb\r\n", "g\r\n", "\xc3\xa9\r\n", "5;a\x7f\r\n"}) {
     EXPECT_EQ(result_of(head + line + "hello\r\n0\r\n\r\n"),
         GHTTP_ERR_CORRUPT)
