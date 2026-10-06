@@ -1,0 +1,255 @@
+# Every disagreement between this library and a reference that the differential
+# (diff.py) is allowed to see, and why.
+#
+# Five tab-separated fields:
+#
+#   tag    which cases: fnmatch pattern against the case's tag (corpus.py). Hand
+#          cases are named for the rule they hold; generated cases are
+#          gen:<operation>[:<value>]@<where in the message the first changed byte
+#          is>.
+#   ref    llhttp, h11, gohttp, or * for any
+#   kind   how the two answers differ: <ours>/<reference>[+what], where the ends
+#          are clean, upgrade, incomplete or error, and `what` is count, start,
+#          headers, body or trailers. fnmatch pattern; `error/*` is "this library
+#          refuses and the reference does not", whatever else differs
+#   class  one of the classes in diff.py's CLASSES
+#   note   what is going on, in a sentence
+#
+# The first matching line wins, so a specific line goes before a general one.
+# A line that explains no disagreement makes the run fail: this file cannot
+# accumulate lines for things that stopped happening.
+#
+# The generated cases are one mutation of a valid message each, so a
+# disagreement on one is about that mutation and nothing else; that is what
+# lets a line here speak for a whole family of them. The families were checked
+# by listing the cases behind each line (notes/http/README.md has the counts).
+
+# ======================= hand cases: llhttp =================================
+leading-empty-lines-lf	llhttp	error/*	policy	a bare LF is refused wherever it occurs, including as an empty line before the request (section 2.2 lets a recipient accept it)
+cl-list-same	llhttp	clean/*	ref-strict	llhttp refuses a Content-Length list even of identical values (RFC 9110 section 8.6 reads it as one length)
+cl-dup-same	llhttp	clean/*	ref-strict	llhttp refuses two Content-Length fields of the same value
+cl-ws-comma	llhttp	clean/*	ref-strict	whitespace around the comma of a list is legal list syntax
+method-lower	llhttp	clean/*	ref-strict	llhttp accepts only its closed list of methods; any token is a method
+method-unknown	llhttp	clean/*	ref-strict	llhttp accepts only its closed list of methods
+te-empty	llhttp	error/*	ref-lenient	an empty Transfer-Encoding is not a list of at least one coding (RFC 9112 section 6.1)
+te-http10	*	error/*	policy	Transfer-Encoding in an HTTP/1.0 message is refused (section 6.1)
+cl-max	llhttp	error/incomplete	ref-limit	a Content-Length over this library's max_body_bytes is refused at the head
+host-missing	*	error/*	policy	an HTTP/1.1 request without exactly one Host is refused (section 3.2)
+host-dup	*	error/*	policy	an HTTP/1.1 request without exactly one Host is refused (section 3.2)
+host-dup-same	*	error/*	policy	an HTTP/1.1 request without exactly one Host is refused (section 3.2)
+host-absolute-missing	*	error/*	policy	an HTTP/1.1 request without exactly one Host is refused, in absolute-form too
+sp-double	*	error/*	policy	one SP between the parts of a start line; section 3 lets a recipient be more liberal
+version-missing	llhttp	error/*	ref-lenient	llhttp reads a request line with no version as HTTP/0.9
+version-2	*	error/*	policy	a version other than 1.0 and 1.1 is UNSUPPORTED, not parsed
+version-09	*	error/*	policy	a version other than 1.0 and 1.1 is UNSUPPORTED, not parsed
+version-12	*	error/*	policy	a version other than 1.0 and 1.1 is UNSUPPORTED, not parsed
+version-pri	*	error/*	policy	the HTTP/2 preface is reported as an unsupported version
+target-asterisk-get	*	error/*	ref-lenient	the asterisk target is for OPTIONS alone
+target-authority-get	*	error/*	ref-lenient	authority-form is for CONNECT alone
+target-no-slash	*	error/*	ref-lenient	"abc" is none of the four request-target forms
+target-connect-origin	*	error/*	ref-lenient	a CONNECT target is authority-form alone
+target-connect-absolute	*	error/*	ref-lenient	a CONNECT target is authority-form alone
+chunk-ext-empty	llhttp	clean/*	ref-strict	llhttp wants an extension name after the semicolon; this library skips extensions and checks only for control bytes
+status-101-no-upgrade	llhttp	upgrade/*	ref-model	llhttp starts a tunnel only for a 101 that carries Connection: upgrade
+status-101-no-upgrade	llhttp	split	ref-split	llhttp reads the bytes after such a 101 differently whole and byte by byte
+status-no-sp	*	error/*	policy	the SP after the status code is required even with no reason (section 4)
+status-099	*	error/*	policy	a status code below 100 is refused
+status-000	*	error/*	policy	a status code below 100 is refused
+reason-ctl	*	error/*	ref-lenient	a control byte in a reason phrase is not in the grammar
+reason-nul	*	error/*	ref-lenient	a NUL in a reason phrase is not in the grammar
+leading-empty-lines	llhttp	error/*	ref-lenient	only a request may begin with an empty line (section 2.2); llhttp skips it before a response too
+te-gzip-only	*	error/*	policy	a response Transfer-Encoding not ending in chunked is refused; section 6.3 would read to the end of the connection
+fixture:*	llhttp	incomplete/error	timing	a start line judged at its end rather than at the offending byte
+
+te-trailing-ows	llhttp	clean/*	ref-bug	llhttp does not trim a trailing HTAB from the value "chunked": a request is refused and a response is read to the end of the connection, where this library, h11 and Go read it as chunked (RFC 9110 section 5.5: OWS includes HTAB)
+
+# ======================= hand cases: h11 ====================================
+leading-empty-lines	h11	clean/*	ref-strict	section 2.2 says a server SHOULD ignore at least one empty line before a request; h11 refuses it
+only-crlf	h11	clean/*	ref-strict	section 2.2: an empty line alone is ignorable
+rfc9112-2.2	h11	clean/*	ref-strict	section 2.2: empty lines before a request are ignorable
+cl-list-same	h11	clean/clean+headers	scope	h11 rewrites a repeated or list Content-Length to its one value, so the field cannot be compared (the body read is the same)
+cl-dup-same	h11	clean/clean+headers	scope	h11 rewrites a repeated or list Content-Length to its one value
+cl-ws-comma	h11	clean/clean+headers	scope	h11 rewrites a list Content-Length to its one value
+te-case	h11	clean/clean+headers	scope	h11 lower-cases the Transfer-Encoding value
+te-gzip-chunked	h11	clean/*	ref-strict	h11 implements no transfer coding but chunked
+te-two-fields	h11	clean/*	ref-strict	h11 implements no transfer coding but chunked
+te-empty-element	h11	clean/*	ref-strict	an empty list element is legal and ignored (RFC 9110 section 5.6.1.2)
+rfc9112-6.1	h11	clean/*	ref-strict	h11 implements no transfer coding but chunked
+method-token-chars	*	error/*	policy	the asterisk target belongs to OPTIONS alone (section 3.2.4)
+cl-te	*	error/*	policy	Content-Length with Transfer-Encoding is refused; section 6.3 lets a recipient process it with Transfer-Encoding winning
+cl-te-smuggle	*	error/*	policy	Content-Length with Transfer-Encoding is refused; section 6.3 lets a recipient process it with Transfer-Encoding winning
+te-obs-fold	*	error/*	policy	an obsolete line fold is refused (section 5.2 allows that or unfolding it); the reference unfolds it
+obs-fold	*	error/*	policy	an obsolete line fold is refused (section 5.2 allows that or unfolding it); the reference unfolds it
+obs-fold-tab	*	error/*	policy	an obsolete line fold is refused (section 5.2 allows that or unfolding it); the reference unfolds it
+rfc9112-5.2	*	error/*	policy	an obsolete line fold is refused (section 5.2 allows that or unfolding it); the reference unfolds it
+cl-overflow	h11	error/incomplete	ref-limit	a Content-Length above 64 bits is refused at the head; h11 has no limit and waits for the body
+cl-max	h11	error/incomplete	ref-limit	a Content-Length over this library's max_body_bytes is refused at the head
+cl-2-64	h11	error/incomplete	ref-limit	a Content-Length above 64 bits is refused at the head
+chunk-huge	*	error/incomplete	ref-limit	a chunk size over max_chunk_size is refused at its line; the reference waits for the data
+chunk-2-64	*	error/incomplete	ref-limit	a chunk size above 64 bits is refused at its line
+bare-lf-*	*	error/*	policy	a bare LF is refused wherever it occurs (section 2.2 lets a recipient accept it; it is the byte parsers disagree about)
+ctl-value	*	error/*	ref-lenient	a control byte in a field value is not in the grammar
+del-value	*	error/*	ref-lenient	DEL in a field value is not in the grammar
+empty-line-after	h11	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
+empty-line-after	gohttp	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
+only-crlf	gohttp	clean/*	ref-strict	section 2.2: an empty line alone is ignorable
+upgrade-no-connection	h11	clean/upgrade	ref-model	h11 treats an Upgrade field alone as a proposal to switch; llhttp and this library need Connection: upgrade
+chunk-trail-space	*	error/*	ref-lenient	the chunk size is followed by whitespace and no extension, which no production allows
+chunk-ext-badchar	*	error/*	ref-lenient	a control byte in a chunk extension is not in the grammar
+chunk-trailer-cl	*	error/*	policy	a Content-Length trailer is refused (RFC 9110 section 6.5.1 lets a recipient ignore or refuse it)
+chunk-trailer-te	*	error/*	policy	a Transfer-Encoding trailer is refused (RFC 9110 section 6.5.1 lets a recipient ignore or refuse it)
+chunk-trailer-fold	*	error/*	policy	an obsolete line fold is refused in a trailer too
+chunk-trailer-ctl	*	error/*	ref-lenient	a control byte in a trailer value is not in the grammar
+chunk-trailer-badname	*	error/*	ref-lenient	a trailer name that is not a token
+te-chunked-cl	*	error/*	policy	Content-Length with Transfer-Encoding is refused in a response too
+
+# ======================= hand cases: Go net/http ============================
+leading-empty-lines	gohttp	clean/*	ref-strict	section 2.2 says a server SHOULD ignore at least one empty line before a request
+rfc9112-2.2	gohttp	clean/*	ref-strict	section 2.2: empty lines before a request are ignorable
+cl-list-same	gohttp	clean/*	ref-strict	Go refuses a Content-Length list even of identical values
+cl-ws-comma	gohttp	clean/*	ref-strict	Go refuses a Content-Length list even of identical values
+target-pct	gohttp	clean/*	ref-strict	Go parses the target as a URL and refuses a bad percent escape; this library keeps the target verbatim and leaves its decoding to the caller
+te-gzip-chunked	gohttp	clean/*	ref-strict	Go implements no transfer coding but chunked
+te-two-fields	gohttp	clean/*	ref-strict	Go implements no transfer coding but chunked
+te-empty-element	gohttp	clean/*	ref-strict	an empty list element is legal and ignored
+rfc9112-6.1	gohttp	clean/*	ref-strict	Go implements no transfer coding but chunked
+te-space-colon	gohttp	error/*	ref-lenient	Go trims whitespace before a field's colon, so "Transfer-Encoding : chunked" is read as a Transfer-Encoding (section 5.1: a server MUST refuse it) - a smuggling shape
+cl-space-colon	gohttp	error/*	ref-lenient	Go trims whitespace before a field's colon (section 5.1: a server MUST refuse it)
+space-before-colon	gohttp	error/*	ref-lenient	Go trims whitespace before a field's colon (section 5.1: a server MUST refuse it)
+name-space	gohttp	error/*	ref-lenient	Go accepts a field name with a space in it
+cl-empty	gohttp	error/error+count	ref-lenient	Go reads an empty Content-Length as no Content-Length, so the body bytes become the next request - a smuggling shape
+high-target	gohttp	error/*	policy	a request target with a byte of 0x80 or above is refused
+connect-200	gohttp	upgrade/*	ref-model	Go reads the bytes after a 2xx to CONNECT as the response body; a tunnel is not a body
+connect-200-cl	gohttp	upgrade/*	ref-model	Go reads the bytes after a 2xx to CONNECT as the response body
+status-double-space	gohttp	error/*	policy	one SP between the version and the status code
+
+# ======================= fixtures, seeds and RFC examples ===================
+# Each fixture is a message one of this library's own unit tests asserts is
+# refused or accepted by a rule in documentation/rfc9112.md, so a difference
+# from a reference on one is that rule against the reference's leniency; the
+# kinds below are the whole population, and the rules above name the individual
+# shapes where a hand case holds the same one.
+fixture:*	*	error/*	policy	a unit-test fixture holding a refusal this library documents; the reference accepts it or reads on
+fixture:*	*	clean/*	ref-strict	a unit-test fixture this library accepts and the reference refuses or does not model (see the hand cases above for the shapes)
+fixture:*	*	upgrade/*	ref-model	a fixture asking for a tunnel or an upgrade
+seed:*	*	upgrade/*	ref-model	a seed asking for a tunnel or an upgrade
+seed:resp-101.see	llhttp	split	ref-split	llhttp reads the bytes after a 101 without Connection: upgrade differently whole and byte by byte
+
+# ======================= generated cases ====================================
+# One mutation of a valid message each. The families, by what the mutation does.
+
+# ---- line endings ----
+gen:cr-only*	*	error/incomplete*	ref-late	the reference reads a CR that is not followed by LF as part of the line and refuses at the head's end
+gen:cr-only*	gohttp	error/*	ref-lenient	Go keeps a bare CR as part of a field value or reason phrase
+gen:lf-only*	*	error/*	policy	a bare LF is refused wherever it occurs; Go and h11 accept it (section 2.2)
+gen:delete-cr*	*	error/*	policy	a deleted CR leaves a bare LF, which is refused wherever it occurs
+gen:*-byte:%0a*	*	error/*	policy	an LF inserted or substituted is a bare LF
+gen:*-byte:%0d*	*	error/*	ref-lenient	a CR inserted or substituted that is not followed by LF; Go and h11 keep it in the line
+gen:*-byte:*@crlf	h11	error/incomplete*	ref-late	the line ending was damaged; h11 refuses when the head ends
+gen:*-byte:*@head-end	h11	error/incomplete*	ref-late	the head's end was damaged; h11 refuses when the head ends
+gen:*-byte:*@crlf	gohttp	error/*	ref-lenient	Go accepts a line ending damaged by a byte it keeps in the line
+gen:*-byte*@head-end	gohttp	error/*	ref-lenient	Go accepts a head's end damaged by a byte it keeps in the line
+gen:*-byte*@crlf	llhttp	error/*	ref-lenient	llhttp keeps the byte in the line
+gen:*-byte*@crlf	h11	error/*	ref-lenient	h11 keeps the byte in the line
+gen:delete-byte@crlf	*	error/*	policy	a deleted CR or LF leaves a bare LF or a bare CR
+gen:delete-byte@head-end	*	error/*	policy	a deleted CR or LF leaves a bare LF or a bare CR
+gen:delete-byte@start-space	*	error/*	ref-lenient	a start line with a part missing; the reference reads what is left as a request line or an HTTP/0.9 one
+gen:delete-byte@start-method	*	clean/*	ref-strict	llhttp and Go keep only methods they know; any token is a method
+gen:delete-byte@start-method	*	error/*	ref-lenient	a start line with a damaged method; the asterisk target needs OPTIONS
+gen:delete-byte@field-value:transfer-encoding	*	error/*	policy	a coding that is not chunked, last, is refused
+gen:*-byte:*@start-method	*	clean/*	ref-strict	llhttp and Go keep only methods they know; any token is a method
+gen:*-byte:*@start-method	*	error/*	ref-lenient	a method the reference accepts and this library refuses (a non-token byte, or the asterisk target on a method that is not OPTIONS)
+gen:*-byte:*@start-target	*	error/*	policy	a byte outside printable ASCII in the target is refused
+gen:*-byte:*@start-target	*	clean/*	ref-strict	llhttp and Go parse the target as a URL and refuse a bad percent escape or a #; this library keeps the target verbatim and leaves it to the caller
+gen:*-byte:*@start-reason	*	error/*	ref-lenient	a control byte in a reason phrase is not in the grammar
+gen:*-byte:*@start-space	*	error/*	ref-lenient	a start line with a part missing or doubled
+gen:*-byte:*@field-value:*	*	error/*	ref-lenient	a control byte in a field value is not in the grammar
+gen:*-byte:*@field-name:*	*	error/*	ref-lenient	a byte that is not a token character in a field name
+gen:*-byte:*@chunk-ext	*	error/*	ref-lenient	a control byte in a chunk extension is not in the grammar
+
+# ---- empty lines ----
+gen:delete-byte@start-target	*	error/*	ref-lenient	a target with its leading slash gone is none of the four forms (section 3.2); the reference reads it
+gen:delete-byte@field-value:content-length	gohttp	error/*	ref-lenient	Go reads an empty Content-Length as none
+gen:append-bytes:*@end	*	error/incomplete*	ref-late	a byte after a message that begins no valid message; this library refuses it at once and the reference waits for a line
+gen:*-byte:*@chunk-ext	llhttp	clean/*	ref-strict	llhttp restricts the characters of a chunk extension; this library skips extensions and refuses only control bytes
+gen:append-bytes:%0d%0a*@end	llhttp	error/*	ref-lenient	llhttp skips empty lines before a response; this library does not (section 2.2 is about requests)
+gen:append-bytes:%0d%0a*@end	h11	clean/*	ref-strict	empty lines after a message, which this library skips as it does before a request (section 2.2)
+gen:append-bytes:%0d%0a*@end	gohttp	clean/*	ref-strict	empty lines after a message, which this library skips as it does before a request (section 2.2)
+gen:split-crlf-crlf@*	h11	clean/*	ref-strict	empty lines after a message, which this library skips as it does before a request (section 2.2)
+gen:split-crlf-crlf@*	gohttp	clean/*	ref-strict	empty lines after a message, which this library skips as it does before a request (section 2.2)
+gen:split-crlf-crlf@*	llhttp	error/*	ref-lenient	llhttp skips empty lines before a response; this library does not (section 2.2 is about requests)
+gen:extra-crlf@*	llhttp	error/*	ref-lenient	llhttp skips an empty line before a response, or reads on past one
+gen:extra-crlf@start-method	h11	clean/*	ref-strict	an empty line before a request is ignored (section 2.2)
+gen:extra-crlf@start-method	gohttp	clean/*	ref-strict	an empty line before a request is ignored (section 2.2)
+gen:extra-crlf@field-value:*	*	error/*	policy	an empty line inside a value leaves an obsolete line fold or ends the head early
+gen:extra-crlf@*	*	error/*	policy	an empty line ends the head early or leaves an obsolete line fold, both refused
+gen:append-bytes:*@end	*	upgrade/*	ref-model	bytes after a message that follows a tunnel
+
+# ---- obsolete line folds, spaces and colons ----
+gen:obs-fold:*@*	*	error/*	policy	an obsolete line fold is refused (section 5.2 allows that or unfolding it)
+gen:space-before-colon:host*	gohttp	error/*	policy	whitespace before the colon of Host leaves no Host (and is refused by section 5.1); Go trims it
+gen:space-before-colon:*@*	gohttp	error/*	ref-lenient	Go trims whitespace before a field's colon (section 5.1: a server MUST refuse it)
+gen:lowercase-line:*@*	*	*	scope	a field line lower-cased; a name is case-insensitive, so any difference is in what the reference can report
+gen:double-space@*	*	error/*	policy	one SP between the parts of a start line (section 3 lets a recipient be more liberal)
+
+# ---- framing fields ----
+gen:cl-add:*@*	*	error/*	policy	a second Content-Length beside Transfer-Encoding, or beside a different one, is refused
+gen:cl-add:*@*	llhttp	clean/*	ref-strict	llhttp refuses two Content-Length fields even of the same value
+gen:cl-add:*@*	h11	clean/*	scope	h11 rewrites a repeated Content-Length to its one value
+gen:cl-add:*@*	gohttp	upgrade/*	ref-model	Go reads the bytes after a 2xx to CONNECT as the response body
+gen:dup-line:content-length@*	llhttp	clean/*	ref-strict	llhttp refuses two Content-Length fields even of the same value
+gen:dup-line:content-length@*	h11	clean/*	scope	h11 rewrites a repeated Content-Length to its one value
+gen:dup-line:content-length@*	h11	upgrade/*	scope	h11 rewrites a repeated Content-Length to its one value
+gen:dup-line:content-length@*	llhttp	upgrade/*	ref-strict	llhttp refuses two Content-Length fields even of the same value
+gen:dup-line:transfer-encoding@*	*	error/*	policy	Transfer-Encoding: chunked twice is refused (it must name chunked once)
+gen:dup-line:host@*	*	error/*	policy	more than one Host is refused
+gen:drop-line:host@*	*	error/*	policy	an HTTP/1.1 request without Host is refused
+gen:dup-line:start@*	*	error/*	policy	a second start line is not a field, and an empty line cannot start a response
+gen:drop-line:start@*	*	error/*	policy	an empty line cannot start a response
+gen:swap-lines:*start*	*	error/*	policy	a field above the start line, or the head ended early
+gen:cl-value:1,1@*	*	error/*	ref-strict	a Content-Length list of identical values is one length (RFC 9110 section 8.6)
+gen:cl-value:1,1@*	*	incomplete/*	scope	h11 rewrites a Content-Length list to its one value
+gen:cl-value:empty@*	gohttp	error/*	ref-lenient	Go reads an empty Content-Length as none
+gen:cl-value:99999999999999999999@*	*	error/incomplete*	ref-limit	a Content-Length beyond 64 bits is refused at the head; the reference waits for the body
+gen:chunk-size:ff*@*	*	error/incomplete	ref-limit	a chunk size over max_chunk_size is refused at its line; the reference waits for the data
+gen:te-add:*@*	*	error/*	policy	Transfer-Encoding added to a message that already has a length, in HTTP/1.0, empty, or not ending in chunked is refused (sections 6.1, 6.3)
+gen:te-add:*@*	*	upgrade/*	policy	Transfer-Encoding added to a message that already has a length, or in HTTP/1.0, is refused (sections 6.1, 6.3)
+gen:te-add:*@*	h11	clean/*	ref-strict	h11 implements no transfer coding but chunked
+gen:te-add:*@*	gohttp	clean/*	ref-strict	Go implements no transfer coding but chunked
+gen:method-change:*@*	llhttp	clean/*	ref-strict	llhttp accepts only its closed list of methods
+gen:method-change:CONNECT@*	*	error/*	ref-lenient	a CONNECT target is authority-form alone
+gen:method-change:*@*	*	error/*	ref-lenient	the asterisk target is for OPTIONS alone
+gen:version-change:HTTP%2f1.0@*	llhttp	clean/*	ref-model	llhttp refuses a message after one on a connection that is not persistent
+gen:version-change:HTTP%2f1.0@*	*	error/*	policy	Transfer-Encoding in an HTTP/1.0 message is refused (section 6.1)
+gen:version-change:*@*	*	error/*	policy	a version other than 1.0 and 1.1 is UNSUPPORTED, not parsed
+gen:status-change:099@*	*	error/*	policy	a status code below 100 is refused
+gen:status-change:%2b20@*	*	error/*	ref-lenient	Go accepts a sign in a status code
+gen:status-change:199@*	llhttp	*	ref-bug	llhttp reads a body after an unassigned 1xx status; section 6.3 says a 1xx has none
+gen:status-change:*@*	h11	clean/incomplete	ref-model	h11 expects a final response after a 1xx and reports the stream incomplete
+gen:status-change:101@*	llhttp	*	ref-model	llhttp starts a tunnel only for a 101 that carries Connection: upgrade
+gen:swap-lines:*@*	*	upgrade/*	ref-model	Go reads the bytes after a 2xx to CONNECT as the response body
+gen:*@*	gohttp	upgrade/*	ref-model	Go reads the bytes after a 2xx to CONNECT as the response body
+
+# ---- found by seeds 1..N at the default size; each family stands for what its cases do ----
+gen:*-byte:*@trailer-*	*	error/*	ref-lenient	a control byte or a space in a trailer's name or value is not in the grammar; h11 and Go keep it
+gen:*-byte:*@start-space	*	clean/*	ref-strict	a method this library accepts as a token that llhttp does not know, or a target Go will not parse as a URL
+gen:*-byte:%20@start-version	*	error/*	policy	one SP between the parts of a start line (section 3 lets a recipient be more liberal)
+gen:*-byte:%20@start-*	*	error/*	policy	one SP between the parts of a start line (section 3 lets a recipient be more liberal)
+gen:*-byte:%0d@end	llhttp	incomplete/*	ref-lenient	llhttp ignores a CR left after a message; this library waits for the LF of an empty line
+gen:insert-byte:%09@crlf	llhttp	clean/*	ref-bug	llhttp does not trim a trailing HTAB from "chunked" and reads the body as it would for no Transfer-Encoding (te-trailing-ows)
+gen:*-byte:*@crlf	llhttp	clean/*	ref-strict	llhttp refuses a chunk-extension tail that this library skips (a space, a colon, a byte over 0x7f)
+gen:cl-value:1,1@*	llhttp	clean/*	ref-strict	a Content-Length list of identical values is one length (RFC 9110 section 8.6); llhttp refuses it
+gen:cl-value:1,1@*	llhttp	upgrade/*	ref-strict	a Content-Length list of identical values is one length; llhttp refuses it
+gen:cl-value:1,1@*	gohttp	clean/*	ref-strict	a Content-Length list of identical values is one length (RFC 9110 section 8.6); Go refuses it
+gen:cl-value:1,1@*	h11	*	scope	h11 rewrites a Content-Length list to its one value
+gen:cl-value:99999999999999999999@*	h11	error/*	ref-limit	a Content-Length beyond 64 bits is refused even on a response whose body is not read; h11 has no limit and does not look
+gen:*-byte:,@*	*	clean/*	ref-strict	an empty list element is legal and ignored (RFC 9110 section 5.6.1.2)
+gen:*-byte:*@body	h11	error/incomplete*	ref-late	a byte in what this library reads as the start of the next message; refused at once, where h11 waits for a line
+gen:dup-line:content-length@*	h11	incomplete/*	scope	h11 rewrites a repeated Content-Length to its one value
+
+# ======================= any reference: timing ==============================
+# This library judges a start line when the line ends and a head when it is
+# whole; the references judge at the offending byte. They differ only for a
+# stream that ends inside such a line. diff.py verifies each of these by
+# completing the stream and requiring this library to refuse it.
+*	*	incomplete/error*	timing	this library is still waiting for the end of a line the reference has already refused

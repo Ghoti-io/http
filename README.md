@@ -117,7 +117,13 @@ make -C libs/http test PREFIX="$PWD/.local"
 symbol carries the version namespace), `check-aliasing`, and `check-defects`,
 which plants four defects in a copy of the source (accepting Content-Length with
 Transfer-Encoding, ignoring a limit twice, a result that depends on where the
-input was split) and requires the tests to go red for each. `make test-valgrind`,
+input was split) and requires the tests to go red for each, and `check-oracle`,
+which parses a generated corpus (valid and invalid) with this library and with
+llhttp, h11 and Go's net/http in one pinned container image and requires every
+disagreement to be explained by a rule in `tools/oracle/known-disagreements.tsv`.
+It needs docker or podman and the image (`make oracle-build`), and **fails**
+without them; `make check-oracle-gate` shows the gate going red for planted
+defects. `make test-valgrind`,
 `make test-asan`, `make coverage` and `make fuzz FUZZ_TIME=60` (libFuzzer, needs
 clang) are the others. It depends on `cutil` only, for the allocator.
 

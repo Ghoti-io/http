@@ -1,0 +1,37 @@
+# The oracle references, pinned.
+#
+# One line per reference, tab-separated: <name> <image> <version> <what it
+# answers>.
+#
+# **Every line names the same image**, because a disagreement between two of
+# these should be a fact about two parsers and never about two container
+# builds. Three implementations that share no code: llhttp (C), h11 (Python)
+# and Go's net/http. See containers/refs/Containerfile for why exactly these,
+# and which others were counted and left out.
+#
+# The image is built here, so the tag is not a digest of the finished image:
+# two builds of one Containerfile are not two copies of one image. What is
+# pinned is everything the build reads - the base by digest, Debian's packages
+# by full apt version against a dated snapshot, h11 by exact PyPI version - and
+# the run-time version check is the real guarantee, so oracle_env.check_pin()
+# is the thing that fails when an image drifts. There is no stock image named
+# here and no host mode, so nothing relaxes that check.
+#
+# The version field is what the reference must say when asked. For llhttp it is
+# llhttp's own version and not Node's (Node is only the carrier), though the
+# probe prints both. For Go it is the toolchain that compiled net/http into the
+# driver, because the HTTP code is Go's standard library at that release.
+#
+# Raising a pin is deliberate, and a separate commit from the change that makes
+# the gate green: a new reference version is new answers, and a new answer that
+# disagrees is a finding to triage, not a regression to fix.
+#
+# The tag is `deb13-N`: Debian 13 fixes the base, N moves whenever the image's
+# contents can differ.
+#
+# Building it:
+#   make oracle-build
+
+llhttp	localhost/ghoti-http-oracle-refs:deb13-1	llhttp 9.2.1	The parser inside Node, driven through its HTTPParser binding, lenient flags off
+h11	localhost/ghoti-http-oracle-refs:deb13-1	h11 0.16.0	Sans-I/O HTTP/1.1 in Python; 0.16.0 is the release that closed the bare-LF chunk terminator hole
+gohttp	localhost/ghoti-http-oracle-refs:deb13-1	go net/http go1.24.4	http.ReadRequest and http.ReadResponse and the body framing behind them

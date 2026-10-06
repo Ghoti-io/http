@@ -29,3 +29,6 @@ tests/data/out
 
 # Pycache files (for generated test fixtures, in any directory)
 **/__pycache__
+
+# Python bytecode from the oracle tooling
+__pycache__

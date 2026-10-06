@@ -304,7 +304,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing check-defects
+TEST_GATES ?= check-symbols check-aliasing check-defects check-oracle
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 # --suppressions: see tests/valgrind.supp. It holds allocations that are
@@ -521,6 +521,8 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 # Fuzz commands
 .PHONY: fuzz fuzz-clean
+# Oracle commands
+.PHONY: oracle-probe oracle-build oracle-version check-oracle check-oracle-gate
 
 watch: ## Watch the file directory for changes and compile the target
 	@while true; do \
@@ -1006,6 +1008,63 @@ test-asan: $(ASAN_TEST_EXECUTABLES)
 			$$test_exe --gtest_brief=1 || exit 1; \
 	done
 	@printf "\033[0;32m\nASan+UBSan suite clean.\033[0m\n"
+
+####################################################################
+# Oracle: a differential against pinned references
+####################################################################
+#
+# The same corpus is parsed by this library and by llhttp, h11 and Go's
+# net/http, each in its pinned container (tools/oracle/containers/IMAGES), and
+# the answers are compared message by message: accept or refuse, and what was
+# accepted. Every disagreement has to be explained by a rule in
+# tools/oracle/known-disagreements.tsv, and a rule that explains nothing is a
+# failure too. notes/http/README.md has the triage.
+#
+# `make test` runs it and FAILS when the image is absent. There is no skip and
+# no host mode, because a gate whose reference is not the one it names prints
+# the same green line as one that looked.
+#
+# Linux only, as check-symbols is: the question is about parsing and the
+# references are containers; a Windows build is not asked it.
+ORACLE := tools/oracle
+HTTP_PROBE := $(APP_DIR)/oracle/http_probe$(EXE_EXTENSION)
+ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-1
+# More cases than the default is `make check-oracle ORACLE_ARGS='--count 40000'`.
+ORACLE_ARGS ?=
+
+# Built like an example (the archive, whole): it must carry the code under
+# test and not whatever is installed. Not a test: a differential needs this
+# library's answer to leave the process.
+$(HTTP_PROBE): $(ORACLE)/http_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: http_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
+
+oracle-probe: ## Build the probe the differential drives
+oracle-probe: $(HTTP_PROBE)
+
+oracle-build: ## Build the pinned reference image: llhttp, h11 and Go net/http
+	docker build -t $(ORACLE_IMAGE) -f $(ORACLE)/containers/refs/Containerfile \
+		$(ORACLE)/containers/refs
+
+oracle-version: ## Print which references would answer, and fail if any would not
+	@python3 $(ORACLE)/oracle_env.py
+
+check-oracle: ## Fail unless every disagreement with the references is explained
+ifeq ($(OS_NAME), Linux)
+check-oracle: $(HTTP_PROBE)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/oracle_run.py llhttp,h11,gohttp -- \
+		python3 $(ORACLE)/diff.py --probe $(HTTP_PROBE) $(ORACLE_ARGS)
+else
+# No probe is built: it is POSIX C, and the references are containers.
+	@printf "check-oracle: skipped (Linux only)\n"
+endif
+
+check-oracle-gate: ## Show that the oracle gate fails: planted defects and harness controls
+check-oracle-gate:
+	@tools/oracle/check-gate.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC)
 
 ####################################################################
 # Fuzzing (libFuzzer)
