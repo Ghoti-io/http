@@ -188,6 +188,41 @@ plant h2-stream-state-skip src/http/h2conn.c testH2conn \
   '    case SS_IDLE:
       return GHTTP_OK;'
 
+plant h2-rapid-reset-not-counted src/http/h2conn.c testH2conn \
+  'H2Abuse.RapidResetStopsAtTheLimitPlusOne_Cve2023_44487' \
+  '      if (++c->n_rst > c->limits.max_rst_per_interval) {
+        return calm(c, "too many RST_STREAM frames");
+      }
+      return on_rst(c, &f);' \
+  '      if (++c->n_rst > c->limits.max_rst_per_interval && 0) {
+        return calm(c, "too many RST_STREAM frames");
+      }
+      return on_rst(c, &f);'
+
+plant h2-own-resets-not-counted src/http/h2conn.c testH2conn \
+  'H2Abuse.ResetsThisEndpointSendsBecauseOfThePeerCountTowardRapidReset' \
+  '  if (++c->n_rst > c->limits.max_rst_per_interval) {
+    return calm(c, "too many RST_STREAM frames");
+  }
+  return check_output(c);' \
+  '  return check_output(c);'
+
+plant h2-goaway-names-an-unaccepted-block src/http/h2conn.c testH2conn \
+  'H2Goaway.ABlockThatWasNeverAcceptedIsNotNamedByTheGoaway_Section6_8' \
+  '      c->highest_peer_id = id;  // opening it closes every lower idle stream' \
+  '      c->highest_peer_id = id;
+      c->last_peer_id = id;  // PLANTED: the GOAWAY id follows the block, not its acceptance'
+
+plant h2-closed-ring-forgets-as-error src/http/h2conn.c testH2conn \
+  'H2Streams.ALateFrameOnAStreamTheRingHasForgottenIsDiscardedNotAProtocolError' \
+  '  return id <= c->closed_evicted_max;' \
+  '  return c && 0 && id <= c->closed_evicted_max;'
+
+plant h2-reset-in-block-not-discarded src/http/h2conn.c testH2conn \
+  'H2Streams.ResettingAStreamBetweenItsHeadersAndItsContinuationKeepsHpackInStep' \
+  '    c->hb_kind = KIND_DISCARD;  // its block is still arriving: decode it, drop it' \
+  '    (void)0;  // its block is still arriving: decode it, drop it'
+
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require
 # that gate to fail (and to pass on the copy before it).

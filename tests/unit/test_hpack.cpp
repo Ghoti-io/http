@@ -188,7 +188,7 @@ TEST(HpackInteger, TruncatedOverlongAndOverflowingValuesAreCompressionErrors) {
   // Ends inside the continuation (section 5.1).
   const uint8_t trunc[] = {0x1f, 0x80};
   EXPECT_EQ(ghttp_int_decode(trunc, 2, 5, &v, &used), GHTTP_ERR_CORRUPT);
-  // A run of zero-padded continuation octets is refused, not looped over.
+  // More than five continuation octets are refused, zeros or not.
   const uint8_t zeros[] = {0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00};
   EXPECT_EQ(ghttp_int_decode(zeros, sizeof(zeros), 5, &v, &used),
       GHTTP_ERR_CORRUPT);
@@ -817,6 +817,118 @@ TEST(HpackOom, EncodingWithAnAllocatorFailingAtEveryPointIsOomAndNeverALeak) {
       EXPECT_EQ(fa.live(), 0u) << k;
     }
   }
+}
+
+
+// ---- Review findings --------------------------------------------------------------
+
+TEST(HpackDecoder, ATruncatedOrOversizeIntegerIsExactlyACorruptBlockInEveryPosition) {
+  // Each representation whose prefix integer can be cut off or too large: an
+  // indexed field (7 bits), a literal with an indexed name for each of the
+  // three literal kinds (6 and 4 bits), a table size update (5 bits), and the
+  // length of a name and of a value string (7 bits).
+  struct Position {
+    const char * what;
+    std::string before;  // octets ahead of the integer
+    uint8_t first;       // the first octet of the integer, prefix all ones
+    std::string after;   // what follows it in a block that is otherwise sound
+  };
+  const std::vector<Position> positions = {
+    {"indexed field", "", 0xff, ""},
+    {"literal with incremental indexing, name index", "", 0x7f, std::string("\x01x", 2)},
+    {"literal without indexing, name index", "", 0x0f, std::string("\x01x", 2)},
+    {"literal never indexed, name index", "", 0x1f, std::string("\x01x", 2)},
+    {"table size update", "", 0x3f, ""},
+    {"name string length", std::string("\x40", 1), 0x7f, "x"},
+    {"value string length", std::string("\x40\x01n", 3), 0x7f, "x"},
+  };
+  const std::string truncated_tails[] = {"", std::string("\x80", 1), std::string("\xff\xff", 2)};
+  // 2^31 + 31: five continuation octets, the last carrying the bit past the bound.
+  const std::string too_big = std::string("\x80\x80\x80\x80\x08", 5);
+  for (const Position & p : positions) {
+    SCOPED_TRACE(p.what);
+    for (const std::string & tail : truncated_tails) {
+      Dec d;
+      std::string block = p.before + std::string(1, static_cast<char>(p.first)) + tail;
+      EXPECT_EQ(d.decode(block), GHTTP_ERR_CORRUPT) << "truncated, tail " << tail.size();
+    }
+    Dec d;
+    std::string block = p.before + std::string(1, static_cast<char>(p.first)) + too_big + p.after;
+    EXPECT_EQ(d.decode(block), GHTTP_ERR_CORRUPT) << "over 2^31 - 1";
+    // The largest value that does fit is read as a value (and then refused for
+    // what it names, but not as a bad integer): a different result from the above.
+    Dec e;
+    std::string fits = p.before + std::string(1, static_cast<char>(p.first))
+        + std::string("\xe0\xff\xff\xff\x07", 5) + p.after;
+    EXPECT_NE(e.decode(fits), GHTTP_OK) << "an index or length of 2^31 - 1 names nothing";
+  }
+  // Zero padding within five continuation octets is not an error (the RFC
+  // allows it): 31 written as 0x1f 0x80 0x00.
+  Dec z;
+  EXPECT_EQ(z.decode(unhex("3f8000")), GHTTP_OK) << "a size update of 31, zero padded";
+}
+
+TEST(HpackEncoder, AListThatFailsAfterItsFirstFieldLeavesTheEncoderFailedOrUnchanged) {
+  GHTTP_Headers * list = nullptr;
+  ASSERT_EQ(ghttp_headers_create(nullptr, &list), GHTTP_OK);
+  const std::pair<const char *, const char *> fields[] = {
+    {"user-agent", "test"}, {"accept-encoding", "gzip, deflate"}, {"accept", "text/html"},
+    {"x-custom-one", "alpha"}, {"x-custom-two", "bravo"}, {"cookie", "a=b"},
+  };
+  for (auto & f : fields) ASSERT_EQ(ghttp_headers_add(list, f.first, f.second), GHTTP_OK);
+
+  auto encode_once = [&](const GHTTP_Allocator * a, std::string * out, GHTTP_HpackEncoder ** keep) {
+    GHTTP_HpackEncoder * e = nullptr;
+    GHTTP_Result r = ghttp_hpack_encoder_create(a, nullptr, 4096, &e);
+    if (r != GHTTP_OK) return r;
+    ghttp_hpack_encoder_set_peer_table_size(e, 256);  // a size update is pending
+    GHTTP_Buffer * b = nullptr;
+    EXPECT_EQ(ghttp_buffer_create(nullptr, &b), GHTTP_OK);
+    r = ghttp_hpack_encode(e, list, b);
+    if (out) out->assign(static_cast<const char *>(ghttp_buffer_data(b)), ghttp_buffer_size(b));
+    ghttp_buffer_destroy(b);
+    if (keep) *keep = e; else ghttp_hpack_encoder_destroy(e);
+    return r;
+  };
+  std::string expected;
+  FailingAllocator count(static_cast<size_t>(-1));
+  ASSERT_EQ(encode_once(count.get(), &expected, nullptr), GHTTP_OK);
+  ASSERT_EQ(count.live(), 0u);
+  int sticky = 0, unchanged = 0;
+  for (size_t run : {size_t(1), size_t(0), size_t(2)}) {
+    for (size_t k = 0; k <= count.requests(); k++) {
+      FailingAllocator fa(k, run);
+      GHTTP_HpackEncoder * e = nullptr;
+      std::string got;
+      GHTTP_Result r = encode_once(fa.get(), &got, &e);
+      if (r != GHTTP_OK && e) {
+        // The same list again, with the allocator now answering. Either the
+        // encoder refuses (failed for good) or it behaves as if the failed
+        // call had never happened: its block equals a fresh encoder's.
+        GHTTP_Buffer * b = nullptr;
+        ASSERT_EQ(ghttp_buffer_create(nullptr, &b), GHTTP_OK);
+        GHTTP_Result r2 = GHTTP_ERR_OOM;
+        if (run == 1) r2 = ghttp_hpack_encode(e, list, b);  // only run 1 stops refusing
+        std::string again(static_cast<const char *>(ghttp_buffer_data(b)), ghttp_buffer_size(b));
+        if (run == 1) {
+          if (r2 == GHTTP_OK) {
+            EXPECT_EQ(again, expected) << "k=" << k << ": the failed call changed the encoder";
+            unchanged++;
+          } else {
+            EXPECT_EQ(r2, r) << "k=" << k;
+            EXPECT_TRUE(again.empty());
+            sticky++;
+          }
+        }
+        ghttp_buffer_destroy(b);
+      }
+      ghttp_hpack_encoder_destroy(e);
+      EXPECT_EQ(fa.live(), 0u) << "k=" << k << " run=" << run;
+    }
+  }
+  EXPECT_GT(sticky, 0) << "the sweep reached a failure after the first field";
+  (void)unchanged;  // no allocation precedes the first byte, so none of these is "unchanged"
+  ghttp_headers_destroy(list);
 }
 
 int main(int argc, char ** argv) {

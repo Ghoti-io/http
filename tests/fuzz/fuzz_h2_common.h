@@ -29,8 +29,11 @@ inline GHTTP_H2Limits h2_limits_for(uint8_t profile) {
             l.max_field_bytes = 16; break;
     case 4: l.max_continuation_frames = 1; l.max_header_block_bytes = 60; break;
     case 5: l.max_rst_per_interval = 2; l.max_settings_per_interval = 3;
-            l.max_ping_per_interval = 2; l.max_empty_data_frames = 2; break;
-    case 6: l.max_frame_size = 16384; l.max_buffered_bytes = 300;
+            l.max_ping_per_interval = 2; l.max_empty_data_frames = 2;
+            l.max_priority_per_interval = 2; l.max_extension_per_interval = 2;
+            l.max_ignored_window_updates_per_interval = 2; break;
+    case 6: l.max_frame_size = 16384;
+            l.max_buffered_bytes = l.max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE;  // the smallest allowed
             l.max_closed_streams = 2; break;
     default: l.max_table_size = 64; l.max_encoder_table_size = 64;
              l.max_body_bytes = 20; break;

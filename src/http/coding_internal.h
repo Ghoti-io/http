@@ -78,7 +78,9 @@ size_t ghttp_int_encode(
  * Read an N-bit-prefix integer from @p in. GHTTP_ERR_CORRUPT when the input
  * ends inside it, when it needs more than five continuation octets or when
  * the value exceeds 2^31 - 1 (RFC 7541 section 5.1 leaves the bound to the
- * implementation; zero-padded runs are what it prevents).
+ * implementation). The five-octet limit bounds the work a padded encoding can
+ * cause; within it, zero padding (0x1f 0x80 0x00 for 31) is accepted, as the
+ * RFC allows, so the encoding is not required to be canonical.
  */
 GHTTP_Result ghttp_int_decode(const uint8_t * in, size_t n, unsigned prefix_bits,
     uint32_t * value, size_t * used);

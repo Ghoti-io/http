@@ -285,6 +285,9 @@ struct Side {
       case GHTTP_H2_EVENT_WINDOW_UPDATE:
         o << "WINDOW " << ev.stream_id << " +" << ev.increment;
         break;
+      case GHTTP_H2_EVENT_STREAM_UNPROCESSED:
+        o << "UNPROCESSED " << ev.stream_id;
+        break;
       case GHTTP_H2_EVENT_NEED_MORE: o << "NEED_MORE"; break;
     }
     return o.str();

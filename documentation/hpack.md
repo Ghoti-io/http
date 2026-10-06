@@ -19,8 +19,10 @@ tables can no longer be known to agree. A limit is `GHTTP_ERR_LIMIT`.
 ## Decoder: enforced
 
 - **Integers (section 5.1):** the prefix width of each representation; a
-  continuation that does not end, one that overflows 32 bits, and an overlong
-  encoding are refused.
+  continuation that does not end, a value above 2^31 - 1, and an encoding with
+  more than five continuation octets are refused (`GHTTP_ERR_CORRUPT`). Zero
+  padding within those five octets is accepted, as the RFC allows; the
+  encoding need not be canonical.
 - **Strings (section 5.2):** a length that runs past the block is refused. A
   Huffman string is refused when its padding is longer than seven bits, when the
   padding is not the most significant bits of EOS, and when it contains EOS. The
@@ -62,6 +64,12 @@ tables can no longer be known to agree. A limit is `GHTTP_ERR_LIMIT`.
 - Huffman coding is used unless it is longer (`GHTTP_HPACK_HUFFMAN_AUTO`).
 - A failed `ghttp_hpack_encode()` restores the output buffer it was appending
   to, and an allocator failing at any point is `GHTTP_ERR_OOM` and never a leak.
+  The encoder's table cannot be restored, though: a failure after the first
+  field leaves the encoder **failed for good** (every later call returns the
+  error), because the fields already encoded are in its table, and the pending
+  size update was in the block thrown away, so the peer's decoder would
+  disagree. A failure before anything changed (the first field's pending update
+  could not be written) leaves it usable and the update still pending.
 
 ## Not enforced, or not provided
 

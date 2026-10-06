@@ -9,6 +9,9 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
+#include <cstddef>
+#include <cstring>
+
 #include "test_helpers.h"
 #include "h2_helpers.h"
 
@@ -186,11 +189,23 @@ TEST(H2Server, ARequestIsDecodedIntoTheSharedMessageTypes_Section8_3_1) {
   EXPECT_EQ(ghttp_request_version(r), 1) << "HTTP/2 messages carry no version; 1 is the semantic one";
 }
 
-TEST(H2Server, AHostFieldIsKeptAndAuthorityIsNotCopiedOverIt) {
+TEST(H2Server, AHostFieldThatAgreesWithAuthorityIsKeptAndNotDuplicated_Section8_3_1) {
   OpenServer o;
-  auto e = o.request(1, request_list("GET", "/", {{"host", "other"}}));
+  auto e = o.request(1, request_list("GET", "/", {{"host", "EXAMPLE.com"}}));
   ASSERT_EQ(e.size(), 1u);
-  EXPECT_EQ(e[0], "HEADERS 1 end GET / [host: other] scheme=https authority=example.com");
+  EXPECT_EQ(e[0], "HEADERS 1 end GET / [host: EXAMPLE.com] scheme=https authority=example.com")
+      << "one Host, the sender's, and authority is not copied over it";
+}
+
+TEST(H2Server, AHostFieldThatDiffersFromAuthorityIsMalformed_Section8_3_1) {
+  OpenServer o;
+  EXPECT_EQ(o.request(1, request_list("GET", "/", {{"host", "other"}})),
+      (Events{"STREAM_ERROR 1 PROTOCOL_ERROR"}));
+  // One of two Host fields that differs is enough.
+  EXPECT_EQ(o.request(3, request_list("GET", "/", {{"host", "example.com"}, {"host", "other"}})),
+      (Events{"STREAM_ERROR 3 PROTOCOL_ERROR"}));
+  // And the connection carries on.
+  EXPECT_EQ(o.request(5, request_list("GET", "/")).size(), 1u);
 }
 
 TEST(H2Server, ARequestWithoutAuthorityIsFine) {
@@ -628,16 +643,7 @@ TEST(H2FlowReceive, TheWholeFrameCountsAgainstTheConnectionWindowEvenOnAnErrored
   int64_t before = ghttp_h2_conn_connection_recv_window(o.s.c);
   EXPECT_EQ(o.feed(data(1, std::string(11, 'x'))), (Events{"STREAM_ERROR 1 FLOW_CONTROL_ERROR"}));
   EXPECT_EQ(ghttp_h2_conn_connection_recv_window(o.s.c), before - 11);
-  // The stream is gone, so the application will never consume those octets:
-  // enough of them, and the connection window is given back.
-  uint64_t returned = 0;
-  for (uint32_t id = 3; id < 40 && returned == 0; id += 2) {
-    o.request(id, request_list("POST", "/"), END_HEADERS);
-    o.feed(data(id, std::string(11, 'x')));
-    o.feed(rst(id, GHTTP_H2_CANCEL));
-    returned = window_updates_for(o.wrote(), 0);
-  }
-  (void)returned;
+  EXPECT_EQ(o.s.result, GHTTP_OK);
 }
 
 TEST(H2FlowReceive, AutomaticFlowControlReturnsEveryOctetItDelivers) {
@@ -1134,16 +1140,6 @@ TEST(H2Abuse, AFloodOfEmptyDataFramesStopsAtTheLimitPlusOne) {
   EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
 }
 
-TEST(H2Abuse, AnyOtherFrameBreaksUpTheRunOfEmptyDataFrames) {
-  GHTTP_H2Limits l = limits();
-  l.max_empty_data_frames = 3;
-  FlowServer o(l);
-  for (int i = 0; i < 20; i++) {
-    o.feed(data(1, "") + data(1, "") + data(1, "x"));
-  }
-  EXPECT_EQ(o.s.result, GHTTP_OK);
-}
-
 TEST(H2Abuse, AnEmptyDataFrameThatEndsTheStreamIsNotCounted) {
   GHTTP_H2Limits l = limits();
   l.max_empty_data_frames = 1;
@@ -1157,7 +1153,7 @@ TEST(H2Abuse, AnEmptyDataFrameThatEndsTheStreamIsNotCounted) {
 
 TEST(H2Abuse, ReplyOutputThatIsNeverDrainedIsBoundedByTheBufferLimit) {
   GHTTP_H2Limits l = limits();
-  l.max_buffered_bytes = 1000;
+  l.max_buffered_bytes = l.max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE;  // the smallest allowed
   l.max_ping_per_interval = 1000000;
   GHTTP_H2Conn * c;
   ASSERT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_OK);
@@ -1166,7 +1162,7 @@ TEST(H2Abuse, ReplyOutputThatIsNeverDrainedIsBoundedByTheBufferLimit) {
   GHTTP_H2Event ev;
   ASSERT_EQ(ghttp_h2_conn_feed(c, in.data(), in.size(), &used, &ev), GHTTP_OK);
   std::string pings;
-  for (int i = 0; i < 200; i++) pings += ping();
+  for (int i = 0; i < 2000; i++) pings += ping();
   size_t off = 0;
   GHTTP_Result r = GHTTP_OK;
   while (off < pings.size() && r == GHTTP_OK) {
@@ -1177,7 +1173,7 @@ TEST(H2Abuse, ReplyOutputThatIsNeverDrainedIsBoundedByTheBufferLimit) {
   uint32_t code;
   ghttp_h2_conn_error(c, &code, nullptr);
   EXPECT_EQ(code, GHTTP_H2_ENHANCE_YOUR_CALM);
-  EXPECT_LT(ghttp_h2_conn_output_size(c), 1200u) << "the output stopped growing at the limit";
+  EXPECT_LE(ghttp_h2_conn_output_size(c), l.max_buffered_bytes + 64u) << "the output stopped growing at the limit";
   ghttp_h2_conn_destroy(c);
 }
 
@@ -1662,6 +1658,612 @@ TEST(H2Finish, AFailedConnectionReportsItsOwnErrorAndNothingChanges) {
   c.feed(settings({}) + ping().substr(0, 3));
   EXPECT_EQ(ghttp_h2_conn_finish(c.c), GHTTP_ERR_CORRUPT);
 }
+
+
+
+// The oracle's rule for "a HEADERS block the RFC makes a stream error" lets the
+// reference's answer float (Go's depends on its goroutines); these pin ours.
+TEST(H2Streams, AHeadersBlockOnAHalfClosedStreamWithoutEndStreamIsAStreamError) {
+  OpenServer o;
+  o.request(1);  // a GET: the client is done, our answer is not
+  EXPECT_EQ(o.feed(headers(1, o.blk({{"x-t", "1"}}), END_HEADERS)),
+      (Events{"STREAM_ERROR 1 STREAM_CLOSED"}));
+  EXPECT_EQ(rst_code(o.wrote(), 1), static_cast<int>(GHTTP_H2_STREAM_CLOSED));
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+}
+
+TEST(H2Streams, AThirdHeadersBlockIsDiscardedAfterTheMalformedSecond) {
+  OpenServer o;
+  o.request(1, request_list("POST", "/"), END_HEADERS);
+  EXPECT_EQ(o.feed(headers(1, o.blk({{"x-a", "1"}}), END_HEADERS)),
+      (Events{"STREAM_ERROR 1 PROTOCOL_ERROR"})) << "a second block that is not trailers";
+  EXPECT_EQ(o.feed(headers(1, o.blk({{"x-b", "2"}}), END_HEADERS)), Events{})
+      << "the third arrives after our RST_STREAM: decoded and dropped";
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+  auto e = o.request(3, request_list("GET", "/", {{"x-b", "2"}}));
+  ASSERT_EQ(e.size(), 1u);
+  EXPECT_TRUE(has_prefix(e[0], "HEADERS 3 end GET /")) << e[0];
+}
+
+// ---- Review findings: GOAWAY, resets inside a block, limits, floods, the ring ---------
+
+namespace {
+
+/** Answer stream @p id with an empty 200, so a request that ended is closed on both sides. */
+void answer(OpenServer & o, uint32_t id) {
+  GHTTP_Response * r = make_response(200);
+  ASSERT_EQ(ghttp_h2_conn_send_response(o.s.c, id, r, 1), GHTTP_OK);
+  ghttp_response_destroy(r);
+}
+
+/** Every GOAWAY in @p fs: its last stream id. */
+std::vector<uint32_t> goaway_lasts(const std::vector<OutFrame> & fs) {
+  std::vector<uint32_t> v;
+  for (auto & f : fs) {
+    if (f.type == GHTTP_H2_GOAWAY) v.push_back(f.u32at(0));
+  }
+  return v;
+}
+
+} // namespace
+
+TEST(H2Goaway, TheLastStreamIdNeverRises_Section6_8) {
+  OpenServer o;
+  o.request(1);
+  o.request(3);
+  ASSERT_EQ(ghttp_h2_conn_shutdown(o.s.c, GHTTP_H2_NO_ERROR, "", 0), GHTTP_OK);
+  EXPECT_EQ(o.request(5), (Events{"STREAM_ERROR 5 REFUSED_STREAM"})) << "refused: not processed";
+  // A connection error now sends a second GOAWAY, which may not name more.
+  o.feed(window_update(0, 0));
+  ASSERT_EQ(o.s.result, GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(goaway_lasts(o.wrote()), (std::vector<uint32_t>{3, 3}));
+  // Calling shutdown again on a failed connection is the error, not a second GOAWAY.
+  EXPECT_EQ(ghttp_h2_conn_shutdown(o.s.c, GHTTP_H2_NO_ERROR, "", 0), GHTTP_ERR_CORRUPT);
+}
+
+TEST(H2Goaway, ABlockThatWasNeverAcceptedIsNotNamedByTheGoaway_Section6_8) {
+  OpenServer o;
+  o.request(1);
+  // Stream 3's header block starts and is then interrupted: it was never accepted.
+  o.feed(headers(3, o.blk(request_list()), END_STREAM));
+  o.feed(ping());
+  ASSERT_EQ(o.s.result, GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(goaway_lasts(o.wrote()), (std::vector<uint32_t>{1}));
+}
+
+TEST(H2Goaway, AStreamThatWasRefusedIsNotNamedByTheGoawayEither) {
+  GHTTP_H2Limits l = limits();
+  l.max_concurrent_streams = 1;
+  OpenServer o(l);
+  o.request(1);
+  EXPECT_EQ(o.request(3), (Events{"STREAM_ERROR 3 REFUSED_STREAM"}));
+  o.feed(window_update(0, 0));
+  EXPECT_EQ(goaway_lasts(o.wrote()), (std::vector<uint32_t>{1}));
+}
+
+TEST(H2Goaway, AGoawayThatRaisesTheLastStreamIdIsAProtocolError_Section6_8) {
+  Side c(GHTTP_H2_CLIENT);
+  c.feed(settings({}));
+  c.events.clear();
+  c.feed(goaway(5, 0) + goaway(3, 0) + goaway(3, 0));
+  EXPECT_EQ(c.result, GHTTP_OK) << "equal and lower are allowed";
+  EXPECT_EQ(c.events.size(), 3u);
+  c.feed(goaway(4, 0));
+  EXPECT_EQ(c.result, GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(goaway_code(parse_frames(c.out.substr(GHTTP_H2_PREFACE_SIZE))),
+      static_cast<int>(GHTTP_H2_PROTOCOL_ERROR));
+}
+
+TEST(H2Streams, ResettingAStreamBetweenItsHeadersAndItsContinuationKeepsHpackInStep) {
+  OpenServer o;
+  o.request(1, request_list("POST", "/"), END_HEADERS);
+  std::string trailer_block = o.blk({{"x-trailer-name", "a-value-that-is-not-short"}});
+  ASSERT_GT(trailer_block.size(), 4u);
+  size_t half = trailer_block.size() / 2;
+  EXPECT_EQ(o.feed(headers(1, trailer_block.substr(0, half), END_STREAM)), Events{});
+  ASSERT_EQ(ghttp_h2_conn_reset_stream(o.s.c, 1, GHTTP_H2_CANCEL), GHTTP_OK);
+  EXPECT_EQ(o.feed(continuation(1, trailer_block.substr(half))), Events{})
+      << "the block is decoded and dropped, not an internal error";
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+  EXPECT_EQ(rst_code(o.wrote(), 1), static_cast<int>(GHTTP_H2_CANCEL));
+  // The compression state is in step: the next request decodes, and uses the
+  // dynamic entry the dropped block added.
+  auto e = o.request(3, request_list("GET", "/next", {{"x-trailer-name", "a-value-that-is-not-short"}}));
+  ASSERT_EQ(e.size(), 1u);
+  EXPECT_TRUE(has_prefix(e[0], "HEADERS 3 end GET /next")) << e[0];
+}
+
+// ---- Limits are validated -------------------------------------------------------
+
+TEST(H2Limits, AnUnusableSetOfLimitsIsRefusedByCreate) {
+  auto create = [](const GHTTP_H2Limits & l) {
+    GHTTP_H2Conn * c = nullptr;
+    GHTTP_Result r = ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c);
+    EXPECT_EQ(c != nullptr, r == GHTTP_OK);
+    ghttp_h2_conn_destroy(c);
+    return r;
+  };
+  GHTTP_H2Limits l = limits();
+  EXPECT_EQ(create(l), GHTTP_OK);
+  l.max_buffered_bytes = l.max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE - 1;
+  EXPECT_EQ(create(l), GHTTP_ERR_INVALID) << "a whole frame must fit in what may be buffered";
+  l.max_buffered_bytes = l.max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE;
+  EXPECT_EQ(create(l), GHTTP_OK);
+  l = limits();
+  l.max_frame_size = 1 << 20;
+  EXPECT_EQ(create(l), GHTTP_ERR_INVALID) << "the larger frame no longer fits the default buffer";
+  l.max_buffered_bytes = (1 << 20) + 9;
+  EXPECT_EQ(create(l), GHTTP_OK);
+
+  // A zero size is not a struct that was initialised, and is not read as a full one.
+  l = limits();
+  l.size = 0;
+  EXPECT_EQ(create(l), GHTTP_ERR_INVALID);
+  // A shorter struct (an older caller) takes the defaults for what it lacks.
+  l = limits();
+  l.size = offsetof(GHTTP_H2Limits, max_streams);
+  l.max_streams = 0;
+  EXPECT_EQ(create(l), GHTTP_OK);
+
+  struct Zero {
+    const char * name;
+    void (*set)(GHTTP_H2Limits *);
+  };
+  const Zero zeros[] = {
+    {"max_header_list_bytes", [](GHTTP_H2Limits * x) { x->max_header_list_bytes = 0; }},
+    {"max_field_bytes", [](GHTTP_H2Limits * x) { x->max_field_bytes = 0; }},
+    {"max_header_count", [](GHTTP_H2Limits * x) { x->max_header_count = 0; }},
+    {"max_header_block_bytes", [](GHTTP_H2Limits * x) { x->max_header_block_bytes = 0; }},
+    {"max_body_bytes", [](GHTTP_H2Limits * x) { x->max_body_bytes = 0; }},
+    {"max_streams", [](GHTTP_H2Limits * x) { x->max_streams = 0; }},
+    {"max_concurrent_streams", [](GHTTP_H2Limits * x) { x->max_concurrent_streams = 0; }},
+    {"max_settings_per_interval", [](GHTTP_H2Limits * x) { x->max_settings_per_interval = 0; }},
+    {"interval_ms", [](GHTTP_H2Limits * x) { x->interval_ms = 0; }},
+    {"max_buffered_bytes", [](GHTTP_H2Limits * x) { x->max_buffered_bytes = 0; }},
+  };
+  for (const Zero & z : zeros) {
+    GHTTP_H2Limits m = limits();
+    z.set(&m);
+    EXPECT_EQ(create(m), GHTTP_ERR_INVALID) << z.name;
+  }
+  // Zero is a real setting where it means "none allowed".
+  l = limits();
+  l.max_ping_per_interval = 0;
+  l.max_rst_per_interval = 0;
+  l.max_empty_data_frames = 0;
+  l.max_continuation_frames = 0;
+  l.max_closed_streams = 0;
+  l.max_priority_per_interval = 0;
+  l.max_extension_per_interval = 0;
+  l.max_ignored_window_updates_per_interval = 0;
+  EXPECT_EQ(create(l), GHTTP_OK);
+}
+
+TEST(H2Limits, TheDefaultClosedRingIsLargerThanTheRapidResetLimit) {
+  GHTTP_H2Limits l = limits();
+  EXPECT_GT(l.max_closed_streams, l.max_rst_per_interval);
+}
+
+// ---- feed writes both outputs on every return ------------------------------------
+
+TEST(H2Feed, ConsumedAndEventAreWrittenOnEveryReturn) {
+  GHTTP_H2Conn * c = nullptr;
+  ASSERT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, nullptr, &c), GHTTP_OK);
+  auto garbage = [](GHTTP_H2Event * ev, size_t * used) {
+    memset(ev, 0xAB, sizeof(*ev));
+    *used = 12345;
+  };
+  auto zeroed = [](const GHTTP_H2Event & ev) {
+    return ev.size == sizeof(GHTTP_H2Event) && ev.type == GHTTP_H2_EVENT_NEED_MORE
+        && ev.stream_id == 0 && ev.data == nullptr && ev.data_len == 0
+        && ev.error_code == 0 && ev.scheme == nullptr;
+  };
+  GHTTP_H2Event ev;
+  size_t used;
+  // Nothing to read.
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, "", 0, &used, &ev), GHTTP_OK);
+  EXPECT_EQ(used, 0u);
+  EXPECT_TRUE(zeroed(ev));
+  // A partial preface: all of it consumed, nothing to report.
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, GHTTP_H2_PREFACE, 10, &used, &ev), GHTTP_OK);
+  EXPECT_EQ(used, 10u);
+  EXPECT_TRUE(zeroed(ev));
+  // An event: SETTINGS arrives after the rest of the preface.
+  std::string rest = std::string(GHTTP_H2_PREFACE).substr(10) + settings({}) + window_update(0, 0);
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, rest.data(), rest.size(), &used, &ev), GHTTP_OK);
+  EXPECT_EQ(ev.type, GHTTP_H2_EVENT_SETTINGS);
+  EXPECT_EQ(used, rest.size() - 13) << "up to the end of the SETTINGS frame";
+  // An error after bytes were read: how far it got, and no stale event.
+  size_t offset = used;  // before garbage() scribbles on it
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, rest.data() + offset, rest.size() - offset, &used, &ev),
+      GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(used, 13u) << "the whole WINDOW_UPDATE frame was read before its zero increment was refused";
+  EXPECT_TRUE(zeroed(ev)) << "the error arm left the event alone";
+  // A failed connection: the same error, nothing consumed, the event zeroed.
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, "x", 1, &used, &ev), GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(used, 0u);
+  EXPECT_TRUE(zeroed(ev));
+  ghttp_h2_conn_destroy(c);
+
+  // A bad preface byte: consumed is where it stopped.
+  ASSERT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, nullptr, &c), GHTTP_OK);
+  garbage(&ev, &used);
+  EXPECT_EQ(ghttp_h2_conn_feed(c, "PRI * HTTP/2.0\r\n\r\nSX", 20, &used, &ev), GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(used, 19u);
+  EXPECT_TRUE(zeroed(ev));
+  ghttp_h2_conn_destroy(c);
+}
+
+// ---- Floods the spec names: every unbounded quantity is capped ---------------------
+
+TEST(H2Abuse, APriorityFloodStopsAtTheLimitPlusOne) {
+  GHTTP_H2Limits l = limits();
+  l.max_priority_per_interval = 5;
+  OpenServer o(l);
+  int n = 0;
+  for (; n < 30 && o.s.result == GHTTP_OK; n++) o.feed(priority(1));
+  EXPECT_EQ(n, 6);
+  EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
+  EXPECT_EQ(goaway_code(o.wrote()), static_cast<int>(GHTTP_H2_ENHANCE_YOUR_CALM));
+}
+
+TEST(H2Abuse, AFloodOfUnknownFramesStopsAtTheLimitPlusOne) {
+  GHTTP_H2Limits l = limits();
+  l.max_extension_per_interval = 4;
+  OpenServer o(l);
+  int n = 0;
+  for (; n < 30 && o.s.result == GHTTP_OK; n++) o.feed(frame(0xfa, 0, 0, "x"));
+  EXPECT_EQ(n, 5);
+  EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
+}
+
+TEST(H2Abuse, AFloodOfWindowUpdatesForClosedStreamsStopsAtTheLimitPlusOne) {
+  GHTTP_H2Limits l = limits();
+  l.max_ignored_window_updates_per_interval = 4;
+  OpenServer o(l);
+  o.request(1);
+  answer(o, 1);
+  ASSERT_FALSE(ghttp_h2_conn_stream_is_active(o.s.c, 1));
+  int n = 0;
+  for (; n < 30 && o.s.result == GHTTP_OK; n++) o.feed(window_update(1, 1));
+  EXPECT_EQ(n, 5);
+  EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
+  // Updates that do something are not counted: a live stream may get any number.
+  OpenServer p(l);
+  p.request(1, request_list("POST", "/"), END_HEADERS);
+  for (int i = 0; i < 20; i++) p.feed(window_update(1, 1));
+  EXPECT_EQ(p.s.result, GHTTP_OK);
+}
+
+TEST(H2Abuse, ResetsThisEndpointSendsBecauseOfThePeerCountTowardRapidReset) {
+  GHTTP_H2Limits l = limits();
+  l.max_rst_per_interval = 3;
+  OpenServer o(l);
+  // Each request is malformed, so each is answered with an RST_STREAM.
+  int n = 0;
+  for (uint32_t id = 1; n < 30 && o.s.result == GHTTP_OK; id += 2, n++) {
+    o.request(id, request_list("GET", "/", {{"connection", "close"}}));
+  }
+  EXPECT_EQ(n, 4) << "three are allowed; the fourth is the one that ends it";
+  EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
+  EXPECT_EQ(goaway_code(o.wrote()), static_cast<int>(GHTTP_H2_ENHANCE_YOUR_CALM));
+}
+
+TEST(H2Abuse, ResetsTheApplicationAsksForAreNotCounted) {
+  GHTTP_H2Limits l = limits();
+  l.max_rst_per_interval = 3;
+  OpenServer o(l);
+  for (uint32_t id = 1; id < 40; id += 2) {
+    o.request(id, request_list("POST", "/"), END_HEADERS);
+    ASSERT_EQ(ghttp_h2_conn_reset_stream(o.s.c, id, GHTTP_H2_CANCEL), GHTTP_OK);
+  }
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+}
+
+TEST(H2Abuse, OnlyProgressBreaksUpTheRunOfEmptyDataFrames) {
+  GHTTP_H2Limits l = limits();
+  l.max_empty_data_frames = 3;
+  {
+    FlowServer o(l);
+    for (int i = 0; i < 20; i++) {
+      o.feed(data(1, "") + data(1, "") + data(1, "x"));
+    }
+    EXPECT_EQ(o.s.result, GHTTP_OK) << "DATA with data is progress";
+  }
+  {
+    FlowServer o(l);
+    for (int i = 0; i < 20 && o.s.result == GHTTP_OK; i++) {
+      o.feed(data(1, "") + ping() + window_update(0, 1) + priority(1));
+    }
+    EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT)
+        << "PING, WINDOW_UPDATE and PRIORITY between empty DATA frames do not reset the count";
+  }
+}
+
+namespace {
+
+enum class Flood { Rst, Settings, Ping };
+
+/** One counted frame of kind @p k, on a fresh stream if it needs one. */
+void send_counted(OpenServer & o, Flood k, uint32_t & id) {
+  switch (k) {
+    case Flood::Rst:
+      o.feed(headers(id, o.blk(request_list("GET", "/")), END_HEADERS));
+      o.feed(rst(id, GHTTP_H2_CANCEL));
+      id += 2;
+      break;
+    case Flood::Settings: o.feed(settings({})); break;
+    case Flood::Ping: o.feed(ping()); break;
+  }
+}
+
+} // namespace
+
+TEST(H2Abuse, TheCountsRenewWhenTheCallerTicksTheClock_RstSettingsAndPing) {
+  for (Flood k : {Flood::Rst, Flood::Settings, Flood::Ping}) {
+    SCOPED_TRACE(static_cast<int>(k));
+    GHTTP_H2Limits l = limits();
+    l.max_rst_per_interval = 3;
+    l.max_settings_per_interval = 3;
+    l.max_ping_per_interval = 3;
+    l.interval_ms = 1000;
+    auto many = [&](OpenServer & o, uint32_t & id, int n) {
+      for (int i = 0; i < n && o.s.result == GHTTP_OK; i++) send_counted(o, k, id);
+    };
+    {
+      OpenServer o(l);
+      uint32_t id = 1;
+      ghttp_h2_conn_tick(o.s.c, 0);
+      many(o, id, 3);
+      EXPECT_EQ(o.s.result, GHTTP_OK);
+      ghttp_h2_conn_tick(o.s.c, 999);
+      many(o, id, 1);
+      EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT) << "inside the interval: one more than allowed";
+    }
+    {
+      OpenServer o(l);
+      uint32_t id = 1;
+      ghttp_h2_conn_tick(o.s.c, 0);
+      many(o, id, 3);
+      ghttp_h2_conn_tick(o.s.c, 1000);
+      many(o, id, 3);
+      EXPECT_EQ(o.s.result, GHTTP_OK) << "a new interval";
+    }
+    {
+      OpenServer o(l);
+      uint32_t id = 1;
+      ghttp_h2_conn_tick(o.s.c, 5000);
+      many(o, id, 3);
+      ghttp_h2_conn_tick(o.s.c, 100);  // the clock went backwards
+      many(o, id, 3);
+      EXPECT_EQ(o.s.result, GHTTP_OK) << "a clock that runs backwards starts a new interval";
+    }
+    {
+      OpenServer o(l);  // never ticked: a lifetime cap
+      uint32_t id = 1;
+      many(o, id, 20);
+      EXPECT_EQ(o.s.result, GHTTP_ERR_LIMIT);
+    }
+  }
+}
+
+TEST(H2Abuse, TheCountsOfThePriorityUnknownAndIgnoredFloodsRenewToo) {
+  GHTTP_H2Limits l = limits();
+  l.max_priority_per_interval = 2;
+  l.max_extension_per_interval = 2;
+  l.max_ignored_window_updates_per_interval = 2;
+  l.interval_ms = 1000;
+  OpenServer o(l);
+  o.request(1);
+  answer(o, 1);
+  ghttp_h2_conn_tick(o.s.c, 0);
+  for (int round = 0; round < 3; round++) {
+    o.feed(priority(1) + priority(1) + frame(0xfa, 0, 0, "x") + frame(0xfa, 0, 0, "x")
+        + window_update(1, 1) + window_update(1, 1));
+    ASSERT_EQ(o.s.result, GHTTP_OK) << round;
+    ghttp_h2_conn_tick(o.s.c, 1000 * (round + 1));
+  }
+}
+
+// ---- The closed-stream ring ---------------------------------------------------------
+
+TEST(H2Streams, ALateFrameOnAStreamTheRingHasForgottenIsDiscardedNotAProtocolError) {
+  GHTTP_H2Limits l = limits();
+  l.max_closed_streams = 2;
+  l.manual_flow_control = 0;
+  OpenServer o(l);
+  for (uint32_t id : {1u, 3u, 5u, 7u}) {
+    o.request(id);
+    answer(o, id);
+  }
+  o.wrote();
+  // 1 and 3 have been forgotten; 5 and 7 are remembered as ended.
+  EXPECT_EQ(o.feed(data(5, "x")), (Events{"ERROR CORRUPT STREAM_CLOSED"}))
+      << "a remembered ended stream: DATA is STREAM_CLOSED";
+  {
+    OpenServer p(l);
+    for (uint32_t id : {1u, 3u, 5u, 7u}) {
+      p.request(id);
+      answer(p, id);
+    }
+    p.wrote();
+    EXPECT_EQ(p.feed(data(1, std::string(100, 'x'))), Events{}) << "forgotten: discarded";
+    EXPECT_EQ(p.s.result, GHTTP_OK);
+    // Its header block, too, is decoded (the table stays in step) and dropped.
+    EXPECT_EQ(p.feed(headers(3, p.blk({{"x-late", "1"}}), END_HEADERS)), Events{});
+    EXPECT_EQ(p.s.result, GHTTP_OK);
+    // The compression state stayed in step.
+    auto e = p.request(9, request_list("GET", "/", {{"x-late", "1"}}));
+    ASSERT_EQ(e.size(), 1u);
+    EXPECT_TRUE(has_prefix(e[0], "HEADERS 9")) << e[0];
+  }
+  {
+    // A stream id that was skipped is not "forgotten": it was never open, and
+    // section 5.1.1 makes a frame on it a protocol error.
+    OpenServer p(l);
+    for (uint32_t id : {1u, 3u, 5u, 7u}) {
+      p.request(id);
+      answer(p, id);
+    }
+    p.request(13);
+    EXPECT_EQ(p.feed(data(11, "x")), (Events{"ERROR CORRUPT PROTOCOL_ERROR"}));
+  }
+}
+
+TEST(H2Streams, WithNoClosedRingEveryClosedStreamIsForgottenAndItsLateFramesAreDiscarded) {
+  GHTTP_H2Limits l = limits();
+  l.max_closed_streams = 0;
+  OpenServer o(l);
+  o.request(1);
+  answer(o, 1);
+  EXPECT_EQ(o.feed(data(1, "x")), Events{});
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+}
+
+// ---- Flow-control credit in the corners ---------------------------------------------
+
+TEST(H2FlowReceive, AResetStreamWithUnconsumedDataGivesItsCreditBackToTheConnection) {
+  GHTTP_H2Limits l = limits();
+  l.manual_flow_control = 1;
+  l.initial_window_size = 40000;
+  FlowServer o(l);
+  for (int i = 0; i < 4; i++) o.feed(data(1, std::string(10000, 'x')));
+  o.wrote();
+  EXPECT_EQ(ghttp_h2_conn_connection_recv_window(o.s.c), 65535 - 40000);
+  o.feed(rst(1, GHTTP_H2_CANCEL));
+  EXPECT_EQ(window_updates_for(o.wrote(), 0), 40000u)
+      << "the application will never consume those octets";
+  EXPECT_EQ(ghttp_h2_conn_connection_recv_window(o.s.c), 65535);
+}
+
+TEST(H2FlowReceive, DataThatArrivesAfterOurRstStreamIsCreditedAndDiscarded_Section5_1) {
+  FlowServer o(limits());
+  ASSERT_EQ(ghttp_h2_conn_reset_stream(o.s.c, 1, GHTTP_H2_CANCEL), GHTTP_OK);
+  o.wrote();
+  EXPECT_EQ(o.feed(data(1, std::string(16384, 'x')) + data(1, std::string(16384, 'x'))), Events{});
+  EXPECT_EQ(o.s.result, GHTTP_OK);
+  EXPECT_EQ(window_updates_for(o.wrote(), 0), 32768u)
+      << "the connection window is not leaked by frames we threw away";
+}
+
+TEST(H2FlowReceive, CreditAfterTheRemoteEndedIsReturnedToTheConnectionAndNotTheStream) {
+  GHTTP_H2Limits l = limits();
+  l.manual_flow_control = 1;
+  FlowServer o(l);
+  o.feed(data(1, std::string(10000, 'x')) + data(1, std::string(10000, 'x'))
+      + data(1, std::string(10000, 'x')) + data(1, std::string(10000, 'x'), true));
+  o.wrote();
+  ASSERT_EQ(ghttp_h2_conn_consume(o.s.c, 1, 40000), GHTTP_OK);
+  auto fs = o.wrote();
+  EXPECT_EQ(window_updates_for(fs, 0), 40000u);
+  EXPECT_EQ(window_updates_for(fs, 1), 0u) << "the peer will send no more on the stream";
+}
+
+TEST(H2FlowReceive, ConsumingOnAStreamThatIsGoneIsAHarmlessNoOp) {
+  FlowServer o(limits());
+  EXPECT_EQ(ghttp_h2_conn_consume(o.s.c, 99, 5), GHTTP_OK);
+  EXPECT_TRUE(o.wrote().empty());
+}
+
+TEST(H2Preface, TheInitialConnectionWindowIsRaisedByAnUpdateAtTheStart) {
+  GHTTP_H2Limits l = limits();
+  l.connection_window = 100000;
+  Side s(GHTTP_H2_SERVER, &l);
+  uint64_t inc = 0;
+  for (auto & f : s.frames()) {
+    if (f.type == GHTTP_H2_WINDOW_UPDATE && f.stream == 0) inc += f.u32at(0);
+  }
+  EXPECT_EQ(inc, 100000u - 65535u);
+  EXPECT_EQ(ghttp_h2_conn_connection_recv_window(s.c), 100000);
+  Side d(GHTTP_H2_SERVER);
+  for (auto & f : d.frames()) EXPECT_NE(f.type, GHTTP_H2_WINDOW_UPDATE) << "the default needs none";
+}
+
+// ---- Receiving: DATA where there is no content --------------------------------------
+
+TEST(H2Client, DataOnAResponseThatHasNoContentIsAStreamProtocolError_Section8_1_1) {
+  struct Case { const char * what; const char * method; int status; };
+  const Case cases[] = {
+    {"a response to HEAD", "HEAD", 200},
+    {"204", "GET", 204},
+    {"304", "GET", 304},
+  };
+  for (const Case & k : cases) {
+    SCOPED_TRACE(k.what);
+    Side c(GHTTP_H2_CLIENT);
+    c.feed(settings({}));
+    GHTTP_Request * r = nullptr;
+    ASSERT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_method(r, k.method), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_target(r, "/"), GHTTP_OK);
+    uint32_t id = 0;
+    ASSERT_EQ(ghttp_h2_conn_send_request(c.c, r, "https", 1, &id), GHTTP_OK);
+    ghttp_request_destroy(r);
+    c.events.clear();
+    Block b;
+    c.feed(headers(id, b(response_list(k.status)), END_HEADERS));
+    c.feed(data(id, "x"));
+    ASSERT_EQ(c.events.size(), 2u);
+    EXPECT_TRUE(has_prefix(c.events[0], "HEADERS 1")) << c.events[0];
+    EXPECT_EQ(c.events[1], "STREAM_ERROR 1 PROTOCOL_ERROR");
+    EXPECT_EQ(c.result, GHTTP_OK);
+  }
+  // An empty DATA frame that ends the stream is fine.
+  Side c(GHTTP_H2_CLIENT);
+  c.feed(settings({}));
+  GHTTP_Request * r = nullptr;
+  ASSERT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+  ASSERT_EQ(ghttp_request_set_method(r, "HEAD"), GHTTP_OK);
+  ASSERT_EQ(ghttp_request_set_target(r, "/"), GHTTP_OK);
+  uint32_t id = 0;
+  ASSERT_EQ(ghttp_h2_conn_send_request(c.c, r, "https", 1, &id), GHTTP_OK);
+  ghttp_request_destroy(r);
+  c.events.clear();
+  Block b;
+  c.feed(headers(id, b(response_list(200, {{"content-length", "5"}})), END_HEADERS));
+  c.feed(data(id, "", true));
+  EXPECT_EQ(c.events.size(), 2u);
+  EXPECT_EQ(c.events[1], "DATA 1 end \"\"");
+}
+
+TEST(H2Server, MoreMalformedRequestsFromTheReviewAreStreamErrors_Section8) {
+  const std::vector<Malformed> bad = {
+    {"8.3.1 :authority with a space", request_list("GET", "/", {}, "exa mple.com")},
+    {"8.3.1 :authority with a control character", request_list("GET", "/", {}, "example\x01.com")},
+    {"8.3.1 :path with a space", request_list("GET", "/a b")},
+    {"8.3.1 :path with a control character", request_list("GET", "/a\x7f")},
+    {"8.3.2 a request carrying :status", {{":method", "GET"}, {":scheme", "https"}, {":path", "/"}, {":status", "1:0"}}},
+  };
+  for (const Malformed & m : bad) {
+    OpenServer o;
+    EXPECT_EQ(o.request(1, m.list), (Events{"STREAM_ERROR 1 PROTOCOL_ERROR"})) << m.what;
+  }
+}
+
+TEST(H2Client, AStatusThatIsNotThreeDigitsIsMalformed_Section8_3_2) {
+  for (const char * status : {"1:0", "20", "2000", "abc", "99", "600", "101", " 20", "2 0"}) {
+    SCOPED_TRACE(status);
+    Side c(GHTTP_H2_CLIENT);
+    c.feed(settings({}));
+    GHTTP_Request * r = nullptr;
+    ASSERT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_method(r, "GET"), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_target(r, "/"), GHTTP_OK);
+    uint32_t id = 0;
+    ASSERT_EQ(ghttp_h2_conn_send_request(c.c, r, "https", 1, &id), GHTTP_OK);
+    ghttp_request_destroy(r);
+    c.events.clear();
+    Block b;
+    c.feed(headers(id, b({{":status", status}}), END_HEADERS | END_STREAM));
+    EXPECT_EQ(c.events, (Events{"STREAM_ERROR 1 PROTOCOL_ERROR"}));
+  }
+}
+
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

@@ -9,6 +9,8 @@
  */
 
 #include <algorithm>
+#include <cctype>
+#include <functional>
 #include <map>
 #include <random>
 
@@ -459,7 +461,9 @@ TEST(H2Interop, AGoawayStopsNewStreamsAndDropsTheUnprocessedOnes_Section6_8) {
   ASSERT_EQ(ghttp_h2_conn_shutdown(p.s.c, GHTTP_H2_NO_ERROR, "", 0), GHTTP_OK);
   std::string bye = p.s.unsent();
   p.c.feed(bye);
-  EXPECT_EQ(p.c.events.back(), "GOAWAY last=1 NO_ERROR \"\"");
+  ASSERT_GE(p.c.events.size(), 2u);
+  EXPECT_EQ(p.c.events[p.c.events.size() - 2], "GOAWAY last=1 NO_ERROR \"\"");
+  EXPECT_EQ(p.c.events.back(), "UNPROCESSED 3") << "the application is told, so it can retry";
   EXPECT_FALSE(ghttp_h2_conn_can_open_stream(p.c.c));
   EXPECT_TRUE(ghttp_h2_conn_stream_is_active(p.c.c, a));
   EXPECT_FALSE(ghttp_h2_conn_stream_is_active(p.c.c, b)) << "above the last stream identifier: it will not be answered";
@@ -740,6 +744,304 @@ TEST(H2Oom, EveryAllocationRefusedInTurnIsOomOrTheSameConversationAndNeverALeak)
     }
   }
 }
+
+
+// ---- Review findings: the sending side, GOAWAY at a client, windows and limits ---------
+
+extern "C" GHTTP_Result ghttp_headers_add_raw(GHTTP_Headers * headers, const char * name,
+    size_t name_len, const char * value, size_t value_len);
+extern "C" GHTTP_Result ghttp_request_assign(GHTTP_Request * request, const char * method,
+    size_t method_len, const char * target, size_t target_len, int minor);
+
+namespace {
+
+/** Decodes the header blocks a connection wrote, in order, with one decoder. */
+struct Wire {
+  GHTTP_HpackDecoder * d = nullptr;
+  Wire() { EXPECT_EQ(ghttp_hpack_decoder_create(nullptr, nullptr, 4096, &d), GHTTP_OK); }
+  ~Wire() { ghttp_hpack_decoder_destroy(d); }
+  /** The fields of every HEADERS block in @p fs (no CONTINUATIONs expected), "name: value" each. */
+  std::vector<std::vector<std::string>> blocks(const std::vector<OutFrame> & fs) {
+    std::vector<std::vector<std::string>> out;
+    for (auto & f : fs) {
+      if (f.type != GHTTP_H2_HEADERS) continue;
+      EXPECT_TRUE(f.flags & GHTTP_H2_FLAG_END_HEADERS);
+      GHTTP_Headers * h = nullptr;
+      EXPECT_EQ(ghttp_headers_create(nullptr, &h), GHTTP_OK);
+      EXPECT_EQ(ghttp_hpack_decode(d, f.payload.data(), f.payload.size(), h), GHTTP_OK);
+      std::vector<std::string> v;
+      for (size_t i = 0; i < ghttp_headers_count(h); i++) {
+        GHTTP_Field fld;
+        ghttp_headers_at(h, i, &fld);
+        v.push_back(std::string(fld.name, fld.name_len) + ": " + std::string(fld.value, fld.value_len));
+      }
+      ghttp_headers_destroy(h);
+      out.push_back(v);
+    }
+    return out;
+  }
+};
+
+GHTTP_Request * raw_request(const std::string & method, const std::string & target) {
+  GHTTP_Request * r = nullptr;
+  EXPECT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+  EXPECT_EQ(ghttp_request_assign(r, method.data(), method.size(), target.data(), target.size(), 1), GHTTP_OK);
+  return r;
+}
+
+void add_raw(GHTTP_Headers * h, const std::string & n, const std::string & v) {
+  ASSERT_EQ(ghttp_headers_add_raw(h, n.data(), n.size(), v.data(), v.size()), GHTTP_OK);
+}
+
+} // namespace
+
+TEST(H2Interop, AGoawayReportsEveryUnprocessedStreamInOrderAndLateFramesForThemAreDiscarded_Section6_8) {
+  Pair p;
+  uint32_t a = open_stream(p.c, "GET", "/a");
+  p.pump_all();
+  uint32_t b = open_stream(p.c, "GET", "/b");
+  uint32_t c3 = open_stream(p.c, "POST", "/c", {}, false);
+  uint32_t d = open_stream(p.c, "GET", "/d");
+  ASSERT_EQ(ghttp_h2_conn_shutdown(p.s.c, GHTTP_H2_NO_ERROR, "", 0), GHTTP_OK);
+  p.c.events.clear();
+  p.c.feed(p.s.unsent());
+  EXPECT_EQ(p.c.events, (std::vector<std::string>{"GOAWAY last=1 NO_ERROR \"\"",
+      "UNPROCESSED " + std::to_string(b), "UNPROCESSED " + std::to_string(c3),
+      "UNPROCESSED " + std::to_string(d)}));
+  EXPECT_TRUE(ghttp_h2_conn_stream_is_active(p.c.c, a));
+  EXPECT_EQ(p.c.result, GHTTP_OK);
+  // What the server sends for them anyway (it may have started before the
+  // GOAWAY): discarded, not an error.
+  p.c.events.clear();
+  p.c.feed(rst(b, GHTTP_H2_REFUSED_STREAM) + window_update(c3, 5));
+  EXPECT_EQ(p.c.events, std::vector<std::string>{});
+  EXPECT_EQ(p.c.result, GHTTP_OK);
+}
+
+TEST(H2Interop, AFieldNameOf200MixedCaseOctetsArrivesLowercased) {
+  std::string name = "X-";
+  for (int i = 0; i < 99; i++) name += "Ab";
+  ASSERT_EQ(name.size(), 200u);
+  Pair p;
+  open_stream(p.c, "GET", "/", {{name, "v"}});
+  p.pump_all();
+  std::string lowered = name;
+  for (char & ch : lowered) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+  ASSERT_FALSE(p.s.events.empty());
+  EXPECT_NE(p.s.events.back().find("[" + lowered + ": v]"), std::string::npos) << p.s.events.back();
+}
+
+TEST(H2Interop, ARequestTheConnectionCannotSendIsInvalidAndCostsNothing_Section8) {
+  struct Bad {
+    const char * what;
+    std::function<GHTTP_Request *()> make;
+    const char * scheme;
+  };
+  auto with_field = [](const std::string & n, const std::string & v) {
+    return [n, v]() {
+      GHTTP_Request * r = raw_request("GET", "/");
+      add_raw(ghttp_request_headers(r), n, v);
+      return r;
+    };
+  };
+  const std::vector<Bad> bad = {
+    {"authority-form with GET", [] { return raw_request("GET", "example.com:443"); }, "https"},
+    {"asterisk with GET", [] { return raw_request("GET", "*"); }, "https"},
+    {"CONNECT with origin-form", [] { return raw_request("CONNECT", "/x"); }, "https"},
+    {"CONNECT with absolute-form", [] { return raw_request("CONNECT", "http://h/x"); }, "https"},
+    {"absolute-form with an empty authority", [] { return raw_request("GET", "http:///x"); }, "https"},
+    {"an empty field name", with_field("", "v"), "https"},
+    {"a field name with a space", with_field("a b", "v"), "https"},
+    {"a pseudo-header name as a field", with_field(":path", "/"), "https"},
+    {"a field name of high-bit octets", with_field("\xe9", "v"), "https"},
+    {"LF in a value", with_field("x", "a\nb"), "https"},
+    {"CR in a value", with_field("x", "a\rb"), "https"},
+    {"NUL in a value", with_field("x", std::string("a\0b", 3)), "https"},
+    {"a leading space in a value", with_field("x", " a"), "https"},
+    {"a trailing space in a value", with_field("x", "a "), "https"},
+    {"a trailing tab in a value", with_field("x", "a\t"), "https"},
+    {"te other than trailers", with_field("te", "gzip"), "https"},
+    {"connection", with_field("connection", "close"), "https"},
+    {"two Host fields", [] {
+       GHTTP_Request * r = raw_request("GET", "/");
+       add_raw(ghttp_request_headers(r), "host", "a.example");
+       add_raw(ghttp_request_headers(r), "host", "a.example");
+       return r;
+     }, "https"},
+    {"a Host that differs from the target's authority", [] {
+       GHTTP_Request * r = raw_request("GET", "http://a.example/x");
+       add_raw(ghttp_request_headers(r), "host", "b.example");
+       return r;
+     }, "https"},
+    {"a Host with a control character", [] {
+       GHTTP_Request * r = raw_request("GET", "/");
+       add_raw(ghttp_request_headers(r), "host", "a\x01.example");
+       return r;
+     }, "https"},
+    {"userinfo in the authority of an https request", [] { return raw_request("GET", "https://u:p@a.example/"); }, "https"},
+    {"an empty scheme", [] { return raw_request("GET", "/"); }, ""},
+    {"a scheme with a space", [] { return raw_request("GET", "/"); }, "ht tp"},
+    {"a scheme that starts with a digit", [] { return raw_request("GET", "/"); }, "1http"},
+    {"a scheme with a control character", [] { return raw_request("GET", "/"); }, "ht\ttp"},
+  };
+  for (const Bad & b : bad) {
+    SCOPED_TRACE(b.what);
+    Pair p;
+    GHTTP_Request * r = b.make();
+    uint32_t id = 777;
+    EXPECT_EQ(ghttp_h2_conn_send_request(p.c.c, r, b.scheme, 1, &id), GHTTP_ERR_INVALID);
+    ghttp_request_destroy(r);
+    EXPECT_EQ(id, 777u) << "no stream was opened";
+    EXPECT_EQ(ghttp_h2_conn_stream_count(p.c.c), 0u);
+    EXPECT_TRUE(p.c.unsent().empty()) << "nothing was written";
+    EXPECT_EQ(p.c.result, GHTTP_OK);
+    // The next request still gets the first stream identifier.
+    EXPECT_EQ(open_stream(p.c, "GET", "/ok"), 1u);
+  }
+}
+
+TEST(H2Interop, ARequestWithAHostAndNoAuthorityInItsTargetSendsAuthorityAndNoHostField_Section8_3_1) {
+  Pair p;
+  open_stream(p.c, "GET", "/x?y", {{"Host", "example.org"}, {"Accept", "*/*"}});
+  Wire w;
+  auto blocks = w.blocks(parse_frames(p.c.unsent()));
+  ASSERT_EQ(blocks.size(), 1u);
+  EXPECT_EQ(blocks[0], (std::vector<std::string>{":method: GET", ":scheme: https",
+      ":authority: example.org", ":path: /x?y", "accept: */*"}))
+      << "one authority, no host field beside it";
+}
+
+TEST(H2Interop, AFragmentIsNeverSent_RfcSection7_1) {
+  Pair p;
+  open_stream(p.c, "GET", "/a?b#frag");
+  GHTTP_Request * r = raw_request("GET", "http://h.example/p#f");
+  uint32_t id;
+  ASSERT_EQ(ghttp_h2_conn_send_request(p.c.c, r, "https", 1, &id), GHTTP_OK);
+  ghttp_request_destroy(r);
+  r = raw_request("GET", "http://h.example?q=1#f");
+  ASSERT_EQ(ghttp_h2_conn_send_request(p.c.c, r, "https", 1, &id), GHTTP_OK);
+  ghttp_request_destroy(r);
+  Wire w;
+  auto blocks = w.blocks(parse_frames(p.c.unsent()));
+  ASSERT_EQ(blocks.size(), 3u);
+  ASSERT_EQ(blocks[0].size(), 3u) << "no authority: the target had none and there was no Host";
+  EXPECT_EQ(blocks[0][2], ":path: /a?b");
+  EXPECT_EQ(blocks[1][2], ":authority: h.example");
+  EXPECT_EQ(blocks[1][3], ":path: /p");
+  EXPECT_EQ(blocks[1][1], ":scheme: http") << "the target's scheme wins";
+  EXPECT_EQ(blocks[2][3], ":path: /?q=1");
+}
+
+TEST(H2Interop, AMatchingHostFieldBesideAnAbsoluteTargetIsAccepted) {
+  Pair p;
+  GHTTP_Request * r = raw_request("GET", "https://Example.ORG/x");
+  add_raw(ghttp_request_headers(r), "host", "example.org");
+  uint32_t id;
+  EXPECT_EQ(ghttp_h2_conn_send_request(p.c.c, r, "https", 1, &id), GHTTP_OK);
+  ghttp_request_destroy(r);
+}
+
+TEST(H2Interop, AResponseOrTrailersTheConnectionCannotSendAreInvalid) {
+  Pair p;
+  uint32_t id = open_stream(p.c, "GET", "/");
+  p.pump_all();
+  GHTTP_Response * bad = make_response(200);
+  add_raw(ghttp_response_headers(bad), "a b", "v");
+  EXPECT_EQ(ghttp_h2_conn_send_response(p.s.c, id, bad, 1), GHTTP_ERR_INVALID);
+  ghttp_response_destroy(bad);
+  bad = make_response(200);
+  add_raw(ghttp_response_headers(bad), "x", "line\nbreak");
+  EXPECT_EQ(ghttp_h2_conn_send_response(p.s.c, id, bad, 1), GHTTP_ERR_INVALID);
+  ghttp_response_destroy(bad);
+  EXPECT_TRUE(p.s.unsent().empty());
+  // The stream is still answerable.
+  respond(p.s, id, 200, {}, false);
+  GHTTP_Headers * t;
+  ASSERT_EQ(ghttp_headers_create(nullptr, &t), GHTTP_OK);
+  add_raw(t, "x t", "v");
+  EXPECT_EQ(ghttp_h2_conn_send_trailers(p.s.c, id, t), GHTTP_ERR_INVALID);
+  ghttp_headers_destroy(t);
+}
+
+TEST(H2Interop, SendTrailersIsRefusedBeforeTheResponseOnATunnelAndAfterTheEnd) {
+  Pair p;
+  uint32_t id = open_stream(p.c, "POST", "/", {}, false);
+  p.pump_all();
+  GHTTP_Headers * t;
+  ASSERT_EQ(ghttp_headers_create(nullptr, &t), GHTTP_OK);
+  ASSERT_EQ(ghttp_headers_add(t, "x-t", "1"), GHTTP_OK);
+  EXPECT_EQ(ghttp_h2_conn_send_trailers(p.s.c, id, t), GHTTP_ERR_INVALID) << "no response headers yet";
+  respond(p.s, id, 200, {}, false);
+  ASSERT_EQ(ghttp_h2_conn_set_stream_mode(p.s.c, id, GHTTP_H2_STREAM_TUNNEL), GHTTP_OK);
+  EXPECT_EQ(ghttp_h2_conn_send_trailers(p.s.c, id, t), GHTTP_ERR_INVALID) << "a tunnel has no trailers";
+  ASSERT_EQ(ghttp_h2_conn_set_stream_mode(p.s.c, id, GHTTP_H2_STREAM_MESSAGE), GHTTP_OK);
+  EXPECT_EQ(ghttp_h2_conn_send_trailers(p.s.c, id, t), GHTTP_OK);
+  EXPECT_EQ(ghttp_h2_conn_send_trailers(p.s.c, id, t), GHTTP_ERR_INVALID) << "the stream has ended";
+  ghttp_headers_destroy(t);
+}
+
+TEST(H2Interop, CanOpenStreamReflectsTheBufferedOutputAndTheStreamLimits) {
+  {
+    GHTTP_H2Limits l = limits();
+    l.max_buffered_bytes = l.max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE;
+    Side c(GHTTP_H2_CLIENT, &l);
+    EXPECT_TRUE(ghttp_h2_conn_can_open_stream(c.c));
+    uint8_t d[8] = {0};
+    for (int i = 0; i < 1100; i++) ASSERT_EQ(ghttp_h2_conn_ping(c.c, d), GHTTP_OK);
+    ASSERT_GT(ghttp_h2_conn_output_size(c.c), l.max_buffered_bytes);
+    EXPECT_FALSE(ghttp_h2_conn_can_open_stream(c.c)) << "the queued output is over its limit";
+    GHTTP_Request * r = make_request("GET", "/");
+    uint32_t id;
+    EXPECT_EQ(ghttp_h2_conn_send_request(c.c, r, "https", 1, &id), GHTTP_ERR_LIMIT);
+    ghttp_request_destroy(r);
+    c.drain();
+    EXPECT_TRUE(ghttp_h2_conn_can_open_stream(c.c));
+  }
+  {
+    GHTTP_H2Limits l = limits();
+    l.max_streams = 2;
+    Side c(GHTTP_H2_CLIENT, &l);
+    open_stream(c, "GET", "/a", {}, false);
+    open_stream(c, "GET", "/b", {}, false);
+    EXPECT_FALSE(ghttp_h2_conn_can_open_stream(c.c));
+    GHTTP_Request * r = make_request("GET", "/c");
+    uint32_t id;
+    EXPECT_EQ(ghttp_h2_conn_send_request(c.c, r, "https", 1, &id), GHTTP_ERR_LIMIT);
+    ghttp_request_destroy(r);
+  }
+}
+
+TEST(H2Interop, TheEncodersTableIsNeverLargerThanTheLimitWhateverThePeerAllows_Section4_2) {
+  GHTTP_H2Limits l = limits();
+  l.max_encoder_table_size = 100;
+  Side c(GHTTP_H2_CLIENT, &l);
+  c.feed(settings({{GHTTP_H2_SETTINGS_HEADER_TABLE_SIZE, 50}}));
+  c.feed(settings({{GHTTP_H2_SETTINGS_HEADER_TABLE_SIZE, 8000}}));
+  c.drain();
+  c.mark();
+  open_stream(c, "GET", "/");
+  auto fs = c.frames_since_mark();
+  ASSERT_FALSE(fs.empty());
+  const OutFrame * h = nullptr;
+  for (auto & f : fs) if (f.type == GHTTP_H2_HEADERS) { h = &f; break; }
+  ASSERT_NE(h, nullptr);
+  // The smallest size reached (50), then the final one, which is the limit (100), not 8000.
+  EXPECT_EQ(h2hex(h->payload.substr(0, 4)), "3f133f45");
+  GHTTP_H2Settings peer;
+  ghttp_h2_conn_peer_settings(c.c, &peer);
+  EXPECT_EQ(peer.header_table_size, 8000u) << "the peer's value is reported as it was";
+}
+
+TEST(H2Interop, AnExtensionFrameLargerThanThePeerAcceptsIsInvalid) {
+  Pair p;
+  std::string max(p.c.c ? 16384 : 0, 'x');
+  EXPECT_EQ(ghttp_h2_conn_send_extension_frame(p.c.c, 0xfa, 0, 0, max.data(), max.size()), GHTTP_OK);
+  std::string over(16385, 'x');
+  EXPECT_EQ(ghttp_h2_conn_send_extension_frame(p.c.c, 0xfa, 0, 0, over.data(), over.size()),
+      GHTTP_ERR_INVALID);
+  EXPECT_EQ(p.c.result, GHTTP_OK);
+}
+
 
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);

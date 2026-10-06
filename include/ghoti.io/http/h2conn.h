@@ -129,9 +129,11 @@ GHTTP_API void ghttp_h2_settings_default(GHTTP_H2Settings * settings);
  *
  * The ones that count frames count them per interval: the interval is
  * @c interval_ms of the clock the caller supplies with ghttp_h2_conn_tick().
- * A caller that never ticks gets a count that never renews, so the limit
- * applies to the connection's whole life: unsafe for a long-lived connection,
- * safe in the sense that nothing is left unbounded.
+ * A caller that never ticks gets a count that never renews, so SETTINGS, PING,
+ * RST_STREAM, PRIORITY, extension and ignored WINDOW_UPDATE frames are each
+ * capped over the connection's whole life: unsafe for a long-lived
+ * connection, safe in the sense that nothing is left unbounded. A backwards
+ * clock reading also starts a new interval.
  */
 typedef struct GHTTP_H2Limits {
   size_t size;  ///< sizeof(GHTTP_H2Limits); set by _default().
@@ -163,11 +165,25 @@ typedef struct GHTTP_H2Limits {
   size_t max_field_bytes;
   /** Octets of message content in one stream (not applied to a tunnel). */
   uint64_t max_body_bytes;
-  /** Octets held at once: a partial frame, a header block being gathered, and queued output. */
+  /**
+   * Octets held at once: a partial frame, a header block being gathered, and
+   * queued output, input and output sharing this one limit. Must be at least
+   * max_frame_size + 9 (a whole frame has to fit), or ghttp_h2_conn_create()
+   * says GHTTP_ERR_INVALID. The caller must drain ghttp_h2_conn_output() for
+   * input to be accepted: a peer that provokes replies faster than they are
+   * written ends the connection with ENHANCE_YOUR_CALM.
+   */
   size_t max_buffered_bytes;
   /** Streams open at once, both directions together. */
   uint32_t max_streams;
-  /** Closed streams remembered so that late frames on them can be told from errors. */
+  /**
+   * Closed streams remembered so that late frames on them can be told from
+   * errors. Keep it above max_rst_per_interval: a burst of resets that
+   * overflows the memory leaves frames for the forgotten streams to be
+   * judged by the rule for "closed so long ago it is not remembered", which
+   * discards them (a stream id at or below the highest forgotten one) rather
+   * than failing the connection.
+   */
   uint32_t max_closed_streams;
 
   // Per interval.
@@ -175,10 +191,21 @@ typedef struct GHTTP_H2Limits {
   uint32_t max_settings_per_interval;
   /** PING frames (ACKs included). */
   uint32_t max_ping_per_interval;
-  /** RST_STREAM frames: the rapid-reset limit (CVE-2023-44487). */
+  /**
+   * RST_STREAM frames: the rapid-reset limit (CVE-2023-44487). Counted are the
+   * frames the peer sends and the ones this endpoint sends because of what
+   * the peer sent (a malformed request, a refused stream, a flow-control
+   * violation); a reset the application asks for is not counted.
+   */
   uint32_t max_rst_per_interval;
-  /** DATA frames with no data and no END_STREAM, in a row. */
+  /** DATA frames with no data and no END_STREAM in a row; any HEADERS, or DATA with data or END_STREAM, ends the run. */
   uint32_t max_empty_data_frames;
+  /** PRIORITY frames (the scheme is deprecated; they are accepted and ignored). */
+  uint32_t max_priority_per_interval;
+  /** Frames of a type this library does not know (they go to the extension handler, if any). */
+  uint32_t max_extension_per_interval;
+  /** WINDOW_UPDATE frames for streams that no longer exist: they have no effect. */
+  uint32_t max_ignored_window_updates_per_interval;
   /** Length of an interval. */
   uint32_t interval_ms;
 
@@ -197,11 +224,14 @@ typedef struct GHTTP_H2Limits {
 #define GHTTP_H2_DEFAULT_MAX_BODY_BYTES ((uint64_t)16 << 20)
 #define GHTTP_H2_DEFAULT_MAX_BUFFERED_BYTES ((size_t)1 << 20)
 #define GHTTP_H2_DEFAULT_MAX_STREAMS 256u
-#define GHTTP_H2_DEFAULT_MAX_CLOSED_STREAMS 256u
+#define GHTTP_H2_DEFAULT_MAX_CLOSED_STREAMS 512u
 #define GHTTP_H2_DEFAULT_MAX_SETTINGS_PER_INTERVAL 32u
 #define GHTTP_H2_DEFAULT_MAX_PING_PER_INTERVAL 32u
 #define GHTTP_H2_DEFAULT_MAX_RST_PER_INTERVAL 200u
 #define GHTTP_H2_DEFAULT_MAX_EMPTY_DATA_FRAMES 32u
+#define GHTTP_H2_DEFAULT_MAX_PRIORITY_PER_INTERVAL 1000u
+#define GHTTP_H2_DEFAULT_MAX_EXTENSION_PER_INTERVAL 1000u
+#define GHTTP_H2_DEFAULT_MAX_IGNORED_WINDOW_UPDATES_PER_INTERVAL 1000u
 #define GHTTP_H2_DEFAULT_INTERVAL_MS 10000u
 
 GHTTP_API void ghttp_h2_limits_default(GHTTP_H2Limits * limits);
@@ -242,7 +272,14 @@ typedef enum GHTTP_H2EventType {
   /** A PING ACK arrived; `data` is its 8 octets. */
   GHTTP_H2_EVENT_PING_ACK,
   /** A send window opened by `increment` on `stream_id` (0: the connection). */
-  GHTTP_H2_EVENT_WINDOW_UPDATE
+  GHTTP_H2_EVENT_WINDOW_UPDATE,
+  /**
+   * A client's stream above the last_stream_id of the peer's GOAWAY: the peer
+   * did not process it, so the request may be sent again on another
+   * connection. One event per such stream, in the calls to ghttp_h2_conn_feed()
+   * after the GOAWAY event (before more input is read); the stream is closed.
+   */
+  GHTTP_H2_EVENT_STREAM_UNPROCESSED
 } GHTTP_H2EventType;
 
 /** What ghttp_h2_conn_feed() reports. Filled in whole on every call that returns GHTTP_OK. */
@@ -278,10 +315,16 @@ GHTTP_API void ghttp_h2_conn_destroy(GHTTP_H2Conn * conn);
  * Call again with the rest until the event is GHTTP_H2_EVENT_NEED_MORE. The
  * events, and the output queued, are the same however the input is cut.
  *
- * @param[out] consumed Octets used.
- * @param[out] event What happened. Written on GHTTP_OK only.
+ * @param[out] consumed Octets used. Written on every return, 0 when nothing
+ *   was: after an error it is how far the input was read, and the connection
+ *   is finished anyway.
+ * @param[out] event What happened. Written on every return: zeroed (type
+ *   GHTTP_H2_EVENT_NEED_MORE, size set) unless the call reported something,
+ *   so it is never stale.
  * @return GHTTP_OK, or the connection error (see the file comment). Once an
  *   error has been returned, it is returned again and nothing is consumed.
+ *   GHTTP_ERR_INVALID (a NULL argument) is the one return that writes
+ *   neither output.
  */
 GHTTP_API GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * conn, const void * data,
     size_t len, size_t * consumed, GHTTP_H2Event * event);
@@ -385,12 +428,18 @@ GHTTP_API GHTTP_Result ghttp_h2_conn_ping(GHTTP_H2Conn * conn, const uint8_t dat
 /**
  * Send GOAWAY with the highest peer-initiated stream accepted so far. Streams
  * the peer opens after it are refused. The connection stays usable for what is
- * in flight; the caller closes it when that is done.
+ * in flight; the caller closes it when that is done. The last stream id of a
+ * GOAWAY never rises (RFC 9113 section 6.8): a later call, and the GOAWAY a
+ * connection error sends, carry the id of the first one or lower.
  */
 GHTTP_API GHTTP_Result ghttp_h2_conn_shutdown(GHTTP_H2Conn * conn,
     uint32_t error_code, const void * debug, size_t debug_len);
 
-/** Send a frame of a type this document does not define (an extension). */
+/**
+ * Send a frame of a type this document does not define (an extension).
+ * GHTTP_ERR_INVALID for a defined type or a payload longer than the peer's
+ * SETTINGS_MAX_FRAME_SIZE.
+ */
 GHTTP_API GHTTP_Result ghttp_h2_conn_send_extension_frame(GHTTP_H2Conn * conn,
     uint8_t type, uint8_t flags, uint32_t stream_id, const void * payload,
     size_t len);

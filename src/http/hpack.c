@@ -751,6 +751,12 @@ GHTTP_Result ghttp_hpack_encode(
     }
     if (r != GHTTP_OK) {
       ghttp_buffer_truncate(out, mark);
+      if (i > 0 && e->failed == GHTTP_OK) {
+        // Earlier fields of this list are in the table (and the pending
+        // size update has been spent on the block just thrown away): the
+        // peer's decoder and this encoder can no longer agree.
+        e->failed = r;
+      }
       return r;
     }
   }

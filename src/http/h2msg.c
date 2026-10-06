@@ -52,6 +52,22 @@ static bool value_ok(const char * v, size_t n) {
   return true;
 }
 
+static bool same_text_ignoring_case(
+    const char * a, size_t an, const char * b, size_t bn) {
+  if (an != bn) {
+    return false;
+  }
+  for (size_t i = 0; i < an; i++) {
+    char x = a[i], y = b[i];
+    x = (x >= 'A' && x <= 'Z') ? (char)(x + 32) : x;
+    y = (y >= 'A' && y <= 'Z') ? (char)(y + 32) : y;
+    if (x != y) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Section 8.2.2 and RFC 9110 7.6.1. */
 static bool is_connection_specific(const char * name, size_t n) {
   return ghttp_ieq(name, n, "connection") || ghttp_ieq(name, n, "proxy-connection")
@@ -304,6 +320,18 @@ GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
   }
   GHTTP_Headers * out = ghttp_request_headers(req);
   ghttp_headers_clear(out);
+  if (ps.seen & P_AUTHORITY) {
+    // A Host field beside :authority must say the same (RFC 9113 section 8.3.1).
+    for (size_t at = ghttp_headers_find(list, "host", 0); at != GHTTP_HEADERS_NPOS;
+         at = ghttp_headers_find(list, "host", at + 1)) {
+      GHTTP_Field hf;
+      ghttp_headers_at(list, at, &hf);
+      if (!same_text_ignoring_case(
+              ps.authority, ps.authority_len, hf.value, hf.value_len)) {
+        return GHTTP_ERR_CORRUPT;
+      }
+    }
+  }
   bool host = (ps.seen & P_AUTHORITY) && !has_host(list);
   r = copy_regular(alloc, list, out, host, ps.authority, ps.authority_len);
   if (r != GHTTP_OK) {
@@ -387,9 +415,19 @@ bool ghttp_h2msg_status_has_no_content(int status) {
   return (status >= 100 && status < 200) || status == 204 || status == 304;
 }
 
-/** Add a field with a lower-cased name; GHTTP_ERR_INVALID for one HTTP/2 forbids. */
+/**
+ * Add a field with a lower-cased name; GHTTP_ERR_INVALID for what HTTP/2
+ * cannot carry: an empty name or one that is not a token (a pseudo-header name
+ * included: those are added by the builders alone), a value with NUL, CR or LF
+ * or with a space or tab at either end (section 8.2.1), and a
+ * connection-specific field.
+ */
 static GHTTP_Result add_lowered(const GHTTP_Allocator * alloc,
     GHTTP_Headers * list, const GHTTP_Field * f) {
+  if (f->name_len == 0 || !ghttp_is_token(f->name, f->name_len)
+      || !value_ok(f->value, f->value_len)) {
+    return GHTTP_ERR_INVALID;
+  }
   if (is_connection_specific(f->name, f->name_len)) {
     return GHTTP_ERR_INVALID;
   }
@@ -421,117 +459,154 @@ static GHTTP_Result add_pseudo(GHTTP_Headers * list, const char * name,
   return ghttp_headers_add_raw(list, name, strlen(name), value, value_len);
 }
 
+/** RFC 3986 section 3.1: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). */
+static bool scheme_ok(const char * s, size_t n) {
+  if (n == 0 || !((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))) {
+    return false;
+  }
+  for (size_t i = 1; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool is_web_scheme(const char * s, size_t n) {
+  return same_text_ignoring_case(s, n, "http", 4)
+      || same_text_ignoring_case(s, n, "https", 5);
+}
+
 GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
     const GHTTP_Request * request, const char * scheme, GHTTP_Headers * list,
     bool * connect) {
-  if (!request || !list) {
+  if (!request || !list || !connect) {
     return GHTTP_ERR_INVALID;
   }
   const char * method = ghttp_request_method(request);
   const char * target = ghttp_request_target(request);
+  size_t mlen = strlen(method);
   GHTTP_TargetForm form;
-  if (ghttp_request_target_form(request, &form) != GHTTP_OK) {
+  if (!ghttp_is_token(method, mlen)
+      || ghttp_request_target_form(request, &form) != GHTTP_OK) {
     return GHTTP_ERR_INVALID;
   }
   const GHTTP_Headers * h = ghttp_request_headers_const(request);
-  bool is_connect = strcmp(method, "CONNECT") == 0;
+  bool is_connect = mlen == 7 && memcmp(method, "CONNECT", 7) == 0;
+  bool is_options = mlen == 7 && memcmp(method, "OPTIONS", 7) == 0;
   *connect = is_connect;
   ghttp_headers_clear(list);
 
-  const char * authority = NULL;
+  // A fragment is never sent (RFC 9110 section 7.1).
+  size_t tlen = strlen(target);
+  const char * hash = memchr(target, '#', tlen);
+  if (hash && form != GHTTP_TARGET_AUTHORITY) {
+    tlen = (size_t)(hash - target);
+  }
+
+  const char * sch = scheme ? scheme : "https";
+  size_t sch_len = strlen(sch);
+  const char * authority = NULL;  // from the target, if its form has one
   size_t authority_len = 0;
   const char * path = NULL;
   size_t path_len = 0;
-  const char * sch = scheme ? scheme : "https";
-  size_t sch_len = strlen(sch);
-  size_t tlen = strlen(target);
-  size_t host_idx = ghttp_headers_find(h, "host", 0);
-  GHTTP_Field hf = {0};
-  if (host_idx != GHTTP_HEADERS_NPOS) {
-    ghttp_headers_at(h, host_idx, &hf);
-  }
+  char * path_buf = NULL;
+  GHTTP_Result r = GHTTP_OK;
+
   switch (form) {
     case GHTTP_TARGET_ORIGIN:
       if (is_connect) {
-        return GHTTP_ERR_INVALID;
+        return GHTTP_ERR_INVALID;  // CONNECT takes authority-form
       }
       path = target;
       path_len = tlen;
       break;
     case GHTTP_TARGET_ASTERISK:
+      if (!is_options) {
+        return GHTTP_ERR_INVALID;  // "*" is for OPTIONS alone
+      }
       path = "*";
       path_len = 1;
       break;
     case GHTTP_TARGET_AUTHORITY:
+      if (!is_connect) {
+        return GHTTP_ERR_INVALID;  // authority-form is for CONNECT alone
+      }
       authority = target;
       authority_len = tlen;
       break;
     case GHTTP_TARGET_ABSOLUTE: {
-      const char * sep = strstr(target, "://");
-      if (!sep) {
+      const char * sep = memchr(target, ':', tlen);
+      if (is_connect || !sep || sep + 3 > target + tlen
+          || memcmp(sep, "://", 3) != 0) {
         return GHTTP_ERR_INVALID;
       }
       sch = target;
       sch_len = (size_t)(sep - target);
       authority = sep + 3;
+      const char * end = target + tlen;
       const char * e = authority;
-      while (*e && *e != '/' && *e != '?') {
+      while (e < end && *e != '/' && *e != '?') {
         e++;
       }
       authority_len = (size_t)(e - authority);
-      if (*e == '/') {
+      if (e < end && *e == '/') {
         path = e;
-        path_len = strlen(e);
+        path_len = (size_t)(end - e);
       } else {
         // "http://host" or "http://host?q": the path is "/" (section 8.3.1).
-        static const char root[] = "/";
-        if (*e == '?') {
-          // Build "/?q" in the list itself below.
-          path = NULL;
-        } else {
-          path = root;
-          path_len = 1;
-        }
-      }
-      if (authority_len == 0) {
-        return GHTTP_ERR_INVALID;
-      }
-      if (is_connect) {
-        return GHTTP_ERR_INVALID;
-      }
-      if (!path) {
-        // "/" plus the query.
-        size_t ql = strlen(e);
-        char * q = gcu_allocator_malloc(alloc, ql + 1);
-        if (!q) {
+        size_t rest = (size_t)(end - e);
+        path_buf = gcu_allocator_malloc(alloc, rest + 1);
+        if (!path_buf) {
           return GHTTP_ERR_OOM;
         }
-        q[0] = '/';
-        memcpy(q + 1, e, ql);
-        GHTTP_Result r0 = add_pseudo(list, ":method", method, strlen(method));
-        if (r0 == GHTTP_OK) {
-          r0 = add_pseudo(list, ":scheme", sch, sch_len);
-        }
-        if (r0 == GHTTP_OK) {
-          r0 = add_pseudo(list, ":authority", authority, authority_len);
-        }
-        if (r0 == GHTTP_OK) {
-          r0 = add_pseudo(list, ":path", q, ql + 1);
-        }
-        gcu_allocator_free(alloc, q);
-        if (r0 != GHTTP_OK) {
-          return r0;
-        }
-        goto fields;
+        path_buf[0] = '/';
+        memcpy(path_buf + 1, e, rest);
+        path = path_buf;
+        path_len = rest + 1;
       }
       break;
     }
   }
-  if (!authority && host_idx != GHTTP_HEADERS_NPOS) {
-    authority = hf.value;
-    authority_len = hf.value_len;
+
+  // Host: at most one, and the same as the authority the target names.
+  size_t host_idx = ghttp_headers_find(h, "host", 0);
+  GHTTP_Field hf = {0};
+  if (host_idx != GHTTP_HEADERS_NPOS) {
+    ghttp_headers_at(h, host_idx, &hf);
+    if (ghttp_headers_find(h, "host", host_idx + 1) != GHTTP_HEADERS_NPOS) {
+      r = GHTTP_ERR_INVALID;  // a second Host would travel beside :authority
+    } else if (authority
+        && !same_text_ignoring_case(authority, authority_len, hf.value, hf.value_len)) {
+      r = GHTTP_ERR_INVALID;  // Host and the target's authority disagree
+    } else if (!authority) {
+      authority = hf.value;
+      authority_len = hf.value_len;
+    }
   }
-  GHTTP_Result r = add_pseudo(list, ":method", method, strlen(method));
+  if (r == GHTTP_OK && authority
+      && (authority_len == 0 || !ghttp_is_target_text(authority, authority_len))) {
+    r = GHTTP_ERR_INVALID;
+  }
+  if (r == GHTTP_OK && is_connect && !authority) {
+    r = GHTTP_ERR_INVALID;
+  }
+  if (r == GHTTP_OK && !is_connect) {
+    // :scheme and :path are required, and the path is a path.
+    if (!scheme_ok(sch, sch_len) || path_len == 0
+        || !ghttp_is_target_text(path, path_len)
+        || (path[0] != '/' && !(is_options && path_len == 1 && path[0] == '*'))) {
+      r = GHTTP_ERR_INVALID;
+    } else if (authority && is_web_scheme(sch, sch_len)
+        && memchr(authority, '@', authority_len)) {
+      r = GHTTP_ERR_INVALID;  // no userinfo for http and https (section 8.3.1)
+    }
+  }
+  if (r == GHTTP_OK) {
+    r = add_pseudo(list, ":method", method, mlen);
+  }
   if (r == GHTTP_OK && !is_connect) {
     r = add_pseudo(list, ":scheme", sch, sch_len);
   }
@@ -541,23 +616,17 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
   if (r == GHTTP_OK && !is_connect) {
     r = add_pseudo(list, ":path", path, path_len);
   }
-  if (r != GHTTP_OK) {
-    return r;
-  }
-fields:;
+  gcu_allocator_free(alloc, path_buf);
   size_t n = ghttp_headers_count(h);
-  for (size_t i = 0; i < n; i++) {
+  for (size_t i = 0; r == GHTTP_OK && i < n; i++) {
     GHTTP_Field f;
     ghttp_headers_at(h, i, &f);
     if (i == host_idx) {
       continue;  // carried by :authority
     }
-    GHTTP_Result r2 = add_lowered(alloc, list, &f);
-    if (r2 != GHTTP_OK) {
-      return r2;
-    }
+    r = add_lowered(alloc, list, &f);
   }
-  return GHTTP_OK;
+  return r;
 }
 
 GHTTP_Result ghttp_h2msg_build_response(const GHTTP_Allocator * alloc,

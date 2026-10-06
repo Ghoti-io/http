@@ -56,6 +56,7 @@ typedef struct Stream {
   bool sent_headers;  // this side's final response (server); always true at a client
   bool is_head;       // a client's request was HEAD
   bool connect;
+  bool no_content;    // a response to HEAD, or a 204 or 304: DATA is an error
   bool has_length;
   uint64_t length;
   uint64_t received;
@@ -117,8 +118,13 @@ struct GHTTP_H2Conn {
   Closed * closed;
   size_t closed_head;
   size_t closed_count;
-  uint32_t last_peer_id;   // the highest stream the peer opened
-  uint32_t next_local_id;  // a client's next stream
+  uint32_t highest_peer_id;   // the highest stream id the peer has used (idle below it no more)
+  uint32_t last_peer_id;      // the highest stream accepted for processing: the GOAWAY id
+  uint32_t closed_evicted_max;  // the highest stream id the closed ring has forgotten
+  uint32_t next_local_id;     // a client's next stream
+  uint32_t * unprocessed;     // a client's streams the peer's GOAWAY left unanswered
+  size_t n_unprocessed;
+  size_t cap_unprocessed;
 
   // Settings.
   GHTTP_H2Settings peer;
@@ -144,6 +150,9 @@ struct GHTTP_H2Conn {
   uint32_t n_ping;
   uint32_t n_rst;
   uint32_t n_empty_data;
+  uint32_t n_priority;
+  uint32_t n_extension;
+  uint32_t n_ignored_wu;
 
   GHTTP_H2ExtensionFn ext_fn;
   void * ext_ctx;
@@ -194,12 +203,22 @@ void ghttp_h2_limits_default(GHTTP_H2Limits * l) {
   l->max_ping_per_interval = GHTTP_H2_DEFAULT_MAX_PING_PER_INTERVAL;
   l->max_rst_per_interval = GHTTP_H2_DEFAULT_MAX_RST_PER_INTERVAL;
   l->max_empty_data_frames = GHTTP_H2_DEFAULT_MAX_EMPTY_DATA_FRAMES;
+  l->max_priority_per_interval = GHTTP_H2_DEFAULT_MAX_PRIORITY_PER_INTERVAL;
+  l->max_extension_per_interval = GHTTP_H2_DEFAULT_MAX_EXTENSION_PER_INTERVAL;
+  l->max_ignored_window_updates_per_interval =
+      GHTTP_H2_DEFAULT_MAX_IGNORED_WINDOW_UPDATES_PER_INTERVAL;
   l->interval_ms = GHTTP_H2_DEFAULT_INTERVAL_MS;
 }
 
 // ---------------------------------------------------------------------------
 // Failure
 // ---------------------------------------------------------------------------
+
+/** The last stream id a GOAWAY may carry now: never higher than one already sent (section 6.8). */
+static uint32_t goaway_id(const GHTTP_H2Conn * c) {
+  return c->goaway_sent && c->goaway_sent_last < c->last_peer_id
+      ? c->goaway_sent_last : c->last_peer_id;
+}
 
 /** End the connection: record why, queue GOAWAY. Always returns @p r. */
 static GHTTP_Result conn_fail(GHTTP_H2Conn * c, uint32_t code,
@@ -210,9 +229,10 @@ static GHTTP_Result conn_fail(GHTTP_H2Conn * c, uint32_t code,
     c->err_reason = reason;
     // Best effort: if even this cannot be allocated the connection is closed
     // without it.
-    (void)ghttp_h2_write_goaway(
-        c->out, c->last_peer_id, code, reason, strlen(reason));
+    uint32_t last = goaway_id(c);
+    (void)ghttp_h2_write_goaway(c->out, last, code, reason, strlen(reason));
     c->goaway_sent = true;
+    c->goaway_sent_last = last;
   }
   return c->failed;
 }
@@ -272,6 +292,9 @@ static Closed * closed_find(GHTTP_H2Conn * c, uint32_t id) {
 static void closed_add(GHTTP_H2Conn * c, uint32_t id, ClosedHow how) {
   size_t cap = c->limits.max_closed_streams;
   if (cap == 0) {
+    if (id > c->closed_evicted_max) {
+      c->closed_evicted_max = id;
+    }
     return;
   }
   Closed * e = closed_find(c, id);
@@ -280,6 +303,10 @@ static void closed_add(GHTTP_H2Conn * c, uint32_t id, ClosedHow how) {
     return;
   }
   if (c->closed_count == cap) {
+    uint32_t forgotten = c->closed[c->closed_head].id;
+    if (forgotten > c->closed_evicted_max) {
+      c->closed_evicted_max = forgotten;
+    }
     c->closed_head = (c->closed_head + 1) % cap;  // forget the oldest
     c->closed_count--;
   }
@@ -287,6 +314,11 @@ static void closed_add(GHTTP_H2Conn * c, uint32_t id, ClosedHow how) {
   e->id = id;
   e->how = (uint8_t)how;
   c->closed_count++;
+}
+
+/** A closed stream the ring has forgotten (or never could keep): it was open once. */
+static bool closed_forgotten(const GHTTP_H2Conn * c, uint32_t id) {
+  return id <= c->closed_evicted_max;
 }
 
 static StreamClass classify(GHTTP_H2Conn * c, uint32_t id, Stream ** out) {
@@ -299,7 +331,7 @@ static StreamClass classify(GHTTP_H2Conn * c, uint32_t id, Stream ** out) {
   }
   if (peer_initiated(c, id)) {
     // At a client the peer's (even) streams are pushes, never opened here.
-    return id > c->last_peer_id ? SS_IDLE : SS_CLOSED;
+    return id > c->highest_peer_id ? SS_IDLE : SS_CLOSED;
   }
   if (c->role == GHTTP_H2_CLIENT) {
     return id < c->next_local_id ? SS_CLOSED : SS_IDLE;
@@ -414,6 +446,10 @@ static GHTTP_Result stream_error(
   c->ev.type = GHTTP_H2_EVENT_STREAM_ERROR;
   c->ev.stream_id = id;
   c->ev.error_code = code;
+  // A reset provoked by the peer counts like one it sent (rapid reset).
+  if (++c->n_rst > c->limits.max_rst_per_interval) {
+    return calm(c, "too many RST_STREAM frames");
+  }
   return check_output(c);
 }
 
@@ -430,8 +466,10 @@ static GHTTP_Result h2_refuse_push(GHTTP_H2Conn * c) {
 /** The RFC 7540 priority scheme is deprecated: PRIORITY is accepted and ignored. */
 static GHTTP_Result h2_handle_priority(
     GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
-  (void)c;
   (void)f;
+  if (++c->n_priority > c->limits.max_priority_per_interval) {
+    return calm(c, "too many PRIORITY frames");
+  }
   return GHTTP_OK;
 }
 
@@ -442,7 +480,10 @@ static GHTTP_Result h2_handle_priority(
 static GHTTP_Result normalise_limits(GHTTP_H2Limits * dst, const GHTTP_H2Limits * src) {
   ghttp_h2_limits_default(dst);
   if (src) {
-    size_t n = src->size > 0 && src->size < sizeof(*dst) ? src->size : sizeof(*dst);
+    if (src->size == 0) {
+      return GHTTP_ERR_INVALID;  // not initialised with ghttp_h2_limits_default()
+    }
+    size_t n = src->size < sizeof(*dst) ? src->size : sizeof(*dst);
     memcpy(dst, src, n);
     dst->size = sizeof(*dst);
   }
@@ -452,7 +493,15 @@ static GHTTP_Result normalise_limits(GHTTP_H2Limits * dst, const GHTTP_H2Limits 
       || dst->connection_window < GHTTP_H2_DEFAULT_WINDOW
       || dst->connection_window > GHTTP_H2_MAX_WINDOW
       || dst->max_header_list_bytes > UINT32_MAX
-      || dst->max_table_size > UINT32_MAX) {
+      || dst->max_table_size > UINT32_MAX
+      // A whole frame must fit in what may be buffered, and nothing that
+      // bounds a header section or the streams can be zero.
+      || dst->max_buffered_bytes < dst->max_frame_size + GHTTP_H2_FRAME_HEADER_SIZE
+      || dst->max_header_list_bytes == 0 || dst->max_field_bytes == 0
+      || dst->max_header_count == 0 || dst->max_header_block_bytes == 0
+      || dst->max_body_bytes == 0 || dst->max_streams == 0
+      || dst->max_concurrent_streams == 0 || dst->max_settings_per_interval == 0
+      || dst->interval_ms == 0) {
     return GHTTP_ERR_INVALID;
   }
   return GHTTP_OK;
@@ -475,6 +524,7 @@ void ghttp_h2_conn_destroy(GHTTP_H2Conn * c) {
   ghttp_request_destroy(c->req);
   ghttp_response_destroy(c->resp);
   gcu_allocator_free(a, c->streams);
+  gcu_allocator_free(a, c->unprocessed);
   gcu_allocator_free(a, c->closed);
   gcu_allocator_free(a, c);
 }
@@ -625,6 +675,9 @@ static GHTTP_Result on_data(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
         // Sent before the peer saw our RST_STREAM: minimal processing.
         return credit_connection(c, len);
       }
+      if (!e && closed_forgotten(c, id)) {
+        return credit_connection(c, len);  // closed so long ago it is not remembered
+      }
       if (!e) {
         return proto(c, "DATA on a stream that is not known to have been open");
       }
@@ -649,6 +702,12 @@ static GHTTP_Result on_data(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
     GHTTP_Result r = credit_connection(c, len);
     return r != GHTTP_OK ? r
         : stream_error(c, id, GHTTP_H2_FLOW_CONTROL_ERROR, HOW_SENT_RST);
+  }
+  if (s->no_content && f->data_len > 0) {
+    // RFC 9110 section 6.4.1: this response has no content, so DATA is malformed.
+    GHTTP_Result r = credit_connection(c, len);
+    return r != GHTTP_OK ? r
+        : stream_error(c, id, GHTTP_H2_PROTOCOL_ERROR, HOW_SENT_RST);
   }
   s->recv_window -= (int64_t)len;
 
@@ -715,13 +774,17 @@ static GHTTP_Result start_block(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
       if (c->role == GHTTP_H2_CLIENT || !peer_initiated(c, id)) {
         return proto(c, "HEADERS on a stream the sender may not open");
       }
-      c->last_peer_id = id;  // opening it closes every lower idle stream
+      c->highest_peer_id = id;  // opening it closes every lower idle stream
       kind = KIND_NEW;
       break;
     case SS_CLOSED: {
       Closed * e = closed_find(c, id);
       if (e && e->how == HOW_SENT_RST) {
         kind = KIND_DISCARD;  // compression state still has to be updated
+        break;
+      }
+      if (!e && closed_forgotten(c, id)) {
+        kind = KIND_DISCARD;  // closed so long ago it is not remembered
         break;
       }
       if (!e) {
@@ -859,6 +922,7 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
       return oom(c);
     }
     Stream * s = stream_add(c, id);
+    c->last_peer_id = id;  // accepted: the GOAWAY id may now name it
     s->got_headers = true;
     s->connect = info.connect;
     s->mode = info.connect ? GHTTP_H2_STREAM_TUNNEL : GHTTP_H2_STREAM_MESSAGE;
@@ -875,6 +939,9 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
 
   Stream * s = stream_find(c, id);
   if (!s) {
+    // Cannot happen: ghttp_h2_conn_reset_stream() turns a block in progress
+    // for its stream into KIND_DISCARD, and nothing else removes a stream
+    // between a HEADERS frame and its last CONTINUATION.
     return GHTTP_ERR_INTERNAL;
   }
   if (s->remote_ended) {
@@ -907,6 +974,7 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
     return malformed(c, id);
   }
   s->got_headers = true;
+  s->no_content = no_content;
   s->has_length = info.has_length && !no_content;
   s->length = info.length;
   if (s->connect && info.status >= 200 && info.status < 300) {
@@ -955,6 +1023,10 @@ static GHTTP_Result on_window_update(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) 
       case SS_IDLE:
         return proto(c, "WINDOW_UPDATE on an idle stream");
       case SS_CLOSED:
+        // No effect; but a flood of them is still work for us.
+        if (++c->n_ignored_wu > c->limits.max_ignored_window_updates_per_interval) {
+          return calm(c, "too many WINDOW_UPDATE frames for closed streams");
+        }
         return GHTTP_OK;
       case SS_ACTIVE:
         break;
@@ -1099,15 +1171,28 @@ static GHTTP_Result on_ping(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
 }
 
 static GHTTP_Result on_goaway(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
+  if (c->goaway_received && f->last_stream_id > c->goaway_received_last) {
+    return proto(c, "GOAWAY last stream id increased");  // section 6.8
+  }
   c->goaway_received = true;
   c->goaway_received_last = f->last_stream_id;
   // Streams this endpoint opened beyond the last one processed will not be
-  // answered (section 6.8): forget them.
+  // answered (section 6.8): close them and report each one, in the calls that
+  // follow, as GHTTP_H2_EVENT_STREAM_UNPROCESSED so the request can be retried.
   if (c->role == GHTTP_H2_CLIENT) {
     for (size_t i = 0; i < c->nstreams;) {
       if (c->streams[i].id > f->last_stream_id) {
         uint32_t id = c->streams[i].id;
-        GHTTP_Result r = stream_remove(c, id, HOW_ENDED);
+        if (c->n_unprocessed == c->cap_unprocessed) {
+          void * q = c->unprocessed;
+          if (ghttp_reserve(c->allocator, &q, &c->cap_unprocessed,
+                  c->n_unprocessed + 1, sizeof(uint32_t), 8) != GHTTP_OK) {
+            return oom(c);
+          }
+          c->unprocessed = q;
+        }
+        c->unprocessed[c->n_unprocessed++] = id;
+        GHTTP_Result r = stream_remove(c, id, HOW_RECV_RST);
         if (r != GHTTP_OK) {
           return r;
         }
@@ -1125,6 +1210,9 @@ static GHTTP_Result on_goaway(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
 }
 
 static GHTTP_Result on_unknown(GHTTP_H2Conn * c, const GHTTP_H2Frame * f) {
+  if (++c->n_extension > c->limits.max_extension_per_interval) {
+    return calm(c, "too many frames of unknown types");
+  }
   if (c->ext_fn) {
     GHTTP_H2Extension x;
     memset(&x, 0, sizeof(x));
@@ -1173,15 +1261,17 @@ static GHTTP_Result process_frame(GHTTP_H2Conn * c) {
     return on_header_stream_error(c);
   }
 
-  // Frames that are not a DATA frame without data end the run of empty ones.
+  // Only progress (HEADERS, or DATA with data or END_STREAM) ends a run of
+  // empty DATA frames: interleaving PINGs or WINDOW_UPDATEs does not.
   bool empty_data = f.header.type == GHTTP_H2_DATA && f.data_len == 0
       && !f.end_stream;
   if (empty_data) {
     if (++c->n_empty_data > c->limits.max_empty_data_frames) {
       return calm(c, "too many empty DATA frames");
     }
-  } else {
-    c->n_empty_data = 0;
+  } else if (f.header.type == GHTTP_H2_HEADERS
+      || (f.header.type == GHTTP_H2_DATA && (f.data_len > 0 || f.end_stream))) {
+    c->n_empty_data = 0;  // progress; any other frame leaves the count where it was
   }
 
   switch (f.header.type) {
@@ -1276,11 +1366,30 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
   if (!c || !consumed || !event || (!data && len > 0)) {
     return GHTTP_ERR_INVALID;
   }
+  // Both outputs are written on every return, so none is ever stale.
+  *consumed = 0;
+  memset(event, 0, sizeof(*event));
+  event->size = sizeof(*event);
+  event->type = GHTTP_H2_EVENT_NEED_MORE;
   if (c->failed != GHTTP_OK) {
     return c->failed;
   }
+  if (c->n_unprocessed > 0) {
+    // A client's streams the peer's GOAWAY left unanswered, one per call,
+    // before any more input is read.
+    size_t lowest = 0;  // in ascending order, so the caller can retry in order
+    for (size_t i = 1; i < c->n_unprocessed; i++) {
+      if (c->unprocessed[i] < c->unprocessed[lowest]) {
+        lowest = i;
+      }
+    }
+    event->type = GHTTP_H2_EVENT_STREAM_UNPROCESSED;
+    event->stream_id = c->unprocessed[lowest];
+    c->unprocessed[lowest] = c->unprocessed[--c->n_unprocessed];
+    event->error_code = GHTTP_H2_REFUSED_STREAM;
+    return GHTTP_OK;
+  }
   const uint8_t * p = data;
-  size_t used = 0;
   if (c->frame_done) {
     ghttp_buffer_clear(c->in);
     c->have_header = false;
@@ -1290,11 +1399,11 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
     // A server reads the client's preface first, a byte at a time so that a
     // wrong byte is refused at the same place however the input is cut.
     if (c->role == GHTTP_H2_SERVER && c->preface_pos < GHTTP_H2_PREFACE_SIZE) {
-      while (used < len && c->preface_pos < GHTTP_H2_PREFACE_SIZE) {
-        if (p[used] != (uint8_t)GHTTP_H2_PREFACE[c->preface_pos]) {
+      while ((*consumed) < len && c->preface_pos < GHTTP_H2_PREFACE_SIZE) {
+        if (p[(*consumed)] != (uint8_t)GHTTP_H2_PREFACE[c->preface_pos]) {
           return proto(c, "invalid connection preface");
         }
-        used++;
+        (*consumed)++;
         c->preface_pos++;
       }
       if (c->preface_pos < GHTTP_H2_PREFACE_SIZE) {
@@ -1304,7 +1413,7 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
 
     if (!c->have_header) {
       bool ready;
-      GHTTP_Result r = take_header(c, p, len, &used, &ready);
+      GHTTP_Result r = take_header(c, p, len, consumed, &ready);
       if (r != GHTTP_OK) {
         return r;
       }
@@ -1314,11 +1423,11 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
     }
     size_t have = ghttp_buffer_size(c->in) - GHTTP_H2_FRAME_HEADER_SIZE;
     size_t need = c->hdr.length - have;
-    size_t take = need < len - used ? need : len - used;
-    if (take > 0 && ghttp_buffer_append(c->in, p + used, take) != GHTTP_OK) {
+    size_t take = need < len - (*consumed) ? need : len - (*consumed);
+    if (take > 0 && ghttp_buffer_append(c->in, p + (*consumed), take) != GHTTP_OK) {
       return oom(c);
     }
-    used += take;
+    (*consumed) += take;
     if (take < need) {
       break;
     }
@@ -1341,7 +1450,6 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
         c->ev.data = (const uint8_t *)ghttp_buffer_data(c->in)
             + GHTTP_H2_FRAME_HEADER_SIZE;
       }
-      *consumed = used;
       *event = c->ev;
       return GHTTP_OK;
     }
@@ -1349,10 +1457,6 @@ GHTTP_Result ghttp_h2_conn_feed(GHTTP_H2Conn * c, const void * data, size_t len,
     c->have_header = false;
     c->frame_done = false;
   }
-  memset(event, 0, sizeof(*event));
-  event->size = sizeof(*event);
-  event->type = GHTTP_H2_EVENT_NEED_MORE;
-  *consumed = used;
   return GHTTP_OK;
 }
 
@@ -1429,6 +1533,9 @@ void ghttp_h2_conn_tick(GHTTP_H2Conn * c, uint64_t now_ms) {
     c->n_settings = 0;
     c->n_ping = 0;
     c->n_rst = 0;
+    c->n_priority = 0;
+    c->n_extension = 0;
+    c->n_ignored_wu = 0;
   }
 }
 
@@ -1746,6 +1853,9 @@ GHTTP_Result ghttp_h2_conn_reset_stream(
   if (ghttp_h2_write_rst_stream(c->out, stream_id, error_code) != GHTTP_OK) {
     return oom(c);
   }
+  if (c->hb_active && c->hb_stream == stream_id) {
+    c->hb_kind = KIND_DISCARD;  // its block is still arriving: decode it, drop it
+  }
   return stream_remove(c, stream_id, HOW_SENT_RST);
 }
 
@@ -1770,8 +1880,8 @@ GHTTP_Result ghttp_h2_conn_shutdown(GHTTP_H2Conn * c, uint32_t error_code,
   if (c->failed != GHTTP_OK) {
     return c->failed;
   }
-  GHTTP_Result r = ghttp_h2_write_goaway(
-      c->out, c->last_peer_id, error_code, debug, debug_len);
+  uint32_t last = goaway_id(c);
+  GHTTP_Result r = ghttp_h2_write_goaway(c->out, last, error_code, debug, debug_len);
   if (r == GHTTP_ERR_OOM) {
     return oom(c);
   }
@@ -1779,7 +1889,7 @@ GHTTP_Result ghttp_h2_conn_shutdown(GHTTP_H2Conn * c, uint32_t error_code,
     return r;
   }
   c->goaway_sent = true;
-  c->goaway_sent_last = c->last_peer_id;
+  c->goaway_sent_last = last;
   return GHTTP_OK;
 }
 
@@ -1790,6 +1900,9 @@ GHTTP_Result ghttp_h2_conn_send_extension_frame(GHTTP_H2Conn * c, uint8_t type,
   }
   if (c->failed != GHTTP_OK) {
     return c->failed;
+  }
+  if (len > c->peer.max_frame_size || (!payload && len > 0)) {
+    return GHTTP_ERR_INVALID;
   }
   GHTTP_Result r = ghttp_h2_write_frame(
       c->out, type, flags, stream_id, payload, len);

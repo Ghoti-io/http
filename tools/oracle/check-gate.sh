@@ -95,13 +95,20 @@ open(path, "w").write(text.replace(old, new))
 PY
 }
 
-expect_red() {  # name dir needle
-  name=$1 dir=$2 needle=$3
+expect_red() {  # name dir needle [forbidden]
+  name=$1 dir=$2 needle=$3 forbid=${4:-}
   if run_diff "$dir"; then
     printf '\033[0;31mcheck-oracle-gate: %s: the differential PASSED with the defect planted\033[0m\n' "$name" >&2
     fail=1
   elif grep -q -- "$needle" "$dir.log"; then
-    printf 'check-oracle-gate: %s: caught (%s)\n' "$name" "$needle"
+    if [ -n "$forbid" ] && grep -q -- "$forbid" "$dir.log"; then
+      printf '\033[0;31mcheck-oracle-gate: %s: a case matching "%s" caught it too, so it is not shown to need a generated case - read %s\033[0m\n' \
+        "$name" "$forbid" "$dir.log" >&2
+      trap - EXIT
+      fail=1
+    else
+      printf 'check-oracle-gate: %s: caught (%s)\n' "$name" "$needle"
+    fi
   else
     printf '\033[0;31mcheck-oracle-gate: %s: it failed, but not with "%s" - read %s\033[0m\n' \
       "$name" "$needle" "$dir.log" >&2
@@ -111,9 +118,9 @@ expect_red() {  # name dir needle
   fi
 }
 
-# plant_lib <name> <file> <old> <new> <needle>
+# plant_lib <name> <file> <old> <new> <needle> [forbidden]
 plant_lib() {
-  name=$1 file=$2 old=$3 new=$4 needle=$5
+  name=$1 file=$2 old=$3 new=$4 needle=$5 forbid=${6:-}
   dir="$SCRATCH/$name"
   cp -a "$SCRATCH/control" "$dir"
   if ! edit "$dir" "$file" "$old" "$new"; then
@@ -132,7 +139,7 @@ plant_lib() {
     fail=1
     return
   fi
-  expect_red "$name" "$dir" "$needle"
+  expect_red "$name" "$dir" "$needle" "$forbid"
 }
 
 # plant_harness <name> <file> <old> <new> <needle>: a patch to the instrument,
@@ -230,6 +237,14 @@ plant_lib h2-accept-data-on-idle-stream src/http/h2conn.c \
   '    case SS_IDLE:
       return GHTTP_OK;' \
   'have no rule'
+
+# A defect that no hand-written case (tag rfc...) notices and only a generated
+# mutation (tag gen: or genhd:) does: one bit of zero padding after a Huffman
+# string is accepted. It shows the generated half of the corpus is not decoration.
+plant_lib h2-accept-one-zero-bit-of-huffman-padding src/http/coding.c \
+  '  if (pending > 7 || (pending > 0 && !all_ones)) {' \
+  '  if (pending > 7 || (pending > 1 && !all_ones)) {' \
+  'tag=genhd:' 'tag=rfc'
 
 plant_harness h2-rule-deleted tools/oracle/known-h2-disagreements.tsv \
   'rfc9113-6.2:headers-padding-too-long	gox2	conn:PROTOCOL_ERROR/ok+resets	code	' \
