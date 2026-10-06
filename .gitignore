@@ -32,3 +32,4 @@ tests/data/out
 
 # Python bytecode from the oracle tooling
 __pycache__
+tools/hpack/data

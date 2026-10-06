@@ -104,3 +104,15 @@ void ghttp_buffer_truncate(GHTTP_Buffer * buffer, size_t size) {
     buffer->len = size;
   }
 }
+
+void ghttp_buffer_consume(GHTTP_Buffer * buffer, size_t n) {
+  if (!buffer || n == 0) {
+    return;
+  }
+  if (n >= buffer->len) {
+    buffer->len = 0;
+    return;
+  }
+  memmove(buffer->data, buffer->data + n, buffer->len - n);
+  buffer->len -= n;
+}

@@ -89,6 +89,9 @@ GHTTP_Result ghttp_response_assign(GHTTP_Response * response, int status,
 /** Drop the byte count to @p size, undoing appends after a failure. */
 void ghttp_buffer_truncate(GHTTP_Buffer * buffer, size_t size);
 
+/** Remove the first @p n bytes (all of them if n is larger). */
+void ghttp_buffer_consume(GHTTP_Buffer * buffer, size_t n);
+
 /**
  * What the headers say about the body: GHTTP_ERR_CORRUPT for a
  * Content-Length with a bad or differing value, a Transfer-Encoding whose

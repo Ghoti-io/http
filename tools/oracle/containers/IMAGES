@@ -27,11 +27,15 @@
 # disagrees is a finding to triage, not a regression to fix.
 #
 # The tag is `deb13-N`: Debian 13 fixes the base, N moves whenever the image's
-# contents can differ.
+# contents can differ. deb13-2 added the three HTTP/2 references (nghttp2, h2,
+# x/net/http2); the HTTP/1.1 references are the same pins as deb13-1.
 #
 # Building it:
 #   make oracle-build
 
-llhttp	localhost/ghoti-http-oracle-refs:deb13-1	llhttp 9.2.1	The parser inside Node, driven through its HTTPParser binding, lenient flags off
-h11	localhost/ghoti-http-oracle-refs:deb13-1	h11 0.16.0	Sans-I/O HTTP/1.1 in Python; 0.16.0 is the release that closed the bare-LF chunk terminator hole
-gohttp	localhost/ghoti-http-oracle-refs:deb13-1	go net/http go1.24.4	http.ReadRequest and http.ReadResponse and the body framing behind them
+llhttp	localhost/ghoti-http-oracle-refs:deb13-2	llhttp 9.2.1	The parser inside Node, driven through its HTTPParser binding, lenient flags off
+h11	localhost/ghoti-http-oracle-refs:deb13-2	h11 0.16.0	Sans-I/O HTTP/1.1 in Python; 0.16.0 is the release that closed the bare-LF chunk terminator hole
+gohttp	localhost/ghoti-http-oracle-refs:deb13-2	go net/http go1.24.4	http.ReadRequest and http.ReadResponse and the body framing behind them
+nghttp2	localhost/ghoti-http-oracle-refs:deb13-2	nghttp2 1.64.0	libnghttp2's server session, and its HPACK encoder and decoder, linked statically
+h2	localhost/ghoti-http-oracle-refs:deb13-2	h2 4.4.1 (hpack 4.2.0, hyperframe 6.1.0)	Python sans-I/O HTTP/2 (h2) with its own HPACK (hpack) and framing (hyperframe) libraries
+gox2	localhost/ghoti-http-oracle-refs:deb13-2	x/net/http2 v0.50.0 (go1.24.4)	Go's golang.org/x/net/http2 server, and its hpack encoder and decoder

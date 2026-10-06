@@ -4,3 +4,6 @@
 !*.seed
 !parse/
 !roundtrip/
+!hpack/
+!hpack-roundtrip/
+!h2conn/

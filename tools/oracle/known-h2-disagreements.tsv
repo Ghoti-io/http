@@ -1,0 +1,136 @@
+# Disagreements with the HTTP/2 references that are understood, and why.
+#
+# Five tab-separated fields: a case tag (a glob, `|` separating alternatives),
+# a reference (a glob, `|` too), the kind of difference (a glob over
+# "<ours>/<ref>[+msgs:<parts>][+resets]", where each end is `ok` or
+# `conn:<CODE>`; `conn:CLOSED` is a connection the reference hung up on without
+# a GOAWAY; a reset the reference made by answering 4xx is `HTTP<status>`), a
+# class (diff_h2.py CLASSES) and a sentence. The first match wins. A
+# disagreement that matches no rule fails the run, and so does a rule that
+# matches nothing. A rule for a generated case (`gen:`, `genhd:`) speaks for a
+# family of single mutations, each of which makes a valid stream invalid in
+# one way; the families were checked by reading the cases behind each rule.
+#
+# Read with documentation/rfc9113.md, which states what this library enforces.
+
+# ---- RFC 9113 3.4: the connection preface -------------------------------------------------
+rfc9113-3.4:preface-*|rfc9113-3.4:http1-request	*	conn:PROTOCOL_ERROR/conn:CLOSED	code	section 3.4 lets a GOAWAY be omitted for an invalid preface, and the reference closes without one; this library sends GOAWAY(PROTOCOL_ERROR)
+rfc9113-3.4:no-settings-after-preface-*|rfc9113-3.4:settings-ack-as-first-frame|rfc9113-3.4:settings-after-garbage-frame-type	h2|gox2	conn:PROTOCOL_ERROR/ok*	ref-lenient	section 3.4: the first frame after the preface MUST be SETTINGS (not an ACK, not another type); the reference does not insist
+
+# ---- limits: this library's defaults against each reference's own ---------------------------
+rfc9113-8.2:many-fields-*|rfc9113-6.10:continuation-many-frames|rfc9113-6.10:continuation-flood-40|rfc9113-8.2.1:value-long-*	*	conn:ENHANCE_YOUR_CALM/*	ref-limit	a limit of this library's default GHTTP_H2Limits (100 fields counting the pseudo-header fields, 16 CONTINUATION frames, 16 KiB a field, 64 KiB of header list) ends the connection with ENHANCE_YOUR_CALM; the reference has another limit, or none, and the codes differ
+rfc9113-5.1.2:concurrent-streams-101	h2	ok/conn:PROTOCOL_ERROR*	ref-strict	section 5.1.2: a stream beyond the advertised limit MUST be a stream error (PROTOCOL_ERROR or REFUSED_STREAM); h2 ends the connection, this library refuses the stream (REFUSED_STREAM)
+
+# ---- RFC 9113 4: frames ----------------------------------------------------------------------
+rfc9113-6.2:headers-padded-no-pad-length|rfc9113-6.2:headers-priority-flag-too-short|rfc9113-6.6:push-promise-short|rfc9113-6.1:data-padded-flag-no-payload	nghttp2|gox2	conn:FRAME_SIZE_ERROR/conn:*	code	section 4.2: a frame too small for its mandatory fields is FRAME_SIZE_ERROR; nghttp2 says PROTOCOL_ERROR and Go closes without a GOAWAY (an error from its frame reader that is not a connection error)
+rfc9113-6.5:settings-ack-with-payload	h2	conn:FRAME_SIZE_ERROR/conn:PROTOCOL_ERROR*	code	section 6.5: an ACK with a payload is FRAME_SIZE_ERROR; h2 raises PROTOCOL_ERROR
+rfc9113-6.2:headers-padding-too-long	gox2	conn:PROTOCOL_ERROR/ok+resets	code	section 6.2: padding longer than the payload is a connection error PROTOCOL_ERROR; Go resets the stream
+rfc9113-6.9:window-update-zero-idle-stream	gox2	conn:PROTOCOL_ERROR/ok+resets	code	a zero WINDOW_UPDATE is a stream error (6.9) but the stream is idle, which is a connection error (5.1): the RFC does not order them; Go takes the first
+rfc9113-6.3:priority-4-octets|rfc9113-6.3:priority-6-octets	*	ok/conn:FRAME_SIZE_ERROR*	ref-strict	section 6.3: a PRIORITY frame of the wrong length MUST be a STREAM error FRAME_SIZE_ERROR; the reference ends the connection
+rfc9113-6.3:priority-self-dependency|rfc9113-6.2:headers-with-priority-self-dependency	*	ok/*	ref-strict	RFC 7540 section 5.3.1 made a stream depending on itself an error; RFC 9113 deprecated the priority scheme and dropped the rule, so this library reads the fields and ignores them
+rfc9113-6.5:settings-ack-unsolicited	nghttp2|gox2	ok/conn:PROTOCOL_ERROR*	ref-strict	section 6.5.3 does not make a SETTINGS ACK that acknowledges nothing an error; this library ignores it
+rfc9113-6.8:goaway-reserved-bit	nghttp2	ok/conn:PROTOCOL_ERROR*	ref-strict	section 4.1 and 6.8: the reserved bit in a GOAWAY's last stream id MUST be ignored on receipt
+rfc9113-6.9:window-update-reserved-bit	h2	ok/conn:PROTOCOL_ERROR*	ref-strict	section 6.9: the reserved bit of a WINDOW_UPDATE increment MUST be ignored on receipt
+rfc9113-6.5.3:settings-duplicate-id	gox2	ok/*	ref-strict	Go ends the connection (PROTOCOL_ERROR) on a SETTINGS identifier that repeats; sections 6.5.2 and 6.5.3 only say the values are applied in order, and this library does
+rfc9113-6.8:goaway-then-request	nghttp2|h2|gox2	ok/*	ref-model	after the peer's GOAWAY h2 treats a HEADERS frame as invalid input (its state machine is CLOSED) and Go starts a graceful shutdown that accepts no new stream; section 6.8 describes what the sender of a GOAWAY may do, not what its receiver must refuse, and this library serves what arrives
+rfc9113-4.2:data-length-claims-more-than-follows	nghttp2	incomplete/ok+msgs:body	scope	nghttp2 hands the application the octets of a DATA frame as they arrive; this library delivers a frame whole, so a stream that ends inside one delivers none of it
+
+# ---- RFC 9113 5.1: stream states and identifiers ------------------------------------------------
+rfc9113-5.1.1:stream-id-decreasing|rfc9113-5.1.1:stream-id-skip-then-lower	nghttp2	conn:PROTOCOL_ERROR/ok*	ref-lenient	section 5.1.1: a stream identifier that is not higher than every one already used MUST be a connection error PROTOCOL_ERROR; nghttp2 ignores the HEADERS frame
+rfc9113-6.4:rst-then-data|rfc9113-6.4:rst-then-headers|rfc9113-5.1:headers-after-rst|rfc9113-5.1.1:stream-id-reuse-closed	h2|gox2	conn:STREAM_CLOSED/*	choice	section 5.1: a frame on a closed stream MAY be a connection error STREAM_CLOSED, which this library chooses; the reference makes it a stream error, or ignores it, or ends the connection with another code
+rfc9113-6.1:data-after-end-stream|rfc9113-6.1:data-on-get-with-end-stream|rfc9113-5.1:headers-after-end-stream	nghttp2	ok/conn:STREAM_CLOSED*	ref-strict	section 5.1: a frame on a half-closed (remote) stream MUST be a STREAM error STREAM_CLOSED; nghttp2 ends the connection
+rfc9113-6.9:window-update-zero-stream|rfc9113-5.1.1:stream-id-reuse-open|rfc9113-8.1:headers-three-times|rfc9113-8.1:trailers-without-end-stream|rfc9113-8.1:trailers-pseudo-header|rfc9113-8.1:trailers-status|rfc9113-8.1:trailers-connection|rfc9113-8.1:trailers-uppercase|rfc9113-8.1.1:content-length-short-data|rfc9113-8.1.1:content-length-long-data|rfc9113-8.1.1:content-length-zero-with-data	nghttp2|h2	ok/conn:PROTOCOL_ERROR*	ref-strict	the stream errors sections 6.9 and 8.1.1 require (a zero WINDOW_UPDATE on a stream; a malformed message): the reference ends the connection instead
+rfc9113-6.9:data-64k-then-more|rfc9113-6.9:data-two-streams-exceed-connection	h2|gox2	*	ref-model	a sender that does not wait for WINDOW_UPDATE is within its window only if the receiver has credited it back; this library credits at once, h2 and Go as the application reads, so a body sent back to back is an error there and not here (section 6.9.1 leaves the policy to the receiver)
+
+# ---- RFC 9113 8.2.1 and 8.3: names, values and control data that are wrong, per reference ----------
+#
+# The tags below are the cases in which one side delivered the request and the
+# other refused it, or refused it differently. In the notes, MUST and SHOULD are
+# RFC 9113's own: section 8.2.1 MUSTs refuse a field name with 0x00-0x20, A-Z,
+# 0x7f-0xff or (outside a pseudo-header) a colon, and a value with NUL, LF, CR or
+# whitespace at either end, and SHOULDs validate the rest against RFC 9110's
+# definitions, which is what this library does (documentation/rfc9113.md).
+
+# nghttp2 drops a field it finds invalid and delivers the rest of the request
+rfc9113-8.2.1:name-space|rfc9113-8.2.1:name-colon|rfc9113-8.2.1:name-tab|rfc9113-8.2.1:name-nul|rfc9113-8.2.1:name-ctl|rfc9113-8.2.1:name-del|rfc9113-8.2.1:name-high|rfc9113-8.2.1:name-empty|rfc9113-8.2.1:name-pseudo-like-mid|rfc9113-8.2:field-empty-name-value-both|rfc9113-8.2.1:value-nul|rfc9113-8.2.1:value-lf|rfc9113-8.2.1:value-cr|rfc9113-8.2.1:value-lead-space|rfc9113-8.2.1:value-trail-space|rfc9113-8.2.1:value-lead-tab|rfc9113-8.2.1:value-trail-tab|rfc9113-8.2.1:value-only-space	nghttp2	ok/ok+msgs:count+resets	ref-lenient	section 8.2.1 says a request with such a name or value MUST be treated as malformed; nghttp2 reports the field to on_invalid_header_callback, drops it and delivers the request (checked: the delivered request lacks the field)
+rfc9113-8.2.1:name-quote|rfc9113-8.2.1:name-slash|rfc9113-8.2.1:name-paren|rfc9113-8.2.1:name-at|rfc9113-8.2.1:name-comma	nghttp2|h2	ok/ok+msgs:count+resets	policy	section 8.2.1 SHOULD validate a field name against RFC 9110's token, which these characters are not in; this library does, the reference checks only the MUST list
+rfc9113-8.1.1:content-length-value-*	nghttp2	ok/ok+msgs:count+resets	ref-lenient	nghttp2 drops a content-length it finds invalid (not digits, or with whitespace) and delivers the request; this library refuses a request whose content-length is not a list of one value in digits
+rfc9113-8.1.1:content-length-twice-equal|rfc9113-8.1.1:content-length-value-352c35|rfc9113-8.1.1:content-length-value-352c2035	nghttp2|h2	ok/*	ref-strict	RFC 9110 section 8.6 allows a content-length repeated with identical values (and a list of them); the reference refuses it
+rfc9113-8.2.1:value-del|rfc9113-8.2.1:value-ctl	nghttp2|gox2	ok/*	ref-strict	section 8.2.1's MUST list does not include DEL or other control characters in a value; the reference drops or refuses the field
+rfc9113-8.3.1:request-no-authority|rfc9113-8.3.1:options-star|rfc9113-8.3.1:host-twice-no-authority|rfc9113-8.3.1:scheme-with-slash|rfc9113-8.3.1:authority-slash	nghttp2	ok/ok+msgs:count+resets	ref-strict	section 8.3.1 allows a request with no :authority and no Host (no authority to convey), an OPTIONS request with :path "*", and does not forbid a repeated Host; nghttp2 refuses them (and a scheme or authority with a slash, which this library does not check)
+rfc9113-8.3.1:path-*|rfc9113-8.3.1:method-*|rfc9113-8.3.1:scheme-*|rfc9113-8.3.1:authority-*|rfc9113-8.5:connect-empty-authority	nghttp2|h2	ok/ok+msgs:count+resets	policy	section 8.3.1 describes the values of the request pseudo-header fields (a method token, an absolute-path, an authority without userinfo, a scheme) and 8.2.1 SHOULD validate against RFC 9110: this library refuses a value outside those grammars, the reference accepts it
+rfc9113-8.1.1:content-length-and-no-data	nghttp2|h2	ok/ok+msgs:count+resets	ref-lenient	section 8.1.1: a message whose content-length differs from the DATA is malformed, including one that ends at its HEADERS with a non-zero length; this library refuses it there, the reference delivers the request
+rfc9113-8.1:trailers-content-length|rfc9113-8.1.1:content-length-trailers-early	h2	ok/ok+msgs:trailers,ended+resets	ref-lenient	a trailer section with a content-length (RFC 9110 section 6.5.1: framing fields MUST NOT be in a trailer) or one that ends the stream short of the announced length (8.1.1: malformed) is accepted by h2; this library resets the stream
+rfc9113-8.5:connect-then-headers	nghttp2|h2	ok/ok+msgs:trailers,ended+resets	ref-lenient	section 8.5: on a connected stream only DATA and stream management frames are allowed and anything else MUST be a stream error; the reference reads a second HEADERS as trailers
+rfc9113-8.2:field-host|rfc9113-8.2.3:cookie-split	nghttp2|h2	ok/ok+msgs:headers	scope	this library adds a Host field from :authority and joins split Cookie fields (section 8.2.3), as its Request type is the HTTP/1.1 one; the probe cannot tell its Host from an identical one the peer sent, and the reference passes the fields as they came
+rfc9113-8.2:field-host-different|rfc9113-8.3.1:authority-host-case	h2	ok/conn:PROTOCOL_ERROR+msgs:count	lenient	section 8.3.1: a server SHOULD treat a request whose Host differs from :authority as malformed (after normalisation); this library does not compare them (documentation/rfc9113.md); h2 refuses a byte-wise difference
+rfc9113-8.3.1:request-no-authority|rfc9113-8.3.1:options-star|rfc9113-8.3.1:host-twice-no-authority	h2	ok/conn:PROTOCOL_ERROR+msgs:count	ref-strict	section 8.3.1 allows a request with no authority to convey, and OPTIONS with :path "*"; h2 requires :authority or Host, and a path that starts with a slash
+rfc9113-8.1.1:content-length-value-3939393939393939393939393939393939393939	h2	ok/conn:PROTOCOL_ERROR*	ref-strict	a content-length above 2^64 is not a length any body can have: h2 ends the connection, this library resets the stream, and the DATA the request goes on to carry differs
+rfc9113-8.5:connect-with-content-length-data	h2	ok/conn:PROTOCOL_ERROR*	ref-strict	section 8.5: a connected stream carries opaque data and is not message-framed; h2 applies the content-length to it
+rfc9113-8.*|rfc9113-6.9:window-update-zero-stream|rfc9113-5.1.1:stream-id-reuse-open|rfc9113-6.2:headers-empty-block	h2	ok/conn:PROTOCOL_ERROR+resets	ref-strict	section 8.1.1: a malformed message MUST be a stream error (here PROTOCOL_ERROR); h2 ends the connection with a GOAWAY instead
+rfc9113-8.*	gox2	ok/ok+*answers	ref-model	section 8.1.1: a malformed request MUST be treated as a stream error and a server MAY send a response before resetting; Go answers 400 and does not reset
+rfc9113-8.1.1:content-length-value-*|rfc9113-8.1.1:content-length-twice-different|rfc9113-8.1.1:content-length-and-no-data	gox2	ok/ok+msgs:count*	ref-lenient	Go reads a content-length it cannot parse as unknown and accepts the request (an invalid or conflicting content-length is malformed, section 8.1.1 and RFC 9110 8.6); a body that does not match then fails at the read
+rfc9113-8.2.1:value-lead-space|rfc9113-8.2.1:value-trail-space|rfc9113-8.2.1:value-lead-tab|rfc9113-8.2.1:value-trail-tab|rfc9113-8.2.1:value-only-space	gox2	ok/ok+msgs:count+resets	ref-lenient	section 8.2.1: a value that starts or ends with whitespace MUST be treated as malformed; Go delivers it with the whitespace
+rfc9113-8.2:field-te-empty|rfc9113-8.3.1:path-star|rfc9113-8.3.1:path-absolute|rfc9113-8.3.1:method-space|rfc9113-8.3.1:method-slash	gox2	ok/ok+msgs:count+resets	ref-lenient	a te field other than "trailers" (8.2.2), a :path that is not an absolute path or "*" for OPTIONS, and a method that is not a token are malformed (8.3.1); Go delivers the request
+rfc9113-8.3.1:path-space|rfc9113-8.3.1:path-high|rfc9113-8.3.1:authority-empty|rfc9113-8.3.1:authority-space	gox2	ok/ok+msgs:count+resets	policy	section 8.2.1 SHOULD validate fields against RFC 9110: a path with a space or a non-ASCII octet, an empty authority and one with a space are refused here and delivered by Go
+rfc9113-8.2:field-te-upper|rfc9113-8.3.1:path-percent|rfc9113-8.3.1:scheme-*	gox2	ok/ok+msgs:count+*	ref-strict	a te of "Trailers" (the RFC's token comparison is case-insensitive), a path with a bad percent-encoding, and a scheme that is not lower-case http or https are accepted by this library, and not by Go, which parses the request URL and answers 400
+rfc9113-8.2:field-trailer|rfc9113-8.2:field-expect	gox2	ok/ok+msgs:headers	scope	Go handles the Trailer and Expect request fields itself (announces trailers, answers 100-continue) and lists them differently
+rfc9113-8.1:trailers|rfc9113-8.1:trailers-no-body|rfc9113-8.1:trailers-continued	gox2	ok/ok+msgs:trailers	scope	Go keeps a request's trailers only for the names its Trailer field announced; the others are discarded before the handler runs
+rfc9113-8.1:trailers-content-length|rfc9113-8.1:trailers-connection	gox2	ok/ok+msgs:ended+resets	scope	a trailer section with a framing or connection-specific field: both reset the stream, Go after having reported the request ended
+rfc9113-8.1.1:content-length-trailers-early|rfc9113-8.1.1:content-length-short-data	gox2	ok/ok+*	code	a body that does not match its content-length: both reset the stream with PROTOCOL_ERROR; Go may have reported part of the body first and resets with the error of its own reader
+rfc9113-8.3.1:host-only|rfc9113-8.3.1:host-twice-no-authority	gox2	ok/ok+msgs:authority	scope	Go reports the first Host as the request's authority when no :authority came; this library reports what the peer put in :authority
+rfc9113-8.1.1:content-length-value-352c35|rfc9113-8.1.1:content-length-value-352c2035|rfc9113-8.5:connect-with-content-length-data	gox2	ok/ok+*	ref-model	a list or an extra field of content-length values: Go treats it as unknown, and a CONNECT stream with a content-length is checked as a message by Go and not by this library
+rfc9113-8.5:connect-then-headers	gox2	ok/ok+*	ref-lenient	section 8.5: on a connected stream only DATA and stream management frames are allowed and anything else MUST be a stream error; Go reads a second HEADERS as trailers
+
+# ---- how the reference reads the same bytes cut differently ----------------------------------------
+rfc9113-6.10:*|rfc9113-4.1:unknown-type-inside-header-block|rfc9113-8.1:trailers-continued|rfc9113-6.8:goaway-then-request|rfc9113-8.1.1:content-length-long-data|rfc9113-8.1.1:content-length-short-data|rfc9113-8.2.1:value-long-*	nghttp2	split	ref-split	nghttp2 counts the pieces a header block arrives in as CONTINUATION frames against its limit (CVE-2024-28182 hardening), so a header block of two or more frames fed a byte at a time ends the connection with no GOAWAY and fed whole does not
+rfc9113-6.8:goaway-then-request	h2	split	ref-split	h2 reads the frames of one chunk against the state the whole chunk leaves, so a request after a GOAWAY is an error in one split and not in the other
+
+# ---- RFC 7541: HPACK decoding -------------------------------------------------------------------------
+rfc7541-6.3:table-size-update-after-field/*|rfc7541-6.3:table-size-update-after-literal/*	gox2	err/ok	ref-lenient	section 4.2: a dynamic table size update is only valid at the start of a header block (COMPRESSION_ERROR otherwise); Go's decoder applies it wherever it comes
+rfc7541-5.2:string-long-70000/*	nghttp2	ok/err	ref-limit	nghttp2's decoder refuses a name plus value above 65536 octets (NGHTTP2_HD_MAX_NV); this library's limit is the one it was given
+rfc7541-4.4:*/t*|rfc7541-C:*/t*|rfc7541-6.3:*/t*	nghttp2	ok/err	update	nghttp2 requires a block to open with a dynamic table size update after the decoder's maximum was set below 4096 (section 4.2); this decoder, handed a table already of that size, does not
+
+# ---- generated mutations: families, by what each side did -------------------------------------------
+#
+# Each case is a valid stream with ONE change (diff_h2.py corpus: an octet, a
+# frame's length, type, flags or stream, a frame cut, repeated, dropped, swapped
+# or split). Reading the cases behind each rule, the families are these; "ours"
+# is this library, "ref" the reference.
+
+# the reference's own process crashed (Go, x/net v0.50.0)
+gen:*|rfc9113-5.5:*	gox2	*/conn:CRASH	ref-bug	golang.org/x/net v0.50.0 indexes its table of frame parsers by frame type with holes at 0x0a to 0x0f (the table is sized for PRIORITY_UPDATE, 0x10), so the server calls a nil function on a client's frame of one of those types, such as ALTSVC (0x0a) and ORIGIN (0x0c), and the whole process dies: a one-frame denial of service. This library treats an unknown type as an extension and ignores it (section 5.5)
+
+# the stream ends inside a frame (finish() on this library says so)
+gen:*	nghttp2	incomplete/*	scope	this library does not act on a frame until it is whole; nghttp2 decodes the field block and DATA as the octets arrive, so it has refused a field, reset a stream or delivered part of a body that this library has not reached when the input ends
+gen:*	h2|gox2	incomplete/*	scope	this library does not act on a frame until it is whole; the reference has acted on a part of the stream's last frame that this library holds back
+
+# both end the connection: the code, or what had been delivered, differs
+gen:*	*	conn:*/conn:*	code	both end the connection at a bad frame, with different codes (a malformed frame header is FRAME_SIZE_ERROR or PROTOCOL_ERROR depending on which check runs first; a bad preface is answered with a GOAWAY here and closed silently by the reference, section 3.4) or after having delivered different requests before it
+
+# this library ended the connection and the reference went on
+
+gen:*@HEADERS.stream|gen:*@HEADERS.frame|gen:*@DATA.frame|gen:*@HEADERS.flags|gen:*@CONTINUATION.frame|gen:*@PRIORITY.frame	nghttp2|h2|gox2	conn:*/ok*	choice	a frame for a stream whose number is lower than one already opened (closed implicitly, section 5.1.1) or on a stream that has ended: this library ends the connection (section 5.1 lets it: a MAY), the reference ignores the frame or answers with a stream error
+gen:*@SETTINGS.frame|gen:*@SETTINGS.flags|gen:*@SETTINGS.stream|gen:*@SETTINGS.type|gen:*@RST_STREAM.stream|gen:*@RST_STREAM.frame	nghttp2|h2|gox2	conn:*/ok*	ref-lenient	section 3.4: the first frame after the preface MUST be SETTINGS, and RST_STREAM on an idle stream is a connection error (5.1); the reference accepts the stream without them, or with them
+gen:*	nghttp2|h2|gox2	conn:*/ok*	timing	a frame header that is refused as soon as it is read (a length over the limit or wrong for its type, a first frame that is not SETTINGS, a type that makes the length wrong) when the input ends before the frame's payload does: the reference waits for the payload, and gives its answer only if the stream goes on
+
+# the reference ended the connection and this library did not
+gen:*	nghttp2|h2|gox2	ok/conn:*	ref-strict	a stream error (a malformed message, a frame on a half-closed stream, PRIORITY of the wrong size, a body that does not match its content-length), or a SETTINGS ACK nobody asked for, or a GOAWAY from a client, answered by the reference with a connection error where this library resets the stream or goes on (sections 5.1, 6.3, 6.5.3, 8.1.1)
+
+# both went on, and what they delivered differs
+gen:*	nghttp2	ok/ok+msgs:body|incomplete/ok+msgs:body	scope	both reset the stream (or both end the input) but nghttp2 delivers the octets of a DATA frame that came before the mismatch and this library delivers a frame only whole
+rfc9113-8.1.1:content-length-short-data	nghttp2	ok/ok+msgs:body	scope	both reset the stream, but nghttp2 delivers the octets of a DATA frame that came before the mismatch and this library delivers a frame only whole
+rfc9113-8.1:headers-three-times	gox2	ok/conn:PROTOCOL_ERROR*	timing	[flaky] Go answers a third HEADERS block on an open stream with a connection error or a stream reset according to when its handler goroutine runs; the RFC calls it a stream error on a half-closed or malformed message, as here
+gen:*	nghttp2	ok/ok*	ref-lenient	nghttp2 drops a field it finds invalid (a name or value outside section 8.2.1's lists, an invalid content-length) and delivers the request, or accepts a header block this library resets the stream for
+gen:*	h2	ok/ok+msgs:count+resets|ok/ok+resets	ref-lenient	a header block this library resets the stream for (a field value, name or pseudo-header the sections 8.2 and 8.3 forbid, a content-length that is invalid, trailers that do not end the stream) is accepted by h2
+gen:*	gox2	ok/ok+msgs:count+resets|ok/ok+msgs:count	ref-lenient	Go accepts what this library resets the stream for: whitespace around a value, an invalid content-length, a pseudo-header or path that is not valid (section 8.2.1 and 8.3.1), or a frame after which this library has stopped
+gen:*	gox2	ok/ok+msgs:trailers	scope	Go keeps a request's trailers only for the names its Trailer field announced, and the others are discarded before the handler runs
+gen:*	gox2	ok/ok+resets|ok/ok+msgs:body+resets	code	both reset the stream; the code, or the number of resets (a second HEADERS or DATA on a stream, Go's own body reader's error), differs
+
+# the reference reads the same bytes differently cut
+*	nghttp2	split	ref-split	nghttp2 counts the pieces a header block arrives in as CONTINUATION frames (CVE-2024-28182 hardening), so a header block of two or more frames fed a byte at a time ends the connection and fed whole does not; DATA and field blocks cut at other places are read the same
+*	h2	split	ref-split	h2 checks a chunk against the state the whole chunk leaves (a bad preface raises on every byte; a GOAWAY and what follows in one chunk is read in one), so the answer depends on the cut
+*	gox2	split	ref-split	Go's handler and its reader run concurrently: whether a request had been recorded, or its body read, when a later frame arrived depends on the timing of the cut
+genhd:*/t100|genhd:*/t0|genhd:*/t64|genhd:*/t40|genhd:*/t256	nghttp2	ok/err	update	nghttp2 requires a block to open with a dynamic table size update after the decoder's maximum was set below 4096 (RFC 7541 section 4.2); this decoder, handed a table already of that size, does not
+genhd:*	gox2	err/ok	ref-lenient	a dynamic table size update in the middle of a block (an inserted or changed octet of the form 001xxxxx) is a COMPRESSION_ERROR (RFC 7541 section 4.2: only at the start of a block); Go's decoder applies it wherever it comes
+

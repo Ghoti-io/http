@@ -304,7 +304,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage target does, because --coverage links the gcov runtime, whose
 # mangle_path check-symbols is right to reject in a shipping library and
 # wrong to reject in an instrumented one. Spelled as text's TEST_GATES is.
-TEST_GATES ?= check-symbols check-aliasing check-defects check-oracle
+TEST_GATES ?= check-symbols check-aliasing check-hpack-tables check-defects check-oracle
 
 # Valgrind flags (exclude "still reachable" as it's not a leak)
 # --suppressions: see tests/valgrind.supp. It holds allocations that are
@@ -514,7 +514,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 ####################################################################
 
 # General commands
-.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-defects
+.PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-aliasing check-defects check-hpack-tables
 # Release build commands
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 # Debug build commands
@@ -774,6 +774,20 @@ ifeq ($(OS_NAME), Linux)
 else
 	@printf "check-symbols: skipped (Linux only)\n"
 endif
+
+# The HPACK static table, the Huffman code and the RFC 7541 Appendix C test
+# vectors are generated from the RFC's own text (pinned by SHA-256), so that
+# nothing in them is a transcription. This fails if a committed file is not
+# what the generators produce, and needs the network the first time, for the
+# RFC (tools/hpack/fetch.sh keeps it). tools/check-defects.sh shows it fail.
+check-hpack-tables: ## Fail unless the generated HPACK tables and test vectors match RFC 7541
+check-hpack-tables:
+	@tools/hpack/fetch.sh
+	@python3 tools/hpack/gen_tables.py tools/hpack/data/rfc7541.txt | cmp - src/http/hpack_tables.c \
+		|| { printf '\033[0;31mcheck-hpack-tables: src/http/hpack_tables.c is not what tools/hpack/gen_tables.py produces from RFC 7541\033[0m\n' >&2; exit 1; }
+	@python3 tools/hpack/gen_vectors.py tools/hpack/data/rfc7541.txt | cmp - tests/hpack_rfc_vectors.h \
+		|| { printf '\033[0;31mcheck-hpack-tables: tests/hpack_rfc_vectors.h is not what tools/hpack/gen_vectors.py produces from RFC 7541\033[0m\n' >&2; exit 1; }
+	@printf 'check-hpack-tables: the static table, the Huffman code and the Appendix C vectors are RFC 7541 as pinned\n'
 
 check-defects: ## Fail unless the unit tests catch each planted defect
 check-defects:
@@ -1039,9 +1053,11 @@ test-asan: $(ASAN_TEST_EXECUTABLES)
 # references are containers; a Windows build is not asked it.
 ORACLE := tools/oracle
 HTTP_PROBE := $(APP_DIR)/oracle/http_probe$(EXE_EXTENSION)
-ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-1
+H2_PROBE := $(APP_DIR)/oracle/h2_probe$(EXE_EXTENSION)
+ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-2
 # More cases than the default is `make check-oracle ORACLE_ARGS='--count 40000'`.
 ORACLE_ARGS ?=
+ORACLE_H2_ARGS ?=
 
 # Built like an example (the archive, whole): it must carry the code under
 # test and not whatever is installed. Not a test: a differential needs this
@@ -1052,22 +1068,31 @@ $(HTTP_PROBE): $(ORACLE)/http_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
 
-oracle-probe: ## Build the probe the differential drives
-oracle-probe: $(HTTP_PROBE)
+$(H2_PROBE): $(ORACLE)/h2_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: h2_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
 
-oracle-build: ## Build the pinned reference image: llhttp, h11 and Go net/http
+oracle-probe: ## Build the probes the differentials drive
+oracle-probe: $(HTTP_PROBE) $(H2_PROBE)
+
+oracle-build: ## Build the pinned reference image: llhttp, h11, Go net/http, nghttp2, h2 and Go x/net/http2
 	docker build -t $(ORACLE_IMAGE) -f $(ORACLE)/containers/refs/Containerfile \
 		$(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if any would not
 	@python3 $(ORACLE)/oracle_env.py
 
-check-oracle: ## Fail unless every disagreement with the references is explained
+check-oracle: ## Fail unless every disagreement with the references is explained (HTTP/1.1 and HTTP/2)
 ifeq ($(OS_NAME), Linux)
-check-oracle: $(HTTP_PROBE)
+check-oracle: $(HTTP_PROBE) $(H2_PROBE)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/oracle_run.py llhttp,h11,gohttp -- \
 		python3 $(ORACLE)/diff.py --probe $(HTTP_PROBE) $(ORACLE_ARGS)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/oracle_run.py nghttp2,h2,gox2 -- \
+		python3 $(ORACLE)/diff_h2.py --probe $(H2_PROBE) $(ORACLE_H2_ARGS)
 else
 # No probe is built: it is POSIX C, and the references are containers.
 	@printf "check-oracle: skipped (Linux only)\n"
@@ -1115,7 +1140,8 @@ define fuzz-rule
 fuzz-$2: ## Build the $2 fuzz harness (requires clang)
 fuzz-$2: $$(FUZZ_APP_DIR)/$1
 
-$$(FUZZ_APP_DIR)/$1: tests/fuzz/$1.cpp $$(FUZZ_OBJECTS) $$(FUZZ_FLAGS_STAMP)
+$$(FUZZ_APP_DIR)/$1: tests/fuzz/$1.cpp $$(wildcard tests/fuzz/*.h) tests/failing_allocator.h \
+		$$(FUZZ_OBJECTS) $$(FUZZ_FLAGS_STAMP)
 	@if [ -z "$$(FUZZ_CC_OK)" ]; then \
 		echo "fuzzing requires $$(FUZZ_CXX); install clang or set FUZZ_CC/FUZZ_CXX"; \
 		exit 1; \
@@ -1135,9 +1161,12 @@ endef
 
 $(eval $(call fuzz-rule,fuzz_parse,parse))
 $(eval $(call fuzz-rule,fuzz_roundtrip,roundtrip))
+$(eval $(call fuzz-rule,fuzz_hpack,hpack))
+$(eval $(call fuzz-rule,fuzz_hpack_roundtrip,hpack-roundtrip))
+$(eval $(call fuzz-rule,fuzz_h2conn,h2conn))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-parse fuzz-run-roundtrip
+fuzz: fuzz-run-parse fuzz-run-roundtrip fuzz-run-hpack fuzz-run-hpack-roundtrip fuzz-run-h2conn
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)

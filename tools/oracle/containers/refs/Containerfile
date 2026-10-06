@@ -1,5 +1,13 @@
-# The HTTP/1.1 references, pinned, in one image.
+# The HTTP/1.1 and HTTP/2 references, pinned, in one image.
 #
+# HTTP/2 (tools/oracle/diff_h2.py): nghttp2 (C, libnghttp2 1.64.0), h2 (Python,
+# with hpack and hyperframe) and Go's x/net/http2, three implementations that
+# share no code, each driven as a server over a client's bytes and through its
+# HPACK encoder and decoder alone (containers/refs/ref-nghttp2.c, ref-h2.py,
+# gox2/main.go). Left out: Node's http2 (it is nghttp2), curl and every proxy
+# built on nghttp2 (the same), hyper/h2 in Rust (a fourth, not wanted here).
+#
+# HTTP/1.1:
 # Three independent implementations of the message syntax this library
 # parses, none of them sharing a line with another:
 #
@@ -45,10 +53,31 @@ RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuit
     && printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99snapshot \
     && apt-get update -qq \
     && apt-get install -y --no-install-recommends golang-1.24-go=1.24.4-1 \
+      ca-certificates=20250419 \
     && rm -rf /var/lib/apt/lists/*
 COPY go/main.go /src/main.go
 RUN cd /src && CGO_ENABLED=0 GOFLAGS=-trimpath GO111MODULE=off \
     /usr/lib/go-1.24/bin/go build -o /out/ref-go main.go
+# golang.org/x/net v0.50.0, the newest that Go 1.24.4 accepts, by go.mod and
+# go.sum (the module proxy is only a download path: go.sum is the pin).
+COPY gox2/go.mod gox2/go.sum gox2/main.go /src/gox2/
+RUN cd /src/gox2 && GOTOOLCHAIN=local /usr/lib/go-1.24/bin/go mod download
+RUN cd /src/gox2 && CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+    /usr/lib/go-1.24/bin/go build -trimpath -o /out/ref-gox2 .
+
+FROM ${BASE} AS nghttp2build
+ARG SNAPSHOT
+RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' \
+      "$SNAPSHOT" "$SNAPSHOT" > /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99snapshot \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends gcc=4:14.2.0-1 libc6-dev=2.41-12+deb13u4 \
+      libnghttp2-dev=1.64.0-1.1+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY nghttp2/ref-nghttp2.c /src/ref-nghttp2.c
+# Linked statically, so the final image needs no libnghttp2 package.
+RUN mkdir -p /out && gcc -std=c17 -O2 -Wall -Wextra -Werror -o /out/ref-nghttp2 \
+    /src/ref-nghttp2.c /usr/lib/x86_64-linux-gnu/libnghttp2.a
 
 FROM ${BASE}
 ARG SNAPSHOT
@@ -73,13 +102,21 @@ RUN apt-get update -qq \
 # in the wrong direction. Pinned exactly; PyPI releases are immutable.
 RUN pip install --no-cache-dir --no-compile --break-system-packages h11==0.16.0
 
-COPY --from=gobuild /out/ref-go /usr/local/bin/ref-go
-COPY ref-llhttp.js ref-h11.py /usr/local/lib/ghttp-ref/
-COPY llhttp-version h11-version go-version /usr/local/bin/
+# The HTTP/2 Python reference. Exact versions of all three packages: h2 carries
+# neither of the other two in its own source.
+RUN pip install --no-cache-dir --no-compile --break-system-packages \
+    h2==4.4.1 hpack==4.2.0 hyperframe==6.1.0
+
+COPY --from=gobuild /out/ref-go /out/ref-gox2 /usr/local/bin/
+COPY --from=nghttp2build /out/ref-nghttp2 /usr/local/bin/ref-nghttp2
+COPY ref-llhttp.js ref-h11.py ref-h2.py /usr/local/lib/ghttp-ref/
+COPY llhttp-version h11-version go-version nghttp2-version h2-version gox2-version /usr/local/bin/
 RUN chmod +x /usr/local/bin/llhttp-version /usr/local/bin/h11-version \
-      /usr/local/bin/go-version /usr/local/bin/ref-go
+      /usr/local/bin/go-version /usr/local/bin/ref-go /usr/local/bin/nghttp2-version \
+      /usr/local/bin/h2-version /usr/local/bin/gox2-version /usr/local/bin/ref-gox2 \
+      /usr/local/bin/ref-nghttp2
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 NODE_OPTIONS=--no-warnings
 
 ENTRYPOINT []
-CMD ["sh", "-c", "llhttp-version; h11-version; go-version"]
+CMD ["sh", "-c", "llhttp-version; h11-version; go-version; nghttp2-version; h2-version; gox2-version"]

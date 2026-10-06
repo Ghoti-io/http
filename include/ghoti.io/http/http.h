@@ -30,7 +30,10 @@
 #include <ghoti.io/http/allocator.h>
 #include <ghoti.io/http/buffer.h>
 #include <ghoti.io/http/core.h>
+#include <ghoti.io/http/h2conn.h>
+#include <ghoti.io/http/h2frame.h>
 #include <ghoti.io/http/headers.h>
+#include <ghoti.io/http/hpack.h>
 #include <ghoti.io/http/libver.h>
 #include <ghoti.io/http/macros.h>
 #include <ghoti.io/http/parser.h>

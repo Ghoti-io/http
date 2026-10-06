@@ -147,6 +147,85 @@ plant split-dependent-crlf src/http/parser.c testSplit \
   c->prev_cr = false; // forgets a CR that ended the previous piece
   bool trailer = (p->state == ST_TRAILERS);'
 
+# HTTP/2 (story 3b). Each defect is the one the spec names.
+plant h2-flow-control-off-by-one src/http/h2conn.c testH2conn \
+  'H2FlowReceive.DataBeyondTheConnectionWindowIsAConnectionError' \
+  '  if ((int64_t)len > c->recv_window) {
+    return conn_fail(c, GHTTP_H2_FLOW_CONTROL_ERROR,
+        "DATA exceeds the connection window", GHTTP_ERR_CORRUPT);' \
+  '  if ((int64_t)len > c->recv_window + 1) {
+    return conn_fail(c, GHTTP_H2_FLOW_CONTROL_ERROR,
+        "DATA exceeds the connection window", GHTTP_ERR_CORRUPT);'
+
+plant h2-send-window-off-by-one src/http/h2conn.c testH2conn \
+  'H2FlowSend.DataIsHeldBackAtTheWindowAndResumesOnWindowUpdate_Section6_9' \
+  '  return w > 0 ? (size_t)w : 0;
+}
+
+size_t ghttp_h2_conn_send_window' \
+  '  return w > 0 ? (size_t)w + 1 : 0;
+}
+
+size_t ghttp_h2_conn_send_window'
+
+plant h2-unbounded-continuation src/http/h2conn.c testH2conn \
+  'H2HeaderBlock.AContinuationFloodStopsAtTheLimitPlusOne_Cve2024_27316Class' \
+  '  if (++c->hb_frames - 1 > c->limits.max_continuation_frames) {' \
+  '  if (++c->hb_frames - 1 > c->limits.max_continuation_frames && 0) {'
+
+plant hpack-table-size-not-enforced src/http/hpack.c testHpack \
+  'HpackDecoder.AnUpdateAboveTheAdvertisedMaximumIsACompressionError' \
+  '      if (v > d->cap) {
+        return GHTTP_ERR_CORRUPT;
+      }
+      table_set_max(&d->table, v);' \
+  '      table_set_max(&d->table, v);'
+
+plant h2-stream-state-skip src/http/h2conn.c testH2conn \
+  'H2Streams.FramesOnAnIdleStreamAreAProtocolError_Section5_1' \
+  '    case SS_IDLE:
+      return proto(c, "DATA on an idle stream");' \
+  '    case SS_IDLE:
+      return GHTTP_OK;'
+
+# The generated HPACK tables are checked against the RFC by a gate of their
+# own, not by a unit test: plant a changed Huffman code in a copy and require
+# that gate to fail (and to pass on the copy before it).
+tdir="$SCRATCH/hpack-table-edit"
+cp -a "$SCRATCH/control" "$tdir"
+mkdir -p "$tdir/tools/hpack"
+if ! ( cd "$tdir" && "$MAKE_CMD" --no-print-directory check-hpack-tables $MARGS ) > "$tdir.ctl.log" 2>&1; then
+  printf 'check-defects: check-hpack-tables fails on the unplanted copy; read %s\n' "$tdir.ctl.log" >&2
+  tail -5 "$tdir.ctl.log" >&2
+  fail=1
+else
+  python3 - "$tdir/src/http/hpack_tables.c" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+m = re.search(r'0x[0-9a-f]+', t)
+if not m:
+    sys.exit(3)
+i = m.end() - 1
+c = t[i]
+t = t[:i] + ('1' if c != '1' else '2') + t[i+1:]
+open(p, "w").write(t)
+PY
+  if [ $? -ne 0 ]; then
+    printf 'check-defects: hpack-table-edit: THE PATCH DID NOT APPLY\n' >&2
+    fail=1
+  elif ( cd "$tdir" && "$MAKE_CMD" --no-print-directory check-hpack-tables $MARGS ) > "$tdir.log" 2>&1; then
+    printf '\033[0;31mcheck-defects: hpack-table-edit: check-hpack-tables PASSED with a table entry changed\033[0m\n' >&2
+    fail=1
+  elif grep -q "is not what tools/hpack/gen_tables.py produces" "$tdir.log"; then
+    printf 'check-defects: hpack-table-edit: caught by check-hpack-tables\n'
+  else
+    printf '\033[0;31mcheck-defects: hpack-table-edit: failed, but not as the gate fails - read %s\033[0m\n' "$tdir.log" >&2
+    trap - EXIT
+    fail=1
+  fi
+fi
+
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-defects: FAILED\033[0m\n' >&2
   exit 1

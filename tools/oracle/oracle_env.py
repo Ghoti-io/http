@@ -15,8 +15,8 @@ the image has no upstream digest, so check_pin() is the guarantee and the
 version each reference prints is what it checks.
 
 **There is no host mode.** Every other converted library keeps one for a
-machine with no container engine. Here the references are Node, a Python
-package and a Go program compiled into the image, and a host that happened to
+machine with no container engine. Here the references are Node, Python
+packages, Go programs and a C program compiled into the image, and a host that happened to
 have a different llhttp would answer a different question under the same name,
 which is the failure this arrangement exists to remove. No engine, or no
 image, is an error and never a skip.
@@ -42,6 +42,10 @@ REFS = {
     "h11": (["h11-version"],
             ["python3", "/usr/local/lib/ghttp-ref/ref-h11.py"]),
     "gohttp": (["go-version"], ["ref-go"]),
+    # HTTP/2 (diff_h2.py)
+    "nghttp2": (["nghttp2-version"], ["ref-nghttp2"]),
+    "h2": (["h2-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-h2.py"]),
+    "gox2": (["gox2-version"], ["ref-gox2"]),
 }
 
 

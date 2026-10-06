@@ -53,12 +53,15 @@ copy_tree() {
 # TEST_LD_PATH does for the tests.
 LDP="$ROOT/$BUILD_DIR/apps:${LD_LIBRARY_PATH:-}"
 
-probe_of() { printf '%s' "$1/$BUILD_DIR/apps/oracle/http_probe"; }
+# Which differential is being shown to fail: the HTTP/1 one first, then HTTP/2.
+DIFF_SCRIPT=diff.py
+PROBE_NAME=http_probe
+probe_of() { printf '%s' "$1/$BUILD_DIR/apps/oracle/$PROBE_NAME"; }
 
 # run <dir> -> log in <dir>.log, status returned
 run_diff() {
   dir=$1
-  ( cd "$dir" && LD_LIBRARY_PATH="$LDP" python3 tools/oracle/diff.py \
+  ( cd "$dir" && LD_LIBRARY_PATH="$LDP" python3 tools/oracle/$DIFF_SCRIPT \
       --probe "$(probe_of "$dir")" ) > "$dir.log" 2>&1
 }
 
@@ -121,7 +124,8 @@ plant_lib() {
   touch "$dir/$file"
   # The control's probe and archive came along: a path make did not match would
   # leave the OLD binary to run against nothing patched.
-  rm -f "$dir/$BUILD_DIR"/apps/*.a "$dir/$BUILD_DIR"/apps/*.so* "$dir/$BUILD_DIR"/apps/oracle/http_probe
+  rm -f "$dir/$BUILD_DIR"/apps/*.a "$dir/$BUILD_DIR"/apps/*.so* "$dir/$BUILD_DIR"/apps/oracle/http_probe \
+    "$dir/$BUILD_DIR"/apps/oracle/h2_probe
   if ! ( cd "$dir" && "$MAKE_CMD" --no-print-directory oracle-probe $MARGS ) > "$dir-build.log" 2>&1; then
     printf 'check-oracle-gate: %s: the patched copy does not build\n' "$name" >&2
     tail -10 "$dir-build.log" >&2
@@ -193,6 +197,64 @@ plant_harness strictness-control-misses-the-flag tools/oracle/diff.py \
   'env={"GHTTP_REF_LENIENTX": "1"})
     flipped = []' \
   'lenient flag changed no answer'
+
+# ---- HTTP/2 (story 3b): the same, against diff_h2.py -----------------------------
+
+DIFF_SCRIPT=diff_h2.py
+PROBE_NAME=h2_probe
+rm -rf "$SCRATCH/control.log"
+if ! run_diff "$SCRATCH/control"; then
+  printf 'check-oracle-gate: the CONTROL copy fails the HTTP/2 differential, so no\n' >&2
+  printf 'HTTP/2 result below would mean anything. Its log:\n' >&2
+  tail -30 "$SCRATCH/control.log" >&2
+  exit 1
+fi
+printf 'check-oracle-gate: HTTP/2 control passes\n'
+
+plant_lib h2-accept-uppercase-field-name src/http/h2msg.c \
+  '  return ghttp_is_tchar(c) && !(c >= '"'A'"' && c <= '"'Z'"');' \
+  '  return ghttp_is_tchar(c);' \
+  'upper-case field name'
+
+plant_lib h2-accept-hpack-index-zero src/http/hpack.c \
+  '  if (idx == 0) {
+    return GHTTP_ERR_CORRUPT;
+  }
+  if (idx <= GHTTP_HPACK_STATIC_COUNT) {' \
+  '  if (idx <= GHTTP_HPACK_STATIC_COUNT) {' \
+  'accepted HPACK index 0'
+
+plant_lib h2-accept-data-on-idle-stream src/http/h2conn.c \
+  '    case SS_IDLE:
+      return proto(c, "DATA on an idle stream");' \
+  '    case SS_IDLE:
+      return GHTTP_OK;' \
+  'have no rule'
+
+plant_harness h2-rule-deleted tools/oracle/known-h2-disagreements.tsv \
+  'rfc9113-6.2:headers-padding-too-long	gox2	conn:PROTOCOL_ERROR/ok+resets	code	' \
+  '# rfc9113-6.2:headers-padding-too-long	gox2	conn:PROTOCOL_ERROR/ok+resets	code	' \
+  'have no rule'
+
+plant_harness h2-comparator-blind-to-bodies tools/oracle/diff_h2.py \
+  '                     fieldmap(m["headers"], drop), hx(m["body"]), fieldmap(m["trailers"], drop),' \
+  '                     fieldmap(m["headers"], drop), b"", fieldmap(m["trailers"], drop),' \
+  'did not deliver a 3-octet body'
+
+plant_harness h2-reference-answers-nothing tools/oracle/diff_h2.py \
+  '    return parse_answers(name, done.stdout, want_count(cases))
+
+
+# ---- normalising' \
+  '    got = parse_answers(name, done.stdout, want_count(cases))
+    if name == "h2":
+        for v in got.values():
+            v.update(msgs=[], resets=[], conn_error=None, closed=False)
+    return got
+
+
+# ---- normalising' \
+  'did not accept a good request'
 
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-oracle-gate: FAILED\033[0m\n' >&2
