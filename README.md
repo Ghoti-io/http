@@ -1,7 +1,8 @@
 # Ghoti.io HTTP
 
-An HTTP/1.1 codec: an incremental parser and a writer for requests and
-responses, bytes in and bytes out. It never opens a socket, reads a file, asks
+An HTTP/1.1 and HTTP/2 codec: for HTTP/1.1 an incremental parser and a writer
+for requests and responses, for HTTP/2 a frame codec, HPACK and a connection
+state machine for a client or a server, bytes in and bytes out. It never opens a socket, reads a file, asks
 for the time or starts a thread, so the same code serves a server, a client, a
 test and a fuzzer, and it builds before an event loop or TLS exist. It
 implements the message syntax and framing of RFC 9112 and refuses what that RFC
@@ -9,7 +10,7 @@ forbids, so that two parties reading one connection cannot be made to disagree
 about where a message ends.
 
 It is a codec and nothing more: no client, no server, no routing, no cookies, no
-content codings, no HTTP/2, no HTTP/3, and no WebSocket beyond reporting that a
+content codings, no HTTP/3, no server push, no stream priorities, and no WebSocket beyond reporting that a
 message asks for an upgrade. A request target is classified into its four forms
 and kept verbatim; decoding and normalising it belongs to the caller.
 
@@ -31,6 +32,22 @@ Every unbounded quantity (head size, line length, field count, body size, chunk
 size, trailer size and count) is capped by `GHTTP_Limits`. Exceeding a cap is
 `GHTTP_ERR_LIMIT` at the same input byte however the input is split; nothing is
 ever truncated.
+
+## HTTP/2
+
+`ghttp_h2_conn_*` (`<ghoti.io/http/h2conn.h>`) is RFC 9113 as bytes in and bytes
+out, by prior knowledge (`PRI * HTTP/2.0`): you feed it what arrived, write what
+it queued, and give it a millisecond tick if its per-interval limits are to
+renew. It tracks every window and refuses to write past one, emits the GOAWAY or
+RST_STREAM bytes itself, and delivers requests and responses as the same
+`GHTTP_Request` and `GHTTP_Response` as the HTTP/1.1 parser. `ghttp_hpack_*`
+(`<ghoti.io/http/hpack.h>`) is the RFC 7541 header codec on its own. Every
+unbounded quantity (frame, header block, CONTINUATION count, header list, table,
+streams, SETTINGS, PING and RST_STREAM per interval, buffered bytes) is capped by
+`GHTTP_H2Limits`, and a decision is the same however the input is cut.
+[documentation/rfc9113.md](documentation/rfc9113.md) and
+[documentation/hpack.md](documentation/hpack.md) list what is enforced, what is
+not, and the extension seams.
 
 ## Example
 
@@ -115,12 +132,18 @@ make -C libs/http test PREFIX="$PWD/.local"
 
 `make test` runs the unit tests and the gates: `check-symbols` (every exported
 symbol carries the version namespace), `check-aliasing`, and `check-defects`,
-which plants four defects in a copy of the source (accepting Content-Length with
-Transfer-Encoding, ignoring a limit twice, a result that depends on where the
-input was split) and requires the tests to go red for each, and `check-oracle`,
-which parses a generated corpus (valid and invalid) with this library and with
-llhttp, h11 and Go's net/http in one pinned container image and requires every
-disagreement to be explained by a rule in `tools/oracle/known-disagreements.tsv`.
+`check-hpack-tables` (the generated HPACK tables are what RFC 7541 says),
+`check-defects`, which plants defects in a copy of the source (accepting
+Content-Length with Transfer-Encoding, ignoring a limit twice, a result that
+depends on where the input was split, an HTTP/2 flow-control off by one, an
+unbounded CONTINUATION run, an HPACK table-size update not enforced, a skipped
+stream-state check) and requires the tests to go red for each, and
+`check-oracle`, which parses a generated corpus (valid and invalid) with this
+library and with llhttp, h11 and Go's net/http in one pinned container image
+and requires every disagreement to be explained by a rule in
+`tools/oracle/known-disagreements.tsv`; the HTTP/2 half does the same for
+connections and HPACK against nghttp2, h2 (Python) and Go's `x/net/http2`, with
+`tools/oracle/known-h2-disagreements.tsv`.
 It needs docker or podman and the image (`make oracle-build`), and **fails**
 without them; `make check-oracle-gate` shows the gate going red for planted
 defects. `make test-valgrind`,
