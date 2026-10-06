@@ -291,6 +291,37 @@ endif
 endif
 INCLUDE += $(CUTIL_CFLAGS)
 
+# ghoti.io-security, for the WebSocket handshake: SHA-1 for Sec-WebSocket-Accept
+# and the kernel generator for the client's nonce and mask keys. A hard
+# dependency, not an optional one: one code path, no feature matrix. Same shape
+# as cutil's above, including the absence of a sibling-checkout fallback.
+SECURITY_PC ?= ghoti.io-security$(BRANCH)
+SECURITY_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(SECURITY_PC) 2>/dev/null)
+SECURITY_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(SECURITY_PC) 2>/dev/null)
+ifeq ($(strip $(SECURITY_CFLAGS)),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-security was not found by pkg-config. Run ./bootstrap.sh at the root of the workspace - two levels up, the directory holding libs/ - to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback, for the reason cutil's error above gives.)
+endif
+endif
+INCLUDE += $(SECURITY_CFLAGS)
+
+# ghoti.io-compress, for permessage-deflate (RFC 7692). A hard dependency for the
+# same reason as security: a WebSocket codec that cannot negotiate the extension
+# every browser offers is not finished.
+COMPRESS_PC ?= ghoti.io-compress$(BRANCH)
+COMPRESS_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --cflags $(COMPRESS_PC) 2>/dev/null)
+COMPRESS_LIBS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs $(COMPRESS_PC) 2>/dev/null)
+ifeq ($(strip $(COMPRESS_CFLAGS)),)
+ifndef SKIP_DEP_CHECK
+$(error ghoti.io-compress was not found by pkg-config. Run ./bootstrap.sh at the root of the workspace - two levels up, the directory holding libs/ - to build and install the suite into a local prefix, then pass the same PREFIX here - or point PKG_CONFIG_PATH at the directory holding its .pc file. There is deliberately no sibling-checkout fallback, for the reason cutil's error above gives.)
+endif
+endif
+INCLUDE += $(COMPRESS_CFLAGS)
+
+# One variable for "the libraries this links", so that a rule cannot pick up one
+# dependency and miss another. Every link line below reads this.
+DEP_LIBS := $(CUTIL_LIBS) $(SECURITY_LIBS) $(COMPRESS_LIBS)
+
 # Automatically collect all .c source files under the src directory.
 SOURCES := $(shell find src -type f -name '*.c')
 
@@ -325,7 +356,7 @@ TEST_HELPER_OBJ := $(patsubst tests/%.cpp,$(OBJ_DIR)/tests/%.o,$(TEST_HELPER_SRC
 # --whole-archive because anything registering itself from a constructor is
 # otherwise dropped - a plain archive link only pulls in object files that
 # something references by name.
-HTTPLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(CUTIL_LIBS)
+HTTPLIBRARY := -Wl,--whole-archive $(APP_DIR)/$(STATIC_TARGET) -Wl,--no-whole-archive $(DEP_LIBS)
 
 # Windows has no fopencookie, so FailingSink (tests/test_helpers.h) serves its
 # failures from a wrapper around the library's fprintf instead of from the
@@ -435,7 +466,7 @@ $(OBJ_DIR)/%.o: src/%.c $(FLAGS_STAMP) | $(LIBVER_GEN)
 $(APP_DIR)/$(TARGET): $(LIBOBJECTS)
 	@printf "\n### Compiling HTTP Library ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(CUTIL_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
+	$(CXX) $(CXXFLAGS) -shared -o $@ $^ $(LDFLAGS) $(DEP_LIBS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)
 
 ifeq ($(OS_NAME), Linux)
 	@ln -f -s $(TARGET) $(APP_DIR)/$(SO_NAME)
@@ -492,7 +523,7 @@ $(APP_DIR)/$2$(EXE_EXTENSION): $$(TEST_OBJ_$1) $(TEST_HELPER_OBJ) \
 		$(APP_DIR)/$(STATIC_TARGET) | $(APP_DIR)/$(TARGET)
 	@printf "\n### Linking Test: $2 ###\n"
 	@mkdir -p $$(@D)
-	$(CXX) $(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $(TEST_HELPER_OBJ) $(LDFLAGS) $(TEST_LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS)
+	$(CXX) $(CXXFLAGS) -o $$@ $$(TEST_OBJ_$1) $(TEST_HELPER_OBJ) $(LDFLAGS) $(TEST_LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS) $(TESTFLAGS)
 endef
 
 $(foreach pair,$(TEST_PAIRS),\
@@ -507,7 +538,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Example: $* ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
 ####################################################################
 # Commands
@@ -793,7 +824,7 @@ check-defects: ## Fail unless the unit tests catch each planted defect
 check-defects:
 # Not a prerequisite of anything it needs: it copies the tree and builds the
 # copies itself, so it works on a tree nobody has built.
-	@tools/check-defects.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC)
+	@tools/check-defects.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) SECURITY_PC=$(SECURITY_PC) COMPRESS_PC=$(COMPRESS_PC)
 
 test: ## Make and run the unit tests
 test: $(APP_DIR)/$(TARGET) $(TEST_EXECUTABLES) $(TEST_GATES)
@@ -980,7 +1011,7 @@ $(ASAN_OBJ_DIR)/%.o: src/%.c $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 $(ASAN_APP_DIR)/$(ASAN_TARGET): $(ASAN_LIBOBJECTS)
 	@printf "\n### Linking ASan+UBSan HTTP Library ###\n"
 	@mkdir -p $(@D)
-	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS) $(CUTIL_LIBS)
+	$(CXX) $(ASAN_CXXFLAGS) -shared -o $@ $^ $(ASAN_LDFLAGS) $(DEP_LIBS)
 
 $(ASAN_OBJ_DIR)/tests/%.o: tests/%.cpp $(ASAN_FLAGS_STAMP) | $(LIBVER_GEN)
 	@printf "\n### Compiling ASan Test: $* ###\n"
@@ -998,7 +1029,7 @@ ASAN_TEST_OBJ_$1 := $(ASAN_OBJ_DIR)/tests/$(basename $(notdir $1)).o
 $(ASAN_APP_DIR)/$2$(EXE_EXTENSION): $$(ASAN_TEST_OBJ_$1) $(ASAN_APP_DIR)/$(ASAN_TARGET)
 	@printf "\n### Linking ASan Test: $2 ###\n"
 	@mkdir -p $$(@D)
-	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_HTTPLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS)
+	$(CXX) $(ASAN_CXXFLAGS) -o $$@ $$(ASAN_TEST_OBJ_$1) $(ASAN_LDFLAGS) $(ASAN_HTTPLIBRARY) $(DEP_LIBS) $(TESTFLAGS)
 endef
 
 $(foreach pair,$(TEST_PAIRS),\
@@ -1066,13 +1097,13 @@ $(HTTP_PROBE): $(ORACLE)/http_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Oracle Probe: http_probe ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
 $(H2_PROBE): $(ORACLE)/h2_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Oracle Probe: h2_probe ###\n"
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(CUTIL_LIBS)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
 oracle-probe: ## Build the probes the differentials drive
 oracle-probe: $(HTTP_PROBE) $(H2_PROBE)
@@ -1100,7 +1131,7 @@ endif
 
 check-oracle-gate: ## Show that the oracle gate fails: planted defects and harness controls
 check-oracle-gate:
-	@tools/oracle/check-gate.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC)
+	@tools/oracle/check-gate.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) SECURITY_PC=$(SECURITY_PC) COMPRESS_PC=$(COMPRESS_PC)
 
 ####################################################################
 # Fuzzing (libFuzzer)
@@ -1149,7 +1180,7 @@ $$(FUZZ_APP_DIR)/$1: tests/fuzz/$1.cpp $$(wildcard tests/fuzz/*.h) tests/failing
 	@mkdir -p $$(@D) $$(FUZZ_CORPUS)/$2
 	@printf "\n### Building fuzz harness: $1 ###\n"
 	$$(FUZZ_CXX) $$(FUZZ_BIN_FLAGS) -std=c++20 -w $$(INCLUDE) \
-		-o $$@ $$< $$(FUZZ_OBJECTS) $(CUTIL_LIBS)
+		-o $$@ $$< $$(FUZZ_OBJECTS) $(DEP_LIBS)
 
 fuzz-run-$2: ## Run the $2 fuzzer for $$(FUZZ_TIME) seconds
 fuzz-run-$2: $$(FUZZ_APP_DIR)/$1
@@ -1164,9 +1195,12 @@ $(eval $(call fuzz-rule,fuzz_roundtrip,roundtrip))
 $(eval $(call fuzz-rule,fuzz_hpack,hpack))
 $(eval $(call fuzz-rule,fuzz_hpack_roundtrip,hpack-roundtrip))
 $(eval $(call fuzz-rule,fuzz_h2conn,h2conn))
+$(eval $(call fuzz-rule,fuzz_ws_conn,ws-conn))
+$(eval $(call fuzz-rule,fuzz_ws_roundtrip,ws-roundtrip))
+$(eval $(call fuzz-rule,fuzz_ws_handshake,ws-handshake))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-parse fuzz-run-roundtrip fuzz-run-hpack fuzz-run-hpack-roundtrip fuzz-run-h2conn
+fuzz: fuzz-run-parse fuzz-run-roundtrip fuzz-run-hpack fuzz-run-hpack-roundtrip fuzz-run-h2conn fuzz-run-ws-conn fuzz-run-ws-roundtrip fuzz-run-ws-handshake
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)
@@ -1182,7 +1216,7 @@ LDCONF_INSTALL_PATH ?= /etc/ld.so.conf.d
 # What goes in the .pc Requires: field. Built from the same variables the
 # compile uses, so a dependency on another branch cannot be named one way for
 # the build and another way for consumers.
-PC_REQUIRES := $(CUTIL_PC)
+PC_REQUIRES := $(CUTIL_PC) $(SECURITY_PC) $(COMPRESS_PC)
 
 # Where this project's own .pc file is installed.
 PKGCONFIG_INSTALL_PATH ?= $(PC_INSTALL_PATH)
@@ -1375,15 +1409,15 @@ help: ## Display this help
 
 $(FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(HTTPLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(LIB_CFLAGS) $(CFLAGS) $(CXXFLAGS) $(LDFLAGS) $(INCLUDE) $(HTTPLIBRARY) $(DEP_LIBS) $(TESTFLAGS) $(TEST_LDFLAGS) $(OS_SPECIFIC_LIBRARY_NAME_FLAG)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(ASAN_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(ASAN_HTTPLIBRARY) $(CUTIL_LIBS) $(TESTFLAGS)' > $@.new
+	@printf '%s\n' '$(CC) $(CXX) $(ASAN_CFLAGS) $(ASAN_CXXFLAGS) $(ASAN_LDFLAGS) $(INCLUDE) $(ASAN_HTTPLIBRARY) $(DEP_LIBS) $(TESTFLAGS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
 
 $(FUZZ_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(CUTIL_LIBS)' > $@.new
+	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(DEP_LIBS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@

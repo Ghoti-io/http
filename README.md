@@ -1,8 +1,9 @@
 # Ghoti.io HTTP
 
-An HTTP/1.1 and HTTP/2 codec: for HTTP/1.1 an incremental parser and a writer
+An HTTP/1.1, HTTP/2 and WebSocket codec: for HTTP/1.1 an incremental parser and a writer
 for requests and responses, for HTTP/2 a frame codec, HPACK and a connection
-state machine for a client or a server, bytes in and bytes out. It never opens a socket, reads a file, asks
+state machine for a client or a server, for WebSocket the opening handshake, a
+frame codec and a connection with permessage-deflate, bytes in and bytes out. It never opens a socket, reads a file, asks
 for the time or starts a thread, so the same code serves a server, a client, a
 test and a fuzzer, and it builds before an event loop or TLS exist. It
 implements the message syntax and framing of RFC 9112 and refuses what that RFC
@@ -10,8 +11,9 @@ forbids, so that two parties reading one connection cannot be made to disagree
 about where a message ends.
 
 It is a codec and nothing more: no client, no server, no routing, no cookies, no
-content codings, no HTTP/3, no server push, no stream priorities, and no WebSocket beyond reporting that a
-message asks for an upgrade. A request target is classified into its four forms
+content codings, no HTTP/3, no server push, no stream priorities, and no WebSocket
+over HTTP/2 (RFC 8441: the connection is carrier-neutral, the handshake for it is
+a later story). A request target is classified into its four forms
 and kept verbatim; decoding and normalising it belongs to the caller.
 
 ## What it enforces
@@ -48,6 +50,43 @@ streams, SETTINGS, PING and RST_STREAM per interval, buffered bytes) is capped b
 [documentation/rfc9113.md](documentation/rfc9113.md) and
 [documentation/hpack.md](documentation/hpack.md) list what is enforced, what is
 not, and the extension seams.
+
+## WebSocket
+
+`ghttp_ws_*` is RFC 6455 and permessage-deflate (RFC 7692) as bytes in and bytes
+out, for either end. The handshake (`<ghoti.io/http/ws_handshake.h>`) works on the
+request and response objects the HTTP/1.1 parser gives and the writer takes: a
+server validates a client's request, refuses with 400, 405, 426 or 431 as the RFC
+says, or builds the `101` with the accept value, the chosen subprotocol and the
+negotiated extensions; a client builds its request and checks the response.
+The connection (`<ghoti.io/http/ws_conn.h>`) then takes the bytes after the
+handshake and reports one event per message, Ping, Pong or Close, however the
+input was cut; it queues the Pong and the Close reply itself, refuses an unmasked
+client frame, a reserved bit, a bad opcode, a fragmented control frame and
+invalid UTF-8 (even split across frames and reads) with the close code the RFC
+names, and caps every unbounded quantity (a frame, a message after decompression,
+fragments, control frames per interval, the handshake, extension parameters, and
+the expansion ratio of a compressed message) with `GHTTP_WsLimits`, closing with
+1009 at the limit and not after it. `ghttp_ws_conn_send_message()` and friends
+write the frames, masking a client's with fresh keys from the kernel generator.
+[documentation/rfc6455.md](documentation/rfc6455.md) and
+[documentation/permessage-deflate.md](documentation/permessage-deflate.md) list
+what is enforced, what is not, and the seams. SHA-1 and the random source come
+from `security`, and deflate from `compress`; there is no build without them.
+
+```c
+GHTTP_WsServerOptions options;
+ghttp_ws_server_options_default(&options);
+options.enable_deflate = 1;
+GHTTP_WsServerResult result;
+ghttp_ws_server_handshake(request, &options, response, &result);   // request: parsed
+ghttp_write_response_head(out, response);                          // the 101, or a refusal
+if (result.accepted) {
+  GHTTP_WsConn * conn;
+  ghttp_ws_conn_create(NULL, GHTTP_WS_SERVER, NULL, &result.negotiated, &conn);
+  // then: feed the socket's bytes to ghttp_ws_conn_feed(), write ghttp_ws_conn_output()
+}
+```
 
 ## Example
 
@@ -137,7 +176,9 @@ symbol carries the version namespace), `check-aliasing`, and `check-defects`,
 Content-Length with Transfer-Encoding, ignoring a limit twice, a result that
 depends on where the input was split, an HTTP/2 flow-control off by one, an
 unbounded CONTINUATION run, an HPACK table-size update not enforced, a skipped
-stream-state check) and requires the tests to go red for each, and
+stream-state check, an unmasked WebSocket frame accepted, UTF-8 not carried across
+fragments, a fragmented control frame allowed, an inflate bomb limit off) and
+requires the tests to go red for each, and
 `check-oracle`, which parses a generated corpus (valid and invalid) with this
 library and with llhttp, h11 and Go's net/http in one pinned container image
 and requires every disagreement to be explained by a rule in
@@ -148,7 +189,9 @@ It needs docker or podman and the image (`make oracle-build`), and **fails**
 without them; `make check-oracle-gate` shows the gate going red for planted
 defects. `make test-valgrind`,
 `make test-asan`, `make coverage` and `make fuzz FUZZ_TIME=60` (libFuzzer, needs
-clang) are the others. It depends on `cutil` only, for the allocator.
+clang) are the others. It depends on `cutil` (the allocator), `security` (SHA-1 and
+the random source, for the WebSocket handshake and masking keys) and `compress`
+(deflate, for permessage-deflate).
 
 ## Status
 

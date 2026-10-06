@@ -51,13 +51,15 @@ extern "C" {
  * (an HTTP version other than 1.0 and 1.1). `ERR_LIMIT` is a
  * @ref GHTTP_Limits field exceeded; the library never truncates instead.
  * `ERR_INVALID` is a wrong argument, including a value the writer would have
- * to emit as something the parser refuses. `ERR_IO` and `ERR_FORMAT` are in
- * the vocabulary and never returned: nothing here does I/O, and a byte
- * stream that is not HTTP at all is `ERR_CORRUPT`.
+ * to emit as something the parser refuses. `ERR_FORMAT` is in the vocabulary
+ * and never returned: a byte stream that is not HTTP at all is `ERR_CORRUPT`.
+ * `ERR_IO` is returned only by the WebSocket codec, when the operating
+ * system's random generator fails to supply a key (ws_handshake.h,
+ * ws_conn.h); nothing here reads a file or a socket.
  */
 typedef enum {
   GHTTP_OK = 0,          ///< Operation succeeded.
-  GHTTP_ERR_IO,          ///< I/O error; never returned by this library.
+  GHTTP_ERR_IO,          ///< The OS random generator failed (WebSocket keys); no other I/O is done here.
   GHTTP_ERR_FORMAT,      ///< Not this format; never returned, see above.
   GHTTP_ERR_UNSUPPORTED, ///< Well-formed, but a feature not implemented.
   GHTTP_ERR_LIMIT,       ///< A GHTTP_Limits field was exceeded.

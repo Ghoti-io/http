@@ -7,3 +7,6 @@
 !hpack/
 !hpack-roundtrip/
 !h2conn/
+!ws-conn/
+!ws-roundtrip/
+!ws-handshake/

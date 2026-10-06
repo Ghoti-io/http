@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the tracked seeds of the HTTP/2 and HPACK fuzz corpora.
+"""Write the tracked seeds of the HTTP/2, HPACK and WebSocket fuzz corpora.
 
 Usage: fuzz-seeds.py <corpus-dir>   (tests/fuzz/corpus)
 
@@ -32,6 +32,23 @@ B_REQ2 = bytes.fromhex("828684be5886a8eb10649cbf")
 B_PLAIN = bytes.fromhex("8286844100") + b"\x0fwww.example.com"[:0] + bytes.fromhex("0f") + b"www.example.com"
 B_POST = bytes.fromhex("8387844180") if False else bytes.fromhex("828684") + b"\x41\x0fwww.example.com"
 B_POST = B_POST.replace(bytes.fromhex("82"), bytes.fromhex("83"), 1)  # :method POST
+
+
+def ws_frame(opcode, payload=b"", fin=True, masked=True, rsv=0, key=b"\x37\xfa\x21\x3d"):
+    """One WebSocket frame, by hand from RFC 6455 section 5.2."""
+    n = len(payload)
+    out = bytes([(0x80 if fin else 0) | (rsv << 4) | opcode])
+    m = 0x80 if masked else 0
+    if n < 126:
+        out += bytes([m | n])
+    elif n < 65536:
+        out += bytes([m | 126]) + struct.pack(">H", n)
+    else:
+        out += bytes([m | 127]) + struct.pack(">Q", n)
+    if masked:
+        out += key
+        payload = bytes(b ^ key[i % 4] for i, b in enumerate(payload))
+    return out + payload
 
 
 def write(d, name, data):
@@ -97,6 +114,65 @@ def main(root):
     write(rt, "fields.seed", bytes([0, 0x90, 0x20, 0x41, 3]) + b"abc" + bytes([5]) + b"hello" + bytes([0x00, 0x95, 2, 0x55]) + b"xy")
     write(rt, "resize.seed", bytes([1, 0x90, 0x41, 0x40, 0x05, 0x91, 0x20, 0xc1, 2]) + b"zzzz" + bytes([4]) + b"data" + bytes([0x00]))
     write(rt, "custom-names.seed", bytes([0, 0x80, 3]) + b"name" + bytes([6]) + b"value1" + bytes([0x82, 2]) + b"nm" + bytes([2]) + b"v2")
+
+    ws(root)
+
+
+def ws(root):
+    # ws-conn: byte 0 options (bit0 client role, bits1-3 limit profile, bit4
+    # deflate negotiated, bit5 OOM pass, bit6 echo, bit7 fix the mask bit),
+    # byte 1 the split seed, byte 2 the deflate variant, then the peer's bytes.
+    c = os.path.join(root, "ws-conn")
+    srv = 0x00
+    write(c, "text.seed", bytes([srv | 0x40, 1, 0]) + ws_frame(1, b"Hello"))
+    write(c, "rfc-hello-masked.seed", bytes([srv, 2, 0]) + bytes.fromhex("818537fa213d7f9f4d5158"))
+    write(c, "fragments-ping.seed", bytes([srv | 0x40, 3, 0]) + ws_frame(1, b"Hel", False) + ws_frame(9, b"p") + ws_frame(0, b"lo", True))
+    write(c, "binary-large.seed", bytes([srv | 0x40, 4, 0]) + ws_frame(2, bytes(range(256)) * 2))
+    write(c, "close.seed", bytes([srv, 5, 0]) + ws_frame(1, b"x") + ws_frame(8, struct.pack(">H", 1000) + b"bye"))
+    write(c, "close-bad-code.seed", bytes([srv, 6, 0]) + ws_frame(8, struct.pack(">H", 1005)))
+    write(c, "utf8-split.seed", bytes([srv, 7, 0]) + ws_frame(1, b"a\xe2\x82", False) + ws_frame(0, b"\xac", True))
+    write(c, "utf8-bad.seed", bytes([srv, 8, 0]) + ws_frame(1, b"\xed\xa0\x80"))
+    write(c, "unmasked.seed", bytes([srv, 9, 0]) + ws_frame(1, b"x", masked=False))
+    write(c, "reserved-bit.seed", bytes([srv, 10, 0]) + ws_frame(1, b"x", rsv=2))
+    write(c, "bad-opcode.seed", bytes([srv, 11, 0]) + ws_frame(3, b"x"))
+    write(c, "long-ping.seed", bytes([srv, 12, 0]) + ws_frame(9, b"x" * 126))
+    write(c, "flood.seed", bytes([srv | 0x08 | 0x80, 13, 0]) + b"".join(ws_frame(9, b"p") for _ in range(6)))
+    write(c, "fragment-flood.seed", bytes([srv | 0x06, 14, 0]) + ws_frame(2, b"a", False) + b"".join(ws_frame(0, b"a", False) for _ in range(5)))
+    write(c, "too-big.seed", bytes([srv | 0x04, 15, 0]) + ws_frame(2, b"x" * 40, False) + ws_frame(0, b"y" * 40, True))
+    write(c, "client-unmasked.seed", bytes([1 | 0x40, 16, 0]) + ws_frame(1, b"Hello", masked=False) + ws_frame(9, b"p", masked=False))
+    write(c, "client-masked.seed", bytes([1, 17, 0]) + ws_frame(1, b"Hello"))
+    # permessage-deflate: RFC 7692 section 7.2.3's "Hello", and the same with BFINAL set.
+    hello = bytes.fromhex("f248cdc9c90700")
+    again = bytes.fromhex("f200110000")
+    final = bytes.fromhex("f348cdc9c90700")
+    d = bytes([srv | 0x10 | 0x40, 18, 0])
+    write(c, "deflate-hello.seed", d + ws_frame(1, hello, rsv=4))
+    write(c, "deflate-takeover.seed", d + ws_frame(1, hello, rsv=4) + ws_frame(1, again, rsv=4))
+    write(c, "deflate-final-block.seed", d + ws_frame(1, final, rsv=4) + ws_frame(1, hello, rsv=4))
+    write(c, "deflate-fragmented.seed", d + ws_frame(1, hello[:3], False, rsv=4) + ws_frame(0, hello[3:], True))
+    write(c, "deflate-empty.seed", d + ws_frame(1, b"\x00", rsv=4) + ws_frame(2, b"\x00", rsv=4))
+    write(c, "deflate-bad.seed", d + ws_frame(2, b"\xff\xff\xff\xff", rsv=4))
+    write(c, "deflate-no-takeover.seed", bytes([srv | 0x10 | 0x40, 19, 0x05]) + ws_frame(1, hello, rsv=4) + ws_frame(1, hello, rsv=4))
+    write(c, "deflate-rsv1-control.seed", d + ws_frame(9, b"", rsv=4))
+
+    # ws-roundtrip: byte 0 the negotiation, byte 1 the cut seed, then operations.
+    r = os.path.join(root, "ws-roundtrip")
+    write(r, "plain.seed", bytes([0, 1, 0x05]) + b"hello" + bytes([0x95]) + b"\x00\x01\x02\x03\x04" + bytes([0x40]))
+    write(r, "deflate.seed", bytes([1, 2, 0x04]) + b"lorem ipsum" + bytes([0x84]) + b"dolor sit amet" + bytes([0x24]) + b"consectetur adipiscing" + bytes([0x42]))
+    write(r, "deflate-no-takeover.seed", bytes([7, 3, 0x03]) + b"abcabcabc" + bytes([0x83]) + b"abcabcabc" + bytes([0x31]) + b"p")
+    write(r, "deflate-windows.seed", bytes([0x39, 4, 0x07]) + b"x" * 91 + bytes([0x87]) + b"y" * 91 + bytes([0xc0]))
+    write(r, "fragments.seed", bytes([1, 5, 0x2f]) + bytes(range(97, 123)) * 20 + bytes([0xa5]) + b"abcde")
+
+    # ws-handshake: byte 0 the server policy, byte 1 the client's offer, then fields.
+    h = os.path.join(root, "ws-handshake")
+    req = (b"Host: server.example.com\nUpgrade: websocket\nConnection: Upgrade\n"
+           b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\nSec-WebSocket-Version: 13\n")
+    write(h, "rfc.seed", bytes([0, 0]) + req + b"Sec-WebSocket-Protocol: chat, superchat\n")
+    write(h, "deflate.seed", bytes([0x81, 0x01]) + req + b"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\n")
+    write(h, "deflate-params.seed", bytes([0x8f, 0x1d]) + req + b"Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; server_max_window_bits=10, permessage-deflate\n")
+    write(h, "response.seed", bytes([0x20, 0x01]) + b"Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\nSec-WebSocket-Protocol: chat\n")
+    write(h, "bad-version.seed", bytes([0, 0]) + req.replace(b"13", b"8"))
+    write(h, "quoted.seed", bytes([0x81, 0x00]) + req + b'Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits="9"\n')
 
 
 if __name__ == "__main__":

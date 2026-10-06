@@ -223,6 +223,102 @@ plant h2-reset-in-block-not-discarded src/http/h2conn.c testH2conn \
   '    c->hb_kind = KIND_DISCARD;  // its block is still arriving: decode it, drop it' \
   '    (void)0;  // its block is still arriving: decode it, drop it'
 
+# WebSocket (story 3c). The four the spec names, and the rest of the checks that
+# a frame codec is judged by: each is one condition removed or one constant
+# changed, and each is caught by the test written for the rule it breaks.
+plant ws-unmasked-client-frame-accepted src/http/ws_conn.c testWs_conn \
+  'WsConn.AServerRefusesAnUnmaskedClientFrameWith1002' \
+  '  if (c->role == GHTTP_WS_SERVER && !fh->masked) {' \
+  '  if (c->role == GHTTP_WS_SERVER && !fh->masked && 0) {'
+
+plant ws-utf8-not-carried-across-fragments src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case6_2_ValidUtf8SplitAtEveryOctetOfTheMessageIsDeliveredWhole' \
+  '  c->msg_frames++;
+  if (c->msg_compressed) {' \
+  '  ghttp_ws_utf8_init(&c->utf8);  // PLANTED: the validator starts afresh at every frame
+  c->msg_frames++;
+  if (c->msg_compressed) {'
+
+plant ws-utf8-not-carried-across-feeds src/http/ws_frame.c testWs_frame \
+  'WsUtf8.ACodePointMayBeCutAnywhereAndTheAnswerIsTheSame' \
+  '  v->need = need;' \
+  '  v->need = 0;  // PLANTED: a code point cut by the end of a piece is forgotten'
+
+plant ws-control-frame-fragmentation-allowed src/http/ws_frame.c testWs_conn \
+  'WsAutobahn.Case5_1And5_2_AFragmentedControlFrameClosesWith1002' \
+  '  if (ghttp_ws_opcode_is_control(opcode) && !fin) {
+    return GHTTP_ERR_CORRUPT;  // section 5.5: control frames must not be fragmented
+  }' \
+  '  if (ghttp_ws_opcode_is_control(opcode) && !fin && 0) {
+    return GHTTP_ERR_CORRUPT;
+  }'
+
+plant ws-nonminimal-length-allowed src/http/ws_frame.c testWs_frame \
+  'WsFrameHeader.ALengthNotInItsShortestEncodingIsRefused' \
+  '    if (plen < 126) {
+      return GHTTP_ERR_CORRUPT;  // section 5.2: the minimal encoding
+    }' \
+  '    if (plen < 126 && 0) {
+      return GHTTP_ERR_CORRUPT;
+    }'
+
+plant ws-reserved-bit-without-extension-allowed src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case3_1To3_7_AReservedBitOnAnyFrameClosesWith1002' \
+  '  if (bits & ~allowed) {' \
+  '  if ((bits & ~allowed) && 0) {'
+
+plant ws-close-code-1005-allowed src/http/ws_frame.c testWs_frame \
+  'WsCloseCode.TheCodesThatMayBeOnTheWireAreExactlyThoseTheRfcAndTheRegistryAllow' \
+  '  if (code >= 1007 && code <= 1014) {' \
+  '  if (code >= 1005 && code <= 1014) {'
+
+plant ws-fragment-flood-unbounded src/http/ws_conn.c testWs_conn \
+  'WsLimitsConn.AFragmentFloodIsStoppedAtTheLimitNotOneFragmentLater' \
+  '  if (frames >= c->limits.max_fragments) {' \
+  '  if (frames >= c->limits.max_fragments && 0) {'
+
+plant ws-message-limit-off-by-one src/http/ws_conn.c testWs_conn \
+  'WsLimitsConn.AMessageOfExactlyTheLimitIsAcceptedAndOneOctetMoreIsNot' \
+  '    if (fh->payload_len > cap - (have < cap ? have : cap)) {' \
+  '    if (fh->payload_len > cap + 1 - (have < cap ? have : cap)) {'
+
+plant ws-control-flood-unbounded src/http/ws_conn.c testWs_conn \
+  'WsLimitsConn.ControlFramesPerIntervalAreCountedAndTheIntervalRenews' \
+  '    if (++c->ctl_count > c->limits.max_control_per_interval) {' \
+  '    if (++c->ctl_count > c->limits.max_control_per_interval && 0) {'
+
+plant ws-mask-offset-forgotten src/http/ws_conn.c testWs_split \
+  'WsSplit.AValidStreamGivesTheSameAnswerCutAnywhereAtEitherRole' \
+  '          ghttp_ws_mask(piece, k, c->fh.mask_key, c->payload_done);' \
+  '          ghttp_ws_mask(piece, k, c->fh.mask_key, 0);  // PLANTED: each piece masked from key 0'
+
+plant ws-accept-guid-wrong include/ghoti.io/http/ws_handshake.h testWs_handshake \
+  'WsAccept.TheRfcExampleKeyGivesTheRfcExampleAccept' \
+  '#define GHTTP_WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"' \
+  '#define GHTTP_WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B12"'
+
+plant ws-inflate-unbounded src/http/ws_deflate.c testWs_deflate \
+  'WsDeflate.ABombIsStoppedAtTheMessageLimitBeforeItsOutputIsHeld' \
+  '  return by_ratio < cap ? by_ratio : cap;' \
+  '  return (by_ratio < cap ? by_ratio : cap) | UINT64_MAX;  // PLANTED: neither the message limit nor the ratio'
+
+plant ws-expansion-ratio-off src/http/ws_deflate.c testWs_deflate \
+  'WsDeflate.TheExpansionRatioStopsAMessageThatGrowsMoreThanItMayPerOctetOfInput' \
+  '    by_ratio = d->max_ratio * d->in_total + RATIO_SLACK;' \
+  '    by_ratio = UINT64_MAX;  // PLANTED: the ratio is never applied'
+
+plant ws-deflate-trailer-not-stripped src/http/ws_deflate.c testWs_deflate \
+  'WsDeflate.The_Hello_ExampleIsCompressedToTheRfcsOctetsAndTheirTrailerIsNotSent' \
+  '  ghttp_buffer_truncate(out, total - sizeof(TRAILER));' \
+  '  (void)total;  // PLANTED: the 0x00 0x00 0xff 0xff stays on the message'
+
+plant ws-context-takeover-ignored src/http/ws_conn.c testWs_deflate \
+  'WsDeflate.WithoutContextTakeoverEveryMessageIsTheSameOctets' \
+  '      server ? p->server_no_context_takeover : p->client_no_context_takeover,
+      server ? p->client_no_context_takeover : p->server_no_context_takeover,' \
+  '      false,
+      false,'
+
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require
 # that gate to fail (and to pass on the copy before it).

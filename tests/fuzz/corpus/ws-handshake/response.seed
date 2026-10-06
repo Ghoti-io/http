@@ -1,0 +1,2 @@
+ Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover
+Sec-WebSocket-Protocol: chat
