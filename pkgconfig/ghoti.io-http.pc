@@ -1,0 +1,7 @@
+Name: Ghoti.io HTTP(BRANCH)
+Description: HTTP/1.1 message codec: bytes in, bytes out, no I/O
+Version: (VERSION)
+URL: https://github.com/Ghoti-io/http
+Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)
+CFlags: -I(PC_INCLUDE_DIR)
+Requires: (REQUIRES)

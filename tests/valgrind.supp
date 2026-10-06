@@ -1,0 +1,6 @@
+# Valgrind suppressions for the Ghoti.io HTTP test suite.
+#
+# Empty on purpose. Add to this file only for allocations that are
+# demonstrably not ours, and name the frames narrowly enough that a leak of our
+# own cannot match; every entry should say what it is, why it cannot be fixed
+# here, and how it was shown to be narrow.

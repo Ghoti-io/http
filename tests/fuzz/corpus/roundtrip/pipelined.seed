@@ -1,0 +1,10 @@
+GET / HTTP/1.1
+Host: h
+
+POST / HTTP/1.1
+Host: h
+Content-Length: 2
+
+abGET /z HTTP/1.1
+Host: h
+

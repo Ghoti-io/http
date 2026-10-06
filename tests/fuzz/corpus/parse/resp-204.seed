@@ -1,0 +1,5 @@
+qHTTP/1.1 204 No Content
+Content-Length: 4
+
+HTTP/1.1 304 Not Modified
+
