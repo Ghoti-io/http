@@ -189,7 +189,8 @@ def load_known(path):
 
 def explain(rules, tag, ref, kind):
     for r in rules:
-        if (fnmatch.fnmatchcase(tag, r["tag"]) and r["ref"] in ("*", ref)
+        if (any(fnmatch.fnmatchcase(tag, alt) for alt in r["tag"].split("|"))
+                and r["ref"] in ("*", ref)
                 and fnmatch.fnmatchcase(kind, r["kind"])):
             r["hits"] += 1
             r.setdefault("examples", []).append((tag, ref, kind))

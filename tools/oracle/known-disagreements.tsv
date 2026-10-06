@@ -3,7 +3,8 @@
 #
 # Five tab-separated fields:
 #
-#   tag    which cases: fnmatch pattern against the case's tag (corpus.py). Hand
+#   tag    which cases: fnmatch pattern against the case's tag (corpus.py), or
+#          several patterns joined by |. Hand
 #          cases are named for the rule they hold; generated cases are
 #          gen:<operation>[:<value>]@<where in the message the first changed byte
 #          is>.
@@ -90,8 +91,8 @@ chunk-2-64	*	error/incomplete	ref-limit	a chunk size above 64 bits is refused at
 bare-lf-*	*	error/*	policy	a bare LF is refused wherever it occurs (section 2.2 lets a recipient accept it; it is the byte parsers disagree about)
 ctl-value	*	error/*	ref-lenient	a control byte in a field value is not in the grammar
 del-value	*	error/*	ref-lenient	DEL in a field value is not in the grammar
-empty-line-after	h11	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
-empty-line-after	gohttp	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
+empty-line-after|gen:extra-crlf@end	h11	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
+empty-line-after|gen:extra-crlf@end	gohttp	clean/*	ref-strict	an empty line after a message, which this library skips as it does before a request (section 2.2)
 only-crlf	gohttp	clean/*	ref-strict	section 2.2: an empty line alone is ignorable
 upgrade-no-connection	h11	clean/upgrade	ref-model	h11 treats an Upgrade field alone as a proposal to switch; llhttp and this library need Connection: upgrade
 chunk-trail-space	*	error/*	ref-lenient	the chunk size is followed by whitespace and no extension, which no production allows
