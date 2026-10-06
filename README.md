@@ -95,9 +95,13 @@ feeds three bytes at a time and answers with the writer.
 
 `ghttp_write_request_head()` and `ghttp_write_response_head()` append a head to
 a `GHTTP_Buffer`; `ghttp_write_chunk()` and `ghttp_write_chunked_end()` frame a
-chunked body. The writer refuses what the parser would refuse
-(`GHTTP_ERR_INVALID`): a CR or LF in any value, a Content-Length with a
-Transfer-Encoding, an HTTP/1.1 request with no Host. The objects it writes are
+chunked body. The writer checks heads with the parser's own head predicates
+(`GHTTP_ERR_INVALID`): no CR, LF, NUL or other control character in a value, a
+token method and field names, a legal target for the method, a Content-Length
+that does not conflict with a Transfer-Encoding, an HTTP/1.1 request with
+exactly one Host. It does not consult `GHTTP_Limits`, does not check that the
+body you append matches the framing headers, and does not apply the bodyless
+status rules. The objects it writes are
 the objects the parser returns, so a message can be parsed, edited and written
 again.
 

@@ -102,7 +102,10 @@ typedef enum {
 /**
  * @brief What the current message asks for beyond HTTP/1.1 messaging.
  *
- * Only reported. The parser does not perform an upgrade or a tunnel.
+ * Only reported. The parser does not perform an upgrade or a tunnel. On the
+ * request side it keeps parsing HTTP after a CONNECT or Upgrade request: the
+ * caller must stop feeding HTTP at that point if it accepts the upgrade. Only a
+ * response (101, or 2xx to CONNECT) ends the parser's reading.
  */
 typedef enum {
   GHTTP_UPGRADE_NONE,    ///< An ordinary message.
@@ -125,11 +128,20 @@ GHTTP_API GHTTP_Result ghttp_parser_create(GHTTP_ParserKind kind,
     const GHTTP_Limits * limits, const GHTTP_Allocator * allocator,
     GHTTP_Parser ** out);
 
-/** @brief Free a parser and everything it holds. NULL is ignored. */
+/**
+ * @brief Free a parser and everything it holds. NULL is ignored.
+ *
+ * A parser keeps its head buffer's capacity (bounded by the limits) from one
+ * message to the next until it is destroyed.
+ */
 GHTTP_API void ghttp_parser_destroy(GHTTP_Parser * parser);
 
 /**
  * @brief Tell a response parser which request the next response answers.
+ *
+ * The method applies to the next final response only and is forgotten when it
+ * ends (interim 1xx responses do not clear it), so a pipelined HEAD or CONNECT
+ * needs this call before each response it applies to.
  *
  * A response to HEAD has no body whatever its headers say, and a 2xx response
  * to CONNECT is the start of a tunnel. The framing of a response is decided
@@ -156,7 +168,8 @@ GHTTP_API GHTTP_Result ghttp_parser_expect_response_to(
  *
  * Any error other than GHTTP_ERR_INVALID is permanent: the stream is not
  * recoverable, every later call returns the same error, and the connection
- * should be closed. After a response that starts a tunnel or an upgrade
+ * should be closed. After an error `*consumed` and `*event` are not written.
+ * After a response that starts a tunnel or an upgrade
  * (@ref ghttp_parser_upgrade at its head: a 101, or a 2xx to CONNECT) the
  * parser reads nothing more: this returns GHTTP_EVENT_NEED_MORE having used
  * nothing, and the bytes it did not use belong to the other protocol.

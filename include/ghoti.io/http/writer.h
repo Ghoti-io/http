@@ -23,14 +23,16 @@
  *
  * The HTTP/1.1 writer: a head, chunks and a terminator as bytes.
  *
- * The writer refuses what the parser would refuse. A head whose method,
+ * The writer applies the parser's head checks. A head whose method,
  * target, status, reason or fields the parser would reject, or whose framing
  * headers the parser would call ambiguous (both Content-Length and
  * Transfer-Encoding, differing Content-Lengths, a Transfer-Encoding that does
  * not end in chunked), fails with GHTTP_ERR_INVALID and writes nothing. It
  * does not add framing headers: the caller sets Content-Length or
  * Transfer-Encoding as it sees fit, and then appends the body with
- * @ref ghttp_buffer_append or @ref ghttp_write_chunk.
+ * @ref ghttp_buffer_append or @ref ghttp_write_chunk. It does not consult
+ * GHTTP_Limits, does not check that the body matches the framing headers, and
+ * does not apply the bodyless-status rules (HEAD, 1xx, 204, 304).
  */
 
 #ifndef GHOTI_IO_GHTTP_WRITER_H

@@ -278,6 +278,58 @@ TEST(ResponseUpgrade, A2xxToConnectStartsATunnel) {
   EXPECT_EQ(out.msgs[0].upgrade, GHTTP_UPGRADE_CONNECT);
   EXPECT_EQ(out.msgs[0].framing, GHTTP_FRAMING_NONE);
   EXPECT_TRUE(out.msgs[0].ended);
+
+  // Bytes after the head belong to the tunnel and are not consumed.
+  GHTTP_Parser * p = nullptr;
+  ASSERT_EQ(ghttp_parser_create(GHTTP_PARSE_RESPONSE, nullptr, nullptr, &p),
+      GHTTP_OK);
+  ASSERT_EQ(ghttp_parser_expect_response_to(p, "CONNECT"), GHTTP_OK);
+  std::string head = crlf("HTTP/1.1 200 OK\n\n");
+  std::string all = head + "tunnel bytes";
+  size_t off = 0;
+  GHTTP_Event ev;
+  do {
+    size_t used;
+    ASSERT_EQ(ghttp_parser_feed(p, all.data() + off, all.size() - off, &used, &ev),
+        GHTTP_OK);
+    off += used;
+  } while (ev != GHTTP_EVENT_NEED_MORE);
+  EXPECT_EQ(off, head.size());
+  ghttp_parser_destroy(p);
+}
+
+TEST(ResponseUpgrade, AConnectFailureIsNotATunnelAndTheNextResponseIsOrdinary) {
+  GHTTP_Parser * p = nullptr;
+  ASSERT_EQ(ghttp_parser_create(GHTTP_PARSE_RESPONSE, nullptr, nullptr, &p),
+      GHTTP_OK);
+  ASSERT_EQ(ghttp_parser_expect_response_to(p, "CONNECT"), GHTTP_OK);
+  // No second expect_response_to: the CONNECT is forgotten after the 403.
+  std::string all = crlf("HTTP/1.1 403 Forbidden\nContent-Length: 0\n\n")
+      + crlf("HTTP/1.1 200 OK\nContent-Length: 2\n\n") + "ok";
+  size_t off = 0;
+  GHTTP_Event ev;
+  int heads = 0;
+  std::string body;
+  do {
+    size_t used;
+    ASSERT_EQ(ghttp_parser_feed(p, all.data() + off, all.size() - off, &used, &ev),
+        GHTTP_OK);
+    off += used;
+    if (ev == GHTTP_EVENT_HEAD) {
+      heads++;
+      EXPECT_EQ(ghttp_parser_upgrade(p), GHTTP_UPGRADE_NONE);
+    }
+    if (ev == GHTTP_EVENT_BODY) {
+      const void * d;
+      size_t n;
+      ghttp_parser_body(p, &d, &n);
+      body.append(static_cast<const char *>(d), n);
+    }
+  } while (ev != GHTTP_EVENT_NEED_MORE);
+  EXPECT_EQ(heads, 2);
+  EXPECT_EQ(body, "ok");
+  EXPECT_EQ(off, all.size());
+  ghttp_parser_destroy(p);
 }
 
 TEST(ResponseUpgrade, ANon2xxToConnectIsAnOrdinaryResponse) {

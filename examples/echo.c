@@ -40,15 +40,19 @@ int main(void) {
                          "5\r\nhello\r\n6;note\r\n world\r\n0\r\n\r\n";
 
   GHTTP_Parser * parser = NULL;
+  GHTTP_Response * response = NULL;
+  GHTTP_Buffer * out = NULL;
+  int status = 1;
+
   if (ghttp_parser_create(GHTTP_PARSE_REQUEST, NULL, NULL, &parser) != GHTTP_OK) {
-    return 1;
+    goto done;
   }
 
   char body[64];
   size_t body_len = 0;
-  int done = 0;
+  int finished = 0;
   size_t total = strlen(request);
-  for (size_t at = 0; at < total && !done; at += 3) {
+  for (size_t at = 0; at < total && !finished; at += 3) {
     size_t piece = total - at < 3 ? total - at : 3;
     size_t off = 0;
     GHTTP_Event ev;
@@ -58,8 +62,7 @@ int main(void) {
           ghttp_parser_feed(parser, request + at + off, piece - off, &used, &ev);
       if (r != GHTTP_OK) {
         fprintf(stderr, "parse failed: %s\n", ghttp_result_string(r));
-        ghttp_parser_destroy(parser);
-        return 1;
+        goto done;
       }
       off += used;
       if (ev == GHTTP_EVENT_HEAD) {
@@ -69,34 +72,41 @@ int main(void) {
         const void * data;
         size_t n;
         ghttp_parser_body(parser, &data, &n);
-        if (body_len + n < sizeof(body)) {
-          memcpy(body + body_len, data, n);
-          body_len += n;
+        // A body that does not fit is refused, never cut short: the
+        // Content-Length below would otherwise claim bytes that are not there.
+        if (n > sizeof(body) - body_len) {
+          fprintf(stderr, "body larger than this example's buffer\n");
+          goto done;
         }
+        memcpy(body + body_len, data, n);
+        body_len += n;
       } else if (ev == GHTTP_EVENT_END) {
-        done = 1;
+        finished = 1;
       }
     } while (ev != GHTTP_EVENT_NEED_MORE);
   }
-  ghttp_parser_destroy(parser);
 
-  GHTTP_Response * response = NULL;
-  GHTTP_Buffer * out = NULL;
   if (ghttp_response_create(NULL, &response) != GHTTP_OK
       || ghttp_buffer_create(NULL, &out) != GHTTP_OK) {
-    return 1;
+    goto done;
   }
   char length[16];
   snprintf(length, sizeof(length), "%zu", body_len);
-  ghttp_headers_add(ghttp_response_headers(response), "Content-Type", "text/plain");
-  ghttp_headers_add(ghttp_response_headers(response), "Content-Length", length);
-  if (ghttp_write_response_head(out, response) != GHTTP_OK
+  if (ghttp_headers_add(ghttp_response_headers(response), "Content-Type",
+          "text/plain") != GHTTP_OK
+      || ghttp_headers_add(ghttp_response_headers(response), "Content-Length",
+          length) != GHTTP_OK
+      || ghttp_write_response_head(out, response) != GHTTP_OK
       || ghttp_buffer_append(out, body, body_len) != GHTTP_OK) {
-    return 1;
+    goto done;
   }
   fwrite(ghttp_buffer_data(out), 1, ghttp_buffer_size(out), stdout);
   printf("\n");
+  status = 0;
+
+done:
   ghttp_buffer_destroy(out);
   ghttp_response_destroy(response);
-  return 0;
+  ghttp_parser_destroy(parser);
+  return status;
 }

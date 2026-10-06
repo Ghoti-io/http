@@ -232,6 +232,26 @@ TEST(Request, OriginFormSplitsAtTheFirstQuestionMarkWithoutDecoding) {
   ghttp_request_destroy(r);
 }
 
+TEST(Request, GettersAcceptNull) {
+  EXPECT_EQ(ghttp_request_method(nullptr), nullptr);
+  EXPECT_EQ(ghttp_request_target(nullptr), nullptr);
+  EXPECT_EQ(ghttp_request_version(nullptr), 0);
+  EXPECT_EQ(ghttp_request_headers(nullptr), nullptr);
+  EXPECT_EQ(ghttp_request_headers_const(nullptr), nullptr);
+  EXPECT_EQ(ghttp_response_status(nullptr), 0);
+  EXPECT_EQ(ghttp_response_reason(nullptr), nullptr);
+  EXPECT_EQ(ghttp_response_version(nullptr), 0);
+  EXPECT_EQ(ghttp_response_headers(nullptr), nullptr);
+  EXPECT_EQ(ghttp_response_headers_const(nullptr), nullptr);
+}
+
+TEST(Request, ATargetWithDelWillNotBeSet) {
+  GHTTP_Request * r = nullptr;
+  ASSERT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+  EXPECT_EQ(ghttp_request_set_target(r, "/a\x7f"), GHTTP_ERR_INVALID);
+  ghttp_request_destroy(r);
+}
+
 TEST(Response, StartsAs200OkAtHttp11) {
   GHTTP_Response * r = nullptr;
   ASSERT_EQ(ghttp_response_create(nullptr, &r), GHTTP_OK);

@@ -119,6 +119,22 @@ TEST(RequestParse, ChunkedBodyIsDechunkedWithExtensionsAndTrailers) {
       (std::vector<Field>{{"Trailer-A", "1"}, {"Trailer-B", "two"}}));
 }
 
+TEST(RequestParse, TrailersOfOneMessageAreNotReportedWithTheNext) {
+  const std::string chunked =
+      crlf("POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n")
+      + "1\r\na\r\n0\r\nT: v\r\n\r\n";
+  for (const std::string & next :
+      {crlf("POST / HTTP/1.1\nHost: h\nContent-Length: 1\n\nb"),
+          crlf("POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n")
+              + "1\r\nb\r\n0\r\n\r\n"}) {
+    Outcome o = run(chunked + next);
+    ASSERT_EQ(o.result, GHTTP_OK);
+    ASSERT_EQ(o.msgs.size(), 2u);
+    EXPECT_EQ(o.msgs[0].trailers, (std::vector<Field>{{"T", "v"}}));
+    EXPECT_TRUE(o.msgs[1].trailers.empty());
+  }
+}
+
 TEST(RequestParse, ChunkedBodyWithNoTrailersHasNone) {
   Outcome o = run(crlf("POST / HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n")
       + "3\r\nabc\r\n0\r\n\r\n");
@@ -265,6 +281,16 @@ TEST(RequestSmuggling, ChunkedMustBeTheFinalTransferCoding) {
   }
 }
 
+TEST(RequestSmuggling, ABadTransferEncodingElementBeforeChunkedIsCorrupt) {
+  for (const char * te : {"x y, chunked", "gzip;q=1, chunked", "g(zip, chunked"}) {
+    EXPECT_EQ(result_of(crlf(std::string("POST / HTTP/1.1\nHost: h\n"
+                                         "Transfer-Encoding: ")
+                  + te + "\n\n0\n\n")),
+        GHTTP_ERR_CORRUPT)
+        << "Transfer-Encoding: " << te;
+  }
+}
+
 TEST(RequestSmuggling, ATransferEncodingParameterIsNotAChunkedCoding) {
   EXPECT_EQ(result_of(crlf("POST / HTTP/1.1\nHost: h\n"
                            "Transfer-Encoding: chunked;q=1\n\n0\n\n")),
@@ -321,6 +347,8 @@ TEST(RequestSmuggling, NulAndControlCharactersAreCorrupt) {
   EXPECT_EQ(result_of("GET / HTTP/1.1\r\nHost: h\x7f\r\n\r\n"),
       GHTTP_ERR_CORRUPT);
   EXPECT_EQ(result_of("GET /\x01 HTTP/1.1\r\nHost: h\r\n\r\n"),
+      GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(result_of("GET /\x7f HTTP/1.1\r\nHost: h\r\n\r\n"),
       GHTTP_ERR_CORRUPT);
 }
 

@@ -142,23 +142,23 @@ GHTTP_Result ghttp_request_set_version(GHTTP_Request * r, int minor) {
 }
 
 const char * ghttp_request_method(const GHTTP_Request * r) {
-  return r->method;
+  return r ? r->method : NULL;
 }
 
 const char * ghttp_request_target(const GHTTP_Request * r) {
-  return r->target;
+  return r ? r->target : NULL;
 }
 
 int ghttp_request_version(const GHTTP_Request * r) {
-  return r->minor;
+  return r ? r->minor : 0;
 }
 
 GHTTP_Headers * ghttp_request_headers(GHTTP_Request * r) {
-  return r->headers;
+  return r ? r->headers : NULL;
 }
 
 const GHTTP_Headers * ghttp_request_headers_const(const GHTTP_Request * r) {
-  return r->headers;
+  return r ? r->headers : NULL;
 }
 
 GHTTP_Result ghttp_request_target_form(
@@ -276,21 +276,21 @@ GHTTP_Result ghttp_response_set_version(GHTTP_Response * r, int minor) {
 }
 
 int ghttp_response_status(const GHTTP_Response * r) {
-  return r->status;
+  return r ? r->status : 0;
 }
 
 const char * ghttp_response_reason(const GHTTP_Response * r) {
-  return r->reason;
+  return r ? r->reason : NULL;
 }
 
 int ghttp_response_version(const GHTTP_Response * r) {
-  return r->minor;
+  return r ? r->minor : 0;
 }
 
 GHTTP_Headers * ghttp_response_headers(GHTTP_Response * r) {
-  return r->headers;
+  return r ? r->headers : NULL;
 }
 
 const GHTTP_Headers * ghttp_response_headers_const(const GHTTP_Response * r) {
-  return r->headers;
+  return r ? r->headers : NULL;
 }

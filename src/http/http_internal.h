@@ -25,9 +25,9 @@
  *
  * What counts as a legal token, field value or target, how a header list
  * frames a body, and when a head is acceptable are each decided once here
- * and used by the parser and the writer alike. That is what makes "the
- * writer refuses what the parser would refuse" true by construction rather
- * than by two lists that agree today.
+ * and used by the parser and the writer alike, so the writer's head checks
+ * (characters, framing headers, Host, target form) cannot drift from the
+ * parser's. The writer does not apply limits or check body framing.
  */
 
 #ifndef GHOTI_IO_GHTTP_SRC_HTTP_HTTP_INTERNAL_H

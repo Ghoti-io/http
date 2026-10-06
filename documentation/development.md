@@ -18,8 +18,9 @@ What counts as a token, a legal field value or target, how a header list frames
 a body, and whether a head is acceptable are decided once, in
 `src/http/util.c`, and used by the parser and the writer alike
 (`ghttp_request_validate`, `ghttp_response_validate`,
-`ghttp_framing_from_headers`). The writer refuses what the parser would refuse
-because it asks the same functions, not because two lists agree today.
+`ghttp_framing_from_headers`). The writer applies the parser's head checks by asking the same functions, not
+because two lists agree today. It does not consult `GHTTP_Limits` or check that a
+body matches its framing headers.
 
 ## The parser does not look at how input is split
 
