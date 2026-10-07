@@ -552,16 +552,29 @@ TEST(WsExtensionNegotiation, AnExtensionOfferedTwiceIsChosenOnce) {
 }
 
 TEST(WsServerHandshake, TheOriginIsHandedOverParsedForTheCallersPolicy) {
-  Served with_origin(rfc_fields());
-  ASSERT_TRUE(with_origin.result.accepted);
-  EXPECT_TRUE(with_origin.result.has_origin);
-  EXPECT_EQ(std::string(with_origin.result.origin, with_origin.result.origin_len), "http://example.com");
-  Served padded(with(rfc_fields(), "Origin", "  http://a.example  "));
-  EXPECT_EQ(std::string(padded.result.origin, padded.result.origin_len), "http://a.example");
-  Served none(without(rfc_fields(), "Origin"));
-  ASSERT_TRUE(none.result.accepted);
-  EXPECT_FALSE(none.result.has_origin);
-  EXPECT_EQ(none.result.origin_len, 0u);
+  // The origin points into the request, which must outlive the use.
+  auto origin_of = [](const Fields & f, bool * has) {
+    Request req(f);
+    GHTTP_Response * resp = nullptr;
+    EXPECT_EQ(ghttp_response_create(nullptr, &resp), GHTTP_OK);
+    GHTTP_WsServerResult r;
+    EXPECT_EQ(ghttp_ws_server_handshake(req.r, nullptr, resp, &r), GHTTP_OK);
+    EXPECT_TRUE(r.accepted);
+    *has = r.has_origin;
+    std::string o = r.has_origin ? std::string(r.origin, r.origin_len) : std::string();
+    if (!r.has_origin) {
+      EXPECT_EQ(r.origin_len, 0u);
+    }
+    ghttp_response_destroy(resp);
+    return o;
+  };
+  bool has = false;
+  EXPECT_EQ(origin_of(rfc_fields(), &has), "http://example.com");
+  EXPECT_TRUE(has);
+  EXPECT_EQ(origin_of(with(rfc_fields(), "Origin", "  http://a.example  "), &has), "http://a.example");
+  EXPECT_TRUE(has);
+  EXPECT_EQ(origin_of(without(rfc_fields(), "Origin"), &has), "");
+  EXPECT_FALSE(has);
 }
 
 TEST(WsServerHandshake, OptionsThatCannotWorkAreInvalid) {
