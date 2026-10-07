@@ -82,9 +82,13 @@
  * Close this endpoint starts with ghttp_ws_conn_close() waits for the peer's.
  * When both have gone the state is GHTTP_WS_STATE_CLOSED and the server closes
  * the transport (section 7.1.1). The peer's Close is the end of what it may say:
- * whatever follows it, in the same read or a later one, is **left unread**
- * (`consumed` stays 0, no event, no error), so a closure that completed stays
- * clean; a caller that wants to know sees that it was not all consumed.
+ * any octet that follows it, in the same read as the Close or in a later one,
+ * fails the connection with 1002 ("data after a Close frame"), even when the
+ * handshake has completed: a feed returns the Close event and consumes only
+ * the Close, and the next feed that offers more is the one that fails. So a
+ * closure that has trailing bytes is reported as a failure, and
+ * ghttp_ws_conn_finish() then says GHTTP_ERR_CORRUPT; a closure with nothing
+ * after the Close is clean (GHTTP_WS_STATE_CLOSED, finish GHTTP_OK).
  *
  * ### Pongs
  *

@@ -433,12 +433,14 @@ plant ws-window-bits-swapped src/http/ws_conn.c testWs_deflate \
   '      server ? p->server_max_window_bits : p->client_max_window_bits,' \
   '      server ? p->client_max_window_bits : p->server_max_window_bits,'
 
-plant ws-close-after-close-not-left-unread src/http/ws_conn.c testWs_conn \
-  'WsAutobahn.Case7_1_2To7_1_5_AnythingAfterTheCloseIsLeftUnreadAndTheClosureStaysClean' \
-  '  if (c->close_received) {
-    // The peer' \
-  '  if (c->close_received && 0) {
-    // The peer'
+plant ws-bytes-after-close-not-refused src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case7_1_2To7_1_5_AnythingAfterTheCloseFailsTheConnectionWith1002' \
+  '    if (len > 0) {
+      return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_PROTOCOL_ERROR,
+          "data after a Close frame");' \
+  '    if (len > 0 && 0) {
+      return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_PROTOCOL_ERROR,
+          "data after a Close frame");'
 
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require

@@ -766,10 +766,16 @@ GHTTP_Result ghttp_ws_conn_feed(GHTTP_WsConn * c, const void * data, size_t len,
     c->lent = false;
   }
   if (c->close_received) {
-    // The peer's Close ended what it may say. Anything after it, in the same
-    // read or a later one, is left unread (consumed stays 0) and is not an
-    // error: the closure that completed stays clean, and a caller that cares
-    // sees that it was not all consumed.
+    // The peer's Close ended what it may say: a frame, or any other octet, after
+    // it - in the same read as the Close or in a later one - is a protocol error
+    // (the matrix's "bad code or frame after close closes 1002"). The handshake
+    // may already be complete, and then the connection reports the failure all
+    // the same; the Close it owes was sent with the echo, so nothing more is
+    // queued.
+    if (len > 0) {
+      return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_PROTOCOL_ERROR,
+          "data after a Close frame");
+    }
     return GHTTP_OK;
   }
   const uint8_t * in = data;

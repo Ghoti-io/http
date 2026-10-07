@@ -622,41 +622,63 @@ TEST(WsAutobahn, Case7_1_1_ACloseFromThePeerIsReportedAndEchoedAndTheHandshakeIs
   EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
 }
 
-TEST(WsAutobahn, Case7_1_2To7_1_5_AnythingAfterTheCloseIsLeftUnreadAndTheClosureStaysClean) {
-  // The peer's Close ended what it may say. What follows it is not consumed and
-  // is not an error: the closure is complete, nothing more is sent, and a
-  // caller can see that it was not all used. (The spec's matrix asks for 1002
-  // here; the codec would have to fail a connection that has already closed
-  // cleanly, and has no Close left to say it with.)
-  for (std::string after : {close_frame(1000), text("x"), ping("p"), fragment(1, "x", false), pong("")}) {
+TEST(WsAutobahn, Case7_1_2To7_1_5_AnythingAfterTheCloseFailsTheConnectionWith1002) {
+  // The peer's Close ended what it may say; the matrix's "bad code or frame after
+  // close closes 1002". The Close itself was echoed, so the failure queues
+  // nothing, and the connection is no longer a clean closure.
+  for (std::string after : {close_frame(1000), text("x"), ping("p"), fragment(1, "x", false), pong(""),
+           std::string("\x81"), std::string("x")}) {
     WsSide s(GHTTP_WS_SERVER);
     WsRun first = s.feed(close_frame(1000));
     EXPECT_EQ(first.events, (Events{ev_close(1000)}));
     EXPECT_EQ(ws_parse_frames(first.output).size(), 1u);
+    EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
     size_t used = 99;
     GHTTP_WsEvent e;
-    EXPECT_EQ(ghttp_ws_conn_feed(s.get(), after.data(), after.size(), &used, &e), GHTTP_OK);
-    EXPECT_EQ(used, 0u);
-    EXPECT_EQ(e.type, GHTTP_WS_EVENT_NEED_MORE);
+    EXPECT_EQ(ghttp_ws_conn_feed(s.get(), after.data(), after.size(), &used, &e), GHTTP_ERR_CORRUPT);
+    uint16_t code = 0;
+    const char * reason = nullptr;
+    EXPECT_EQ(ghttp_ws_conn_error(s.get(), &code, &reason), GHTTP_ERR_CORRUPT);
+    EXPECT_EQ(code, 1002);
+    EXPECT_NE(std::string(reason).find("after a Close"), std::string::npos);
     EXPECT_EQ(ghttp_ws_conn_output_size(s.get()), 0u);
-    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_CLOSED);
-    EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
+    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_FAILED);
+    EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_ERR_CORRUPT);
   }
 }
 
-TEST(WsAutobahn, Case7_1_2_TwoCloseFramesInOneFeedGiveTheFirstAndLeaveTheSecondUnread) {
-  WsSide s(GHTTP_WS_SERVER);
-  std::string in = close_frame(1000) + close_frame(1000);
-  size_t used;
-  GHTTP_WsEvent e;
-  ASSERT_EQ(ghttp_ws_conn_feed(s.get(), in.data(), in.size(), &used, &e), GHTTP_OK);
-  EXPECT_EQ(e.type, GHTTP_WS_EVENT_CLOSE);
-  EXPECT_EQ(used, in.size() / 2);
-  size_t used2;
-  EXPECT_EQ(ghttp_ws_conn_feed(s.get(), in.data() + used, in.size() - used, &used2, &e), GHTTP_OK);
-  EXPECT_EQ(used2, 0u);
-  EXPECT_EQ(ws_parse_frames(s.take_output()).size(), 1u);
+TEST(WsAutobahn, Case7_1_2_TrailingBytesInTheSameReadAsTheCloseGiveTheCloseThenFail1002) {
+  // One read holds the Close and more. The Close is reported (and consumed alone);
+  // the next feed, which offers the rest, fails.
+  for (std::string rest : {close_frame(1000), text("x"), std::string("\x88")}) {
+    WsSide s(GHTTP_WS_SERVER);
+    std::string in = close_frame(1000) + rest;
+    size_t used;
+    GHTTP_WsEvent e;
+    ASSERT_EQ(ghttp_ws_conn_feed(s.get(), in.data(), in.size(), &used, &e), GHTTP_OK);
+    EXPECT_EQ(e.type, GHTTP_WS_EVENT_CLOSE);
+    EXPECT_EQ(used, close_frame(1000).size());
+    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_CLOSED);
+    size_t used2;
+    EXPECT_EQ(ghttp_ws_conn_feed(s.get(), in.data() + used, in.size() - used, &used2, &e), GHTTP_ERR_CORRUPT);
+    uint16_t code = 0;
+    ghttp_ws_conn_error(s.get(), &code, nullptr);
+    EXPECT_EQ(code, 1002);
+    EXPECT_EQ(ws_parse_frames(s.take_output()).size(), 1u);  // only the echo
+    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_FAILED);
+  }
+}
+
+TEST(WsAutobahn, Case7_1_1_ACloseWithNothingAfterItIsACleanFinish) {
+  // And when this end closed first, the peer's Close completes it; nothing follows.
+  WsSide s(GHTTP_WS_CLIENT);
+  ASSERT_EQ(ghttp_ws_conn_close(s.get(), 1000, "bye", 3), GHTTP_OK);
+  EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_ERR_CORRUPT);  // the peer has not answered
+  std::string reply = wsf(8, std::string("\x03\xe8", 2), true, false);
+  WsRun r = s.feed(reply);
+  EXPECT_EQ(r.events, (Events{ev_close(1000)}));
   EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_CLOSED);
+  EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
 }
 
 TEST(WsAutobahn, Case7_3_1_ACloseWithNoBodyIsReportedAs1005AndAnsweredWithNoBody) {

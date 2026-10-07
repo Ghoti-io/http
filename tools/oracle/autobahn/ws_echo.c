@@ -254,6 +254,13 @@ static int feed_all(Loop * lp, const uint8_t * data, size_t len) {
     if (on_event(lp, &ev) != 0) {
       return -1;
     }
+    /* The documented loop takes the output after every event: Autobahn 2.10
+     * sends ten Pings in one read and wants ten Pongs, and the codec answers
+     * only the latest of Pings whose Pong has not yet been taken. */
+    if (flush_output(lp) != 0) {
+      lp->why = "write failed";
+      return -1;
+    }
     if (ghttp_ws_conn_state(lp->conn) == GHTTP_WS_STATE_CLOSED) {
       /* Anything after both Closes is not read: the transport ends here. */
       return 1;
