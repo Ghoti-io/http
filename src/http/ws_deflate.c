@@ -259,6 +259,8 @@ GHTTP_Result ghttp_ws_deflate_format(const GHTTP_WsDeflateParams * p,
 static const uint8_t TRAILER[4] = {0x00, 0x00, 0xff, 0xff};
 /** Output that no ratio refuses, so that a few octets of input may still make a short message. */
 #define RATIO_SLACK 256u
+/** The zero octets a message may carry after its final block. */
+#define FINAL_EXTRA_MAX 4u
 
 struct GHTTP_WsDeflate {
   const GHTTP_Allocator * allocator;
@@ -273,12 +275,14 @@ struct GHTTP_WsDeflate {
   uint64_t in_total;
   uint64_t out_total;
   bool stream_done;  // the decompressor saw a final block
+  size_t final_extra;  // zero octets accepted after that block, this message
+  bool limit_is_ratio;  // which limit the last GHTTP_ERR_LIMIT was
 };
 
 GHTTP_Result ghttp_ws_deflate_open(const GHTTP_Allocator * allocator,
     unsigned enc_window_bits, bool enc_reset, bool dec_reset,
     uint64_t max_message, uint64_t max_ratio, GHTTP_WsDeflate ** out) {
-  if (!out) {
+  if (!out || (enc_window_bits != 0 && (enc_window_bits < 8 || enc_window_bits > 15))) {
     return GHTTP_ERR_INVALID;
   }
   if (!allocator) {
@@ -420,6 +424,9 @@ GHTTP_Result ghttp_ws_deflate_compress(GHTTP_WsDeflate * d, const void * in,
     if (s == GCOMP_OK) {
       break;
     }
+    if (dst.used == 0) {
+      return GHTTP_ERR_INTERNAL;  // "more room, please" with nothing given: it would never end
+    }
   }
   size_t total = ghttp_buffer_size(out);
   // The flush ends in an empty stored block, and RFC 7692 has it sent without
@@ -442,18 +449,34 @@ void ghttp_ws_inflate_begin(GHTTP_WsDeflate * d) {
   d->in_total = 0;
   d->out_total = 0;
   d->stream_done = false;
+  d->final_extra = 0;
+}
+
+bool ghttp_ws_inflate_limit_is_ratio(const GHTTP_WsDeflate * d) {
+  return d->limit_is_ratio;
 }
 
 /** The most output the message may have had by now, whatever has been fed. */
 static uint64_t output_allowance(const GHTTP_WsDeflate * d) {
   uint64_t cap = d->max_message;
   uint64_t by_ratio;
-  if (d->max_ratio != 0 && d->in_total > (UINT64_MAX - RATIO_SLACK) / d->max_ratio) {
+  // A ratio of 0 is "no ratio limit": the message limit alone bounds the output.
+  if (d->max_ratio == 0
+      || d->in_total > (UINT64_MAX - RATIO_SLACK) / d->max_ratio) {
     by_ratio = UINT64_MAX;
   } else {
     by_ratio = d->max_ratio * d->in_total + RATIO_SLACK;
   }
   return by_ratio < cap ? by_ratio : cap;
+}
+
+/** Whether the ratio and not the message limit is what bounds the output now. */
+static bool ratio_binds(const GHTTP_WsDeflate * d) {
+  uint64_t cap = d->max_message;
+  uint64_t by_ratio = d->max_ratio == 0
+          || d->in_total > (UINT64_MAX - RATIO_SLACK) / d->max_ratio
+      ? UINT64_MAX : d->max_ratio * d->in_total + RATIO_SLACK;
+  return by_ratio < cap;
 }
 
 static GHTTP_Result inflate_piece(GHTTP_WsDeflate * d, const uint8_t * in,
@@ -470,6 +493,7 @@ static GHTTP_Result inflate_piece(GHTTP_WsDeflate * d, const uint8_t * in,
   for (;;) {
     uint64_t allow = output_allowance(d);
     if (d->out_total > allow) {
+      d->limit_is_ratio = ratio_binds(d);
       return GHTTP_ERR_LIMIT;
     }
     // One octet more than may be kept, so that exceeding the limit is seen
@@ -483,6 +507,7 @@ static GHTTP_Result inflate_piece(GHTTP_WsDeflate * d, const uint8_t * in,
       return from_gcomp(s);
     }
     if (dst.used > room) {
+      d->limit_is_ratio = ratio_binds(d);
       return GHTTP_ERR_LIMIT;
     }
     GHTTP_Result r = ghttp_buffer_append(out, piece, dst.used);
@@ -498,11 +523,11 @@ static GHTTP_Result inflate_piece(GHTTP_WsDeflate * d, const uint8_t * in,
     // The decompressor stopped taking input with some left and nothing to
     // give: the stream ended in a final block, and this is what follows it.
     d->stream_done = true;
-    // Zero octets are accepted: RFC 7692 section 7.2.3.4's own example has the
-    // octet of the empty stored block that the appended trailer completes,
-    // after a block whose BFINAL was set.
+    // Zero octets are accepted, a few: RFC 7692 section 7.2.3.4's own example
+    // has the one octet of the empty stored block that the appended trailer
+    // completes, after a block whose BFINAL was set.
     for (size_t i = src.used; i < src.size; i++) {
-      if (in[i] != 0) {
+      if (in[i] != 0 || ++d->final_extra > FINAL_EXTRA_MAX) {
         return GHTTP_ERR_CORRUPT;
       }
     }
@@ -528,6 +553,24 @@ GHTTP_Result ghttp_ws_inflate_end(GHTTP_WsDeflate * d, GHTTP_Buffer * out) {
   d->stream_done = false;
   if (r != GHTTP_OK) {
     return r;
+  }
+  if (!final_block) {
+    // The trailer made an empty stored block only if the data before it ended
+    // at a block boundary. Data cut off inside a block would read the trailer
+    // as more of itself and be delivered as a message. A second empty stored
+    // block is a no-op at a boundary (no output, all of it consumed) and is
+    // not, inside a block, so it tells the two apart.
+    static const uint8_t probe[5] = {0x00, 0x00, 0x00, 0xff, 0xff};
+    uint8_t room[1];
+    gcomp_buffer_t src = {probe, sizeof(probe), 0};
+    gcomp_buffer_t dst = {room, sizeof(room), 0};
+    gcomp_status_t s = gcomp_decoder_update(d->dec, &src, &dst);
+    if (s != GCOMP_OK) {
+      return from_gcomp(s) == GHTTP_ERR_OOM ? GHTTP_ERR_OOM : GHTTP_ERR_CORRUPT;
+    }
+    if (dst.used != 0 || src.used != src.size) {
+      return GHTTP_ERR_CORRUPT;
+    }
   }
   if (final_block || d->dec_reset) {
     return from_gcomp(gcomp_decoder_reset(d->dec));

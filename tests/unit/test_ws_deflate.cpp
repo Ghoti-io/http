@@ -174,6 +174,42 @@ TEST(WsDeflate, ADataFrameAfterAFinalBlockInTheSameMessageIsAnError) {
   EXPECT_EQ(r.code, 1007);
 }
 
+TEST(WsDeflate, DataCutOffInsideABlockIsNotDeliveredAsAMessage) {
+  // The appended trailer completes an empty stored block only where the data
+  // ended at a block boundary. Cut inside a block it would be read as more of
+  // the block, and the cut-off message was delivered.
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated(true, true);
+  std::string msg = ws_lorem(3000, 3);
+  WsFrame f = first_frame(sent(GHTTP_WS_CLIENT, neg, GHTTP_WS_MESSAGE_TEXT, msg));
+  int delivered = 0;
+  for (size_t cut : {size_t(1), size_t(2), size_t(5), f.payload.size() / 3, f.payload.size() / 2,
+           f.payload.size() - 3, f.payload.size() - 1}) {
+    WsSide s(GHTTP_WS_SERVER, nullptr, &neg);
+    WsRun r = s.feed(wsf(1, f.payload.substr(0, cut), true, true, 4));
+    if (!r.events.empty()) delivered++;
+    EXPECT_EQ(r.code, 1007) << cut;
+  }
+  EXPECT_EQ(delivered, 0);
+  // The whole payload is still read.
+  WsSide ok(GHTTP_WS_SERVER, nullptr, &neg);
+  EXPECT_EQ(ok.feed(wsf(1, f.payload, true, true, 4)).events.size(), 1u);
+}
+
+TEST(WsDeflate, OnlyAFewZeroOctetsMayFollowAFinalBlock) {
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated();
+  std::string final_block = bytes({0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00});
+  for (size_t zeros : {size_t(0), size_t(1), size_t(4)}) {
+    WsSide s(GHTTP_WS_SERVER, nullptr, &neg);
+    EXPECT_EQ(s.feed(wsf(1, final_block + std::string(zeros, '\0'), true, true, 4)).events.size(), 1u) << zeros;
+  }
+  WsSide t(GHTTP_WS_SERVER, nullptr, &neg);
+  EXPECT_EQ(t.feed(wsf(1, final_block + std::string(5, '\0'), true, true, 4)).code, 1007);
+  // And not by spreading them over frames either.
+  WsSide u(GHTTP_WS_SERVER, nullptr, &neg);
+  WsRun r = u.feed(wsf(1, final_block + std::string(3, '\0'), false, true, 4) + wsf(0, std::string(3, '\0'), true, true, 0));
+  EXPECT_EQ(r.code, 1007);
+}
+
 TEST(WsDeflate, AnEmptyMessageIsOneZeroOctetOnTheWireAndComesBackEmpty) {
   // Section 7.2.3.6: an empty message compresses to a single 0x00.
   GHTTP_WsNegotiated neg = ws_deflate_negotiated();
@@ -272,15 +308,33 @@ TEST(WsDeflate, ARepetitiveMessageIsSmallerOnTheWireAndTakeoverMakesTheSecondSma
 
 TEST(WsDeflate, ASmallWindowLimitsWhatTheCompressorCanReachBackTo) {
   // A message whose second half repeats its first, 3000 octets back: a 2^8
-  // window cannot use that and a 2^15 one can.
+  // window cannot use that and a 2^15 one can. Window bits 8 is a real
+  // 256-octet window in the compress library (measured: a repeat 300 octets
+  // back is not found at 8 bits, is at 9), so it is negotiated as asked.
   std::string a = ws_random_bytes(3000, 11);
   std::string msg = a + a;
+  auto size_with = [&](GHTTP_WsRole role, int server_bits, int client_bits) {
+    GHTTP_WsNegotiated neg = ws_deflate_negotiated(false, false, server_bits, client_bits);
+    return sent(role, neg, GHTTP_WS_MESSAGE_BINARY, msg).size();
+  };
+  EXPECT_GT(size_with(GHTTP_WS_SERVER, 8, 0), 5500u);
+  EXPECT_LT(size_with(GHTTP_WS_SERVER, 15, 0), 3300u);
+  // The client's compressor is the one client_max_window_bits limits...
+  EXPECT_GT(size_with(GHTTP_WS_CLIENT, 0, 8), 5500u);
+  EXPECT_LT(size_with(GHTTP_WS_CLIENT, 0, 15), 3300u);
+  // ...and each end ignores the other's window: swapped, nothing is limited.
+  EXPECT_LT(size_with(GHTTP_WS_SERVER, 0, 8), 3300u);
+  EXPECT_LT(size_with(GHTTP_WS_CLIENT, 8, 0), 3300u);
+}
+
+TEST(WsDeflate, ARepeatJustBeyondTheWindowIsFoundOnlyWithTheBiggerOne) {
+  std::string x = ws_random_bytes(400, 5);
+  std::string msg = x + x.substr(0, 100);  // 100 octets repeated 400 back
   auto size_with = [&](int bits) {
     GHTTP_WsNegotiated neg = ws_deflate_negotiated(false, false, bits, 0);
     return sent(GHTTP_WS_SERVER, neg, GHTTP_WS_MESSAGE_BINARY, msg).size();
   };
-  EXPECT_GT(size_with(8), 5500u);
-  EXPECT_LT(size_with(15), 3300u);
+  EXPECT_GT(size_with(8), size_with(9) + 50);  // 8 bits is 256 octets, not zlib's silent 512
 }
 
 TEST(WsDeflate, AMessageThatIsNotWorthCompressingIsSentPlainAndTheContextIsUndisturbed) {
@@ -338,22 +392,6 @@ TEST(WsDeflate, ControlFramesAreNeverCompressedAndMayInterleave) {
   EXPECT_EQ(frames[1].opcode, 9);
   EXPECT_EQ(frames[1].rsv, 0);
   EXPECT_EQ(frames[1].payload, "ping");
-}
-
-TEST(WsDeflate, AnIncompressibleMessageOfTheLimitIsStillAccepted) {
-  // The compressed form of random data is a little larger than the data: the
-  // frame limit and the message limit must not refuse a message for that.
-  GHTTP_WsLimits l = limits();
-  l.max_message_bytes = 100000;
-  l.max_frame_payload = 200000;
-  GHTTP_WsNegotiated neg = ws_deflate_negotiated();
-  WsPair p(&neg, &l);
-  std::string msg = ws_random_bytes(100000);
-  ASSERT_EQ(ghttp_ws_conn_send_message(p.client.get(), GHTTP_WS_MESSAGE_BINARY, msg.data(), msg.size()), GHTTP_OK);
-  p.pump();
-  ASSERT_EQ(p.server_events.size(), 1u);
-  EXPECT_EQ(p.server_events[0].data, msg);
-  EXPECT_EQ(p.server_result, GHTTP_OK);
 }
 
 // ---- Where RSV1 may and may not be ---------------------------------------------------------------------------------
@@ -437,7 +475,8 @@ TEST(WsDeflate, ABombIsStoppedAtTheMessageLimitBeforeItsOutputIsHeld) {
   ASSERT_LT(f.payload.size(), 8192u);
   GHTTP_WsLimits l = limits();
   l.max_message_bytes = 100000;
-  l.max_expansion_ratio = 0;  // so the size limit is the one under test
+  l.max_frame_payload = 100000;
+  l.max_expansion_ratio = 0;  // no ratio limit: the size limit is the one under test
   WsSide s(GHTTP_WS_SERVER, &l, &neg);
   WsRun r = s.feed(wsf(2, f.payload, true, true, 4));
   EXPECT_EQ(r.result, GHTTP_ERR_LIMIT);
@@ -446,6 +485,11 @@ TEST(WsDeflate, ABombIsStoppedAtTheMessageLimitBeforeItsOutputIsHeld) {
   auto frames = ws_parse_frames(r.output);
   ASSERT_EQ(frames.size(), 1u);
   EXPECT_EQ(ws_close_code(frames[0]), 1009);
+  // Which limit fired, not just that one did: the size limit, with the ratio
+  // switched off (0 is "no ratio limit"), and not the ratio.
+  const char * why = nullptr;
+  ghttp_ws_conn_error(s.get(), nullptr, &why);
+  EXPECT_STREQ(why, "a message inflates past the message size limit");
 }
 
 TEST(WsDeflate, TheInflateNeverHoldsMoreThanTheLimitAndOneOctet) {
@@ -480,9 +524,13 @@ TEST(WsDeflate, AMessageOfExactlyTheLimitInflatesAndOneOctetMoreDoesNot) {
     GHTTP_WsLimits l = limits();
     l.max_expansion_ratio = 100000;
     l.max_message_bytes = n;
+    l.max_frame_payload = n;
+    l.max_frame_payload = std::min(l.max_frame_payload, l.max_message_bytes);
     WsSide ok(GHTTP_WS_SERVER, &l, &neg);
     EXPECT_EQ(ok.feed(wsf(2, f.payload, true, true, 4)).events.size(), 1u) << n;
     l.max_message_bytes = n - 1;
+    l.max_frame_payload = n - 1;
+    l.max_frame_payload = std::min(l.max_frame_payload, l.max_message_bytes);
     WsSide over(GHTTP_WS_SERVER, &l, &neg);
     WsRun r = over.feed(wsf(2, f.payload, true, true, 4));
     EXPECT_EQ(r.result, GHTTP_ERR_LIMIT) << n;
@@ -501,6 +549,9 @@ TEST(WsDeflate, TheExpansionRatioStopsAMessageThatGrowsMoreThanItMayPerOctetOfIn
   WsRun r = strict.feed(wsf(2, f.payload, true, true, 4));
   EXPECT_EQ(r.result, GHTTP_ERR_LIMIT);
   EXPECT_EQ(r.code, 1009);
+  const char * why = nullptr;
+  ghttp_ws_conn_error(strict.get(), nullptr, &why);
+  EXPECT_STREQ(why, "a message inflates past the expansion ratio limit");  // and not the size limit
   l.max_expansion_ratio = 1032;
   WsSide fine(GHTTP_WS_SERVER, &l, &neg);
   EXPECT_EQ(fine.feed(wsf(2, f.payload, true, true, 4)).events.size(), 1u);
@@ -510,6 +561,26 @@ TEST(WsDeflate, TheExpansionRatioStopsAMessageThatGrowsMoreThanItMayPerOctetOfIn
   l.max_expansion_ratio = 20;
   WsSide ordinary(GHTTP_WS_SERVER, &l, &neg);
   EXPECT_EQ(ordinary.feed(wsf(1, g.payload, true, true, 4)).events.size(), 1u);
+}
+
+TEST(WsDeflate, ARatioOfZeroIsNoRatioLimitAndTheMessageLimitStillApplies) {
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated(true, true);
+  std::string zeros(100000, '\0');
+  WsFrame f = first_frame(sent(GHTTP_WS_CLIENT, neg, GHTTP_WS_MESSAGE_BINARY, zeros));
+  GHTTP_WsLimits l = limits();
+  l.max_expansion_ratio = 0;
+  WsSide s(GHTTP_WS_SERVER, &l, &neg);
+  WsRun r = s.feed(wsf(2, f.payload, true, true, 4));
+  ASSERT_EQ(r.events.size(), 1u);
+  EXPECT_EQ(r.events[0].data.size(), 100000u);
+  l.max_message_bytes = 50000;
+  l.max_frame_payload = 50000;
+  WsSide t(GHTTP_WS_SERVER, &l, &neg);
+  WsRun q = t.feed(wsf(2, f.payload, true, true, 4));
+  EXPECT_EQ(q.code, 1009);
+  const char * why = nullptr;
+  ghttp_ws_conn_error(t.get(), nullptr, &why);
+  EXPECT_STREQ(why, "a message inflates past the message size limit");
 }
 
 TEST(WsDeflate, TheRatioIsHeldOnAMessageTheSameWayWhateverTheFeedBoundaries) {
@@ -530,6 +601,7 @@ TEST(WsDeflate, TheRatioIsHeldOnAMessageTheSameWayWhateverTheFeedBoundaries) {
 TEST(WsDeflate, ACompressedMessageLargerThanTheLimitPlusItsOverheadIsRefusedAtItsHeader) {
   GHTTP_WsLimits l = limits();
   l.max_message_bytes = 1000;
+  l.max_frame_payload = 1000;
   GHTTP_WsNegotiated neg = ws_deflate_negotiated();
   // 1000 + 1000/64 + 16 = 1031 octets may arrive; 1032 may not.
   WsSide ok(GHTTP_WS_SERVER, &l, &neg);
@@ -663,6 +735,40 @@ TEST(WsDeflate, SendingUnderAllocationFailureIsOomAndLeaksNothing) {
     }
   }
   EXPECT_GT(oom, 0u);
+}
+
+TEST(WsDeflate, ACompressedSendThatWouldOverfillTheQueueIsRefusedBeforeTheCompressorIsTouched) {
+  // The compressor cannot give back what it has taken, so the queue's limit is
+  // judged first, on a bound: a refused send leaves the connection open and
+  // its history as it was (the next send still decodes at the other end).
+  GHTTP_WsLimits l = limits();
+  l.max_buffered_bytes = 1000;
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated();
+  WsPair p(&neg, &l);
+  std::string big = ws_lorem(2000);
+  EXPECT_EQ(ghttp_ws_conn_send_message(p.server.get(), GHTTP_WS_MESSAGE_TEXT, big.data(), big.size()), GHTTP_ERR_LIMIT);
+  EXPECT_EQ(ghttp_ws_conn_state(p.server.get()), GHTTP_WS_STATE_OPEN);
+  EXPECT_EQ(ghttp_ws_conn_output_size(p.server.get()), 0u);
+  std::string ok = ws_lorem(300);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.server.get(), GHTTP_WS_MESSAGE_TEXT, ok.data(), ok.size()), GHTTP_OK);
+  p.pump();
+  ASSERT_EQ(p.client_events.size(), 1u);
+  EXPECT_EQ(p.client_events[0].data, ok);
+}
+
+TEST(WsDeflate, AWindowOutsideEightToFifteenIsInvalidWhereverItIsGiven) {
+  GHTTP_WsDeflate * d = nullptr;
+  EXPECT_EQ(ghttp_ws_deflate_open(nullptr, 7, false, false, 100, 100, &d), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_deflate_open(nullptr, 16, false, false, 100, 100, &d), GHTTP_ERR_INVALID);
+  ASSERT_EQ(ghttp_ws_deflate_open(nullptr, 8, false, false, 100, 100, &d), GHTTP_OK);
+  ghttp_ws_deflate_close(d);
+  for (int bad : {7, 16, 255}) {
+    GHTTP_WsNegotiated n = ws_deflate_negotiated(false, false, bad, 0);
+    GHTTP_WsConn * c = nullptr;
+    EXPECT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, nullptr, &n, &c), GHTTP_ERR_INVALID) << bad;
+    GHTTP_WsNegotiated m = ws_deflate_negotiated(false, false, 0, bad);
+    EXPECT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_CLIENT, nullptr, &m, &c), GHTTP_ERR_INVALID) << bad;
+  }
 }
 
 int main(int argc, char ** argv) {

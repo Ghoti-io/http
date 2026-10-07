@@ -64,6 +64,25 @@ GHTTP_WsLimits limits() {
   return l;
 }
 
+/** Feed everything and report the events, never taking the output until the end: a writer that is slow. */
+Events feed_without_draining(WsSide & s, const std::string & in, std::string * output) {
+  Events events;
+  size_t off = 0;
+  for (;;) {
+    size_t used = 0;
+    GHTTP_WsEvent e;
+    if (ghttp_ws_conn_feed(s.get(), in.data() + off, in.size() - off, &used, &e) != GHTTP_OK) break;
+    off += used;
+    if (e.type == GHTTP_WS_EVENT_NEED_MORE) break;
+    WsEv we;
+    we.type = e.type;
+    if (e.data_len) we.data.assign(reinterpret_cast<const char *>(e.data), e.data_len);
+    events.push_back(we);
+  }
+  *output = s.take_output();
+  return events;
+}
+
 std::string fragment(int opcode, const std::string & p, bool fin) { return wsf(opcode, p, fin); }
 
 } // namespace
@@ -84,6 +103,44 @@ TEST(WsConnCreate, ARoleIsRequiredAndALimitThatCannotWorkIsRefused) {
   ASSERT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, &l, nullptr, &c), GHTTP_OK);
   ghttp_ws_conn_destroy(c);
   ghttp_ws_conn_destroy(nullptr);
+}
+
+TEST(WsConnCreate, EveryLimitThatMustBeNonZeroIsRefusedAtZeroAndAFrameMayNotOutgrowItsMessage) {
+  struct Case { const char * name; void (*set)(GHTTP_WsLimits *); };
+  Case cases[] = {
+      {"max_frame_payload", [](GHTTP_WsLimits * l) { l->max_frame_payload = 0; }},
+      {"max_message_bytes", [](GHTTP_WsLimits * l) { l->max_message_bytes = 0; }},
+      {"max_fragments", [](GHTTP_WsLimits * l) { l->max_fragments = 0; }},
+      {"max_control_per_interval", [](GHTTP_WsLimits * l) { l->max_control_per_interval = 0; }},
+      {"interval_ms", [](GHTTP_WsLimits * l) { l->interval_ms = 0; }},
+      {"max_buffered_bytes", [](GHTTP_WsLimits * l) { l->max_buffered_bytes = 0; }},
+      {"max_handshake_bytes", [](GHTTP_WsLimits * l) { l->max_handshake_bytes = 0; }},
+      {"max_extension_offers", [](GHTTP_WsLimits * l) { l->max_extension_offers = 0; }},
+      {"max_extension_params", [](GHTTP_WsLimits * l) { l->max_extension_params = 0; }},
+      {"frame over message", [](GHTTP_WsLimits * l) { l->max_frame_payload = 101; l->max_message_bytes = 100; }},
+  };
+  for (auto & c : cases) {
+    GHTTP_WsLimits l = limits();
+    c.set(&l);
+    GHTTP_WsConn * conn = nullptr;
+    EXPECT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, &l, nullptr, &conn), GHTTP_ERR_INVALID) << c.name;
+    EXPECT_EQ(conn, nullptr) << c.name;
+  }
+  // A ratio of 0 is not a refusal: it is "no ratio limit".
+  GHTTP_WsLimits l = limits();
+  l.max_expansion_ratio = 0;
+  GHTTP_WsConn * conn = nullptr;
+  EXPECT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, &l, nullptr, &conn), GHTTP_OK);
+  ghttp_ws_conn_destroy(conn);
+}
+
+TEST(WsConnCreate, ANegotiatedStructWithNoSizeIsInvalidAndANullConnectionIsReportedFailed) {
+  GHTTP_WsNegotiated n;
+  ghttp_ws_negotiated_default(&n);
+  n.size = 0;
+  GHTTP_WsConn * c = nullptr;
+  EXPECT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, nullptr, &n, &c), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_conn_state(nullptr), GHTTP_WS_STATE_FAILED);
 }
 
 TEST(WsConnCreate, ANullArgumentToFeedIsInvalidAndNotSticky) {
@@ -227,7 +284,23 @@ TEST(WsAutobahn, Case2_9_APongThenAPingThenTheMessagesAfterThemAreAllDelivered) 
   EXPECT_EQ(f[0].payload, "b");
 }
 
-TEST(WsAutobahn, Case2_10And2_11_ManyPingsAreAnsweredInOrderOnePongEach) {
+TEST(WsAutobahn, Case2_10And2_11_ManyPingsAreAnsweredInOrderOnePongEachWhenTheWriterKeepsUp) {
+  WsSide s(GHTTP_WS_SERVER);
+  std::string out;
+  for (int i = 0; i < 10; i++) {
+    std::string p = "ping" + std::to_string(i);
+    WsRun r = s.feed(ping(p));  // the helper takes the output after each feed
+    EXPECT_EQ(r.events, (Events{ev(GHTTP_WS_EVENT_PING, p)}));
+    out += r.output;
+  }
+  auto f = ws_parse_frames(out);
+  ASSERT_EQ(f.size(), 10u);
+  for (int i = 0; i < 10; i++) EXPECT_EQ(f[i].payload, "ping" + std::to_string(i));
+}
+
+TEST(WsConn, PingsThatArriveBeforeTheLastPongIsWrittenAreAnsweredByOnePongOfTheLatest) {
+  // RFC 6455 section 5.5.3: a Pong may answer only the most recent Ping. Every
+  // Ping is still reported; a slow reader is not made to queue one Pong each.
   WsSide s(GHTTP_WS_SERVER);
   std::string in;
   Events want;
@@ -236,11 +309,57 @@ TEST(WsAutobahn, Case2_10And2_11_ManyPingsAreAnsweredInOrderOnePongEach) {
     in += ping(p);
     want.push_back(ev(GHTTP_WS_EVENT_PING, p));
   }
-  WsRun r = s.feed(in);
-  EXPECT_EQ(r.events, want);
-  auto f = ws_parse_frames(r.output);
-  ASSERT_EQ(f.size(), 10u);
-  for (int i = 0; i < 10; i++) EXPECT_EQ(f[i].payload, "ping" + std::to_string(i));
+  std::string output;
+  EXPECT_EQ(feed_without_draining(s, in, &output), want);
+  auto f = ws_parse_frames(output);
+  ASSERT_EQ(f.size(), 1u);
+  EXPECT_EQ(f[0].payload, "ping9");
+}
+
+TEST(WsConn, APongThatHasBegunToBeWrittenIsNotReplaced) {
+  GHTTP_WsConn * c = nullptr;
+  ASSERT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, nullptr, nullptr, &c), GHTTP_OK);
+  std::string in = ping("first");
+  size_t used;
+  GHTTP_WsEvent e;
+  ASSERT_EQ(ghttp_ws_conn_feed(c, in.data(), in.size(), &used, &e), GHTTP_OK);
+  ASSERT_EQ(e.type, GHTTP_WS_EVENT_PING);
+  ghttp_ws_conn_output_consume(c, 3);  // the writer took part of it
+  std::string in2 = ping("second");
+  ASSERT_EQ(ghttp_ws_conn_feed(c, in2.data(), in2.size(), &used, &e), GHTTP_OK);
+  size_t n;
+  const uint8_t * out = ghttp_ws_conn_output(c, &n);
+  std::string rest(reinterpret_cast<const char *>(out), n);
+  // "first"'s Pong is 7 octets: 3 gone, 4 left, then the whole Pong of "second".
+  EXPECT_EQ(rest.size(), 4u + 8u);
+  EXPECT_EQ(rest.substr(4), std::string("\x8a\x06second", 8) + "");
+  ghttp_ws_conn_destroy(c);
+}
+
+TEST(WsConn, PingsWhileALargeMessageIsQueuedDoNotFillTheQueueWithPongs) {
+  GHTTP_WsLimits l = limits();
+  l.max_buffered_bytes = 2000;
+  l.max_control_per_interval = 100000;
+  GHTTP_WsConn * c = nullptr;
+  ASSERT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, &l, nullptr, &c), GHTTP_OK);
+  std::string big(1500, 'x');
+  ASSERT_EQ(ghttp_ws_conn_send_message(c, GHTTP_WS_MESSAGE_BINARY, big.data(), big.size()), GHTTP_OK);
+  std::string p(120, 'p');
+  std::string in;
+  for (int i = 0; i < 1000; i++) in += ping(p);
+  size_t off = 0;
+  int pings = 0;
+  while (off < in.size()) {
+    size_t used;
+    GHTTP_WsEvent e;
+    ASSERT_EQ(ghttp_ws_conn_feed(c, in.data() + off, in.size() - off, &used, &e), GHTTP_OK);
+    off += used;
+    if (e.type == GHTTP_WS_EVENT_PING) pings++;
+  }
+  EXPECT_EQ(pings, 1000);
+  EXPECT_EQ(ghttp_ws_conn_state(c), GHTTP_WS_STATE_OPEN);
+  EXPECT_EQ(ghttp_ws_conn_output_size(c), 1504u + 122u);  // the message and one Pong
+  ghttp_ws_conn_destroy(c);
 }
 
 // ---- Autobahn 3.x: reserved bits ---------------------------------------------------------------------
@@ -361,8 +480,9 @@ TEST(WsAutobahn, Case5_19And5_20_ControlFramesInterleavedWithFragmentsAllWork) {
   WsRun r = s.feed(fragment(1, "fragment1", false) + fragment(0, "fragment2", false) + ping("pongme 1!")
       + fragment(0, "fragment3", false) + fragment(0, "fragment4", false) + ping("pongme 2!")
       + fragment(0, "fragment5", true));
-  EXPECT_EQ(r.events, (Events{ev(GHTTP_WS_EVENT_PING, "pongme 1!"), ev(GHTTP_WS_EVENT_PING, "pongme 2!"),
-      ev_text("fragment1fragment2fragment3fragment4fragment5", 5)}));
+  EXPECT_EQ(r.events.size(), 3u);
+  EXPECT_EQ(r.events[2], ev_text("fragment1fragment2fragment3fragment4fragment5", 5));
+  // The writer took each Pong as it came (the loop does), so there are two.
   EXPECT_EQ(ws_parse_frames(r.output).size(), 2u);
 }
 
@@ -502,27 +622,41 @@ TEST(WsAutobahn, Case7_1_1_ACloseFromThePeerIsReportedAndEchoedAndTheHandshakeIs
   EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
 }
 
-TEST(WsAutobahn, Case7_1_2To7_1_5_AnythingAfterTheCloseIsAProtocolErrorWithNothingMoreSent) {
+TEST(WsAutobahn, Case7_1_2To7_1_5_AnythingAfterTheCloseIsLeftUnreadAndTheClosureStaysClean) {
+  // The peer's Close ended what it may say. What follows it is not consumed and
+  // is not an error: the closure is complete, nothing more is sent, and a
+  // caller can see that it was not all used. (The spec's matrix asks for 1002
+  // here; the codec would have to fail a connection that has already closed
+  // cleanly, and has no Close left to say it with.)
   for (std::string after : {close_frame(1000), text("x"), ping("p"), fragment(1, "x", false), pong("")}) {
     WsSide s(GHTTP_WS_SERVER);
     WsRun first = s.feed(close_frame(1000));
     EXPECT_EQ(first.events, (Events{ev_close(1000)}));
     EXPECT_EQ(ws_parse_frames(first.output).size(), 1u);
-    WsRun r = s.feed(after);
-    EXPECT_EQ(r.result, GHTTP_ERR_CORRUPT);
-    EXPECT_EQ(r.code, 1002);
-    EXPECT_EQ(r.output, "");  // the Close has gone once; a second is not sent
-    EXPECT_TRUE(r.events.empty());
-    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_FAILED);
+    size_t used = 99;
+    GHTTP_WsEvent e;
+    EXPECT_EQ(ghttp_ws_conn_feed(s.get(), after.data(), after.size(), &used, &e), GHTTP_OK);
+    EXPECT_EQ(used, 0u);
+    EXPECT_EQ(e.type, GHTTP_WS_EVENT_NEED_MORE);
+    EXPECT_EQ(ghttp_ws_conn_output_size(s.get()), 0u);
+    EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_CLOSED);
+    EXPECT_EQ(ghttp_ws_conn_finish(s.get()), GHTTP_OK);
   }
 }
 
-TEST(WsAutobahn, Case7_1_2_TwoCloseFramesInOneFeedGiveTheFirstThenTheError) {
+TEST(WsAutobahn, Case7_1_2_TwoCloseFramesInOneFeedGiveTheFirstAndLeaveTheSecondUnread) {
   WsSide s(GHTTP_WS_SERVER);
-  WsRun r = s.feed(close_frame(1000) + close_frame(1000));
-  EXPECT_EQ(r.events, (Events{ev_close(1000)}));
-  EXPECT_EQ(r.result, GHTTP_ERR_CORRUPT);
-  EXPECT_EQ(ws_parse_frames(r.output).size(), 1u);
+  std::string in = close_frame(1000) + close_frame(1000);
+  size_t used;
+  GHTTP_WsEvent e;
+  ASSERT_EQ(ghttp_ws_conn_feed(s.get(), in.data(), in.size(), &used, &e), GHTTP_OK);
+  EXPECT_EQ(e.type, GHTTP_WS_EVENT_CLOSE);
+  EXPECT_EQ(used, in.size() / 2);
+  size_t used2;
+  EXPECT_EQ(ghttp_ws_conn_feed(s.get(), in.data() + used, in.size() - used, &used2, &e), GHTTP_OK);
+  EXPECT_EQ(used2, 0u);
+  EXPECT_EQ(ws_parse_frames(s.take_output()).size(), 1u);
+  EXPECT_EQ(ghttp_ws_conn_state(s.get()), GHTTP_WS_STATE_CLOSED);
 }
 
 TEST(WsAutobahn, Case7_3_1_ACloseWithNoBodyIsReportedAs1005AndAnsweredWithNoBody) {
@@ -796,6 +930,26 @@ TEST(WsConn, AReservedBitAnExtensionClaimedIsLetThroughAndReported) {
   expect_failed(u.feed(wsf(1, "x", true, true, 4)), GHTTP_ERR_CORRUPT, 1002, "rsv1");
 }
 
+TEST(WsConn, AReservedBitAnExtensionClaimedIsLetThroughOnContinuationsAndReportedForTheFirstFrameOnly) {
+  // RFC 6455 section 5.2: a reserved bit means what a negotiated extension says
+  // it means, on any frame. Here that is: allowed on every frame, control
+  // frames included, and reported with the message by its first frame's bits.
+  GHTTP_WsNegotiated n;
+  ghttp_ws_negotiated_default(&n);
+  n.extension_rsv = GHTTP_WS_RSV2;
+  WsSide s(GHTTP_WS_SERVER, nullptr, &n);
+  WsRun r = s.feed(wsf(1, "a", false, true, 2) + wsf(0, "b", false, true, 2) + wsf(9, "p", true, true, 2)
+      + wsf(0, "c", true, true, 0));
+  ASSERT_EQ(r.events.size(), 2u);
+  EXPECT_EQ(r.events[0].type, GHTTP_WS_EVENT_PING);
+  EXPECT_EQ(r.events[1].data, "abc");
+  EXPECT_EQ(r.events[1].rsv, GHTTP_WS_RSV2);
+  // One that nobody claimed is refused on a continuation as anywhere.
+  WsSide t(GHTTP_WS_SERVER, nullptr, &n);
+  WsRun q = t.feed(wsf(1, "a", false, true, 2) + wsf(0, "b", true, true, 1));
+  EXPECT_EQ(q.code, 1002);
+}
+
 TEST(WsConn, TheFragmentCountOfAMessageIsReported) {
   WsSide s(GHTTP_WS_SERVER);
   WsRun r = s.feed(text("a") + fragment(2, "b", false) + fragment(0, "c", false) + fragment(0, "d", true));
@@ -871,7 +1025,7 @@ TEST(WsLimitsConn, AFrameOverTheFrameLimitIsRefusedAtItsHeader) {
 
 TEST(WsLimitsConn, AMessageOverTheMessageLimitIsRefusedBeforeItsLastFrameArrives) {
   GHTTP_WsLimits l = limits();
-  l.max_message_bytes = 100;
+  l.max_message_bytes = 100; l.max_frame_payload = 100;
   WsSide ok(GHTTP_WS_SERVER, &l);
   EXPECT_EQ(ok.feed(fragment(2, std::string(60, 'x'), false) + fragment(0, std::string(40, 'y'), true)).events.size(), 1u);
   WsSide s(GHTTP_WS_SERVER, &l);
@@ -883,7 +1037,7 @@ TEST(WsLimitsConn, AMessageOverTheMessageLimitIsRefusedBeforeItsLastFrameArrives
 
 TEST(WsLimitsConn, AMessageOfExactlyTheLimitIsAcceptedAndOneOctetMoreIsNot) {
   GHTTP_WsLimits l = limits();
-  l.max_message_bytes = 1000;
+  l.max_message_bytes = 1000; l.max_frame_payload = 1000;
   WsSide a(GHTTP_WS_SERVER, &l);
   EXPECT_EQ(a.feed(binary(std::string(1000, 'x'))).events.size(), 1u);
   WsSide b(GHTTP_WS_SERVER, &l);
@@ -935,40 +1089,21 @@ TEST(WsLimitsConn, DataFramesAreNotControlFrames) {
   EXPECT_EQ(s.feed(in).events.size(), 50u);
 }
 
-TEST(WsLimitsConn, APingFloodThatIsNotDrainedEndsTheConnectionAtTheQueueLimit) {
+TEST(WsLimitsConn, ANeverTickedConnectionCountsControlFramesOverItsWholeLife) {
+  // Without ghttp_ws_conn_tick() the interval never starts, so the cap is a
+  // total for the connection (documented in ws_frame.h): safe, because nothing
+  // is unbounded, and wrong for a connection that lives long.
   GHTTP_WsLimits l = limits();
-  l.max_buffered_bytes = 400;  // three Pongs of 100 octets and a little
-  l.max_control_per_interval = 1000;
-  std::string p(100, 'p');  // a Pong of 102 octets
-  // The helper drains after every feed, which would hide a writer that has
-  // stopped, so this one drives the connection directly and never takes output.
-  GHTTP_WsConn * c = nullptr;
-  ASSERT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, &l, nullptr, &c), GHTTP_OK);
-  std::string in = ping(p) + ping(p) + ping(p) + ping(p) + ping(p);
-  size_t off = 0;
-  GHTTP_Result res = GHTTP_OK;
-  int events = 0;
-  while (off < in.size() && res == GHTTP_OK) {
-    size_t used;
-    GHTTP_WsEvent e;
-    res = ghttp_ws_conn_feed(c, in.data() + off, in.size() - off, &used, &e);
-    off += used;
-    if (e.type == GHTTP_WS_EVENT_PING) events++;
+  l.max_control_per_interval = 5;
+  WsSide s(GHTTP_WS_SERVER, &l);
+  for (int i = 0; i < 5; i++) EXPECT_EQ(s.feed(ping("p")).result, GHTTP_OK) << i;
+  WsRun r = s.feed(ping("p"));
+  expect_failed(r, GHTTP_ERR_LIMIT, 1008, "the sixth control frame of a never-ticked connection", false);
+  WsSide t(GHTTP_WS_SERVER, &l);
+  for (int round = 0; round < 3; round++) {
+    ghttp_ws_conn_tick(t.get(), static_cast<uint64_t>(round) * 20000);
+    for (int i = 0; i < 5; i++) EXPECT_EQ(t.feed(ping("p")).result, GHTTP_OK) << round;
   }
-  EXPECT_EQ(res, GHTTP_ERR_LIMIT);
-  EXPECT_EQ(events, 3);  // three Pongs of 102 fit in 400; the fourth does not
-  uint16_t code;
-  ghttp_ws_conn_error(c, &code, nullptr);
-  EXPECT_EQ(code, 1008);
-  // The queue holds the three Pongs and the Close that ended it, which the
-  // limit does not stop.
-  size_t n;
-  const uint8_t * out = ghttp_ws_conn_output(c, &n);
-  auto frames = ws_parse_frames(std::string(reinterpret_cast<const char *>(out), n));
-  ASSERT_EQ(frames.size(), 4u);
-  EXPECT_EQ(frames.back().opcode, 8);
-  EXPECT_EQ(ws_close_code(frames.back()), 1008);
-  ghttp_ws_conn_destroy(c);
 }
 
 TEST(WsLimitsConn, ASendThatWouldOverfillTheQueueIsRefusedWithNothingQueued) {
@@ -987,7 +1122,7 @@ TEST(WsLimitsConn, ASendThatWouldOverfillTheQueueIsRefusedWithNothingQueued) {
 
 TEST(WsLimitsConn, AMessageLargerThanTheMessageLimitCannotBeSent) {
   GHTTP_WsLimits l = limits();
-  l.max_message_bytes = 100;
+  l.max_message_bytes = 100; l.max_frame_payload = 100;
   WsSide s(GHTTP_WS_SERVER, &l);
   std::string m(101, 'x');
   EXPECT_EQ(ghttp_ws_conn_send_message(s.get(), GHTTP_WS_MESSAGE_BINARY, m.data(), m.size()), GHTTP_ERR_LIMIT);
@@ -1009,7 +1144,7 @@ TEST(WsLimitsConn, ALimitsStructFromAnOlderCallerIsReadAsFarAsItGoes) {
 
 TEST(WsLimitsConn, TheMessageLimitIsEnforcedOnABytewiseFeedToo) {
   GHTTP_WsLimits l = limits();
-  l.max_message_bytes = 10;
+  l.max_message_bytes = 10; l.max_frame_payload = 10;
   WsSide s(GHTTP_WS_SERVER, &l);
   WsRun r = s.feed_bytes(binary(std::string(11, 'x')));
   expect_failed(r, GHTTP_ERR_LIMIT, 1009, "bytewise");

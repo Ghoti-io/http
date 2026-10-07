@@ -944,7 +944,7 @@ def hand_hs():
     add("protocol-trailing-comma", request(extra=P("chat,")), "p=chat")
     add("protocol-leading-comma", request(extra=P(",chat")), "p=chat")
     add("protocol-space-in-token", request(extra=P("cha t")), "p=chat")
-    add("protocol-non-token-char", request(extra=P("chat/1")), "p=chat/1")
+    add("protocol-non-token-char", request(extra=P("chat/1")), "p=chat")
     add("protocol-quoted", request(extra=P('"chat"')), "p=chat")
     add("protocol-trailing-ows", b"GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + RFC_KEY.encode() + b"\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat \t\r\n\r\n", "p=chat")
     add("protocol-name-127", request(extra=P("x" * 127)), "p=" + "x" * 127)

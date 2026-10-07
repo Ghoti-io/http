@@ -134,7 +134,9 @@ typedef struct GHTTP_WsExtensionReply {
   int accept;
   /**
    * Server: the extension as it is to appear in the response, name and
-   * parameters, NUL-terminated (for example `x-foo; level=2`). Ignored at a
+   * parameters, NUL-terminated (for example `x-foo; level=2`), checked as one
+   * extension in the grammar of RFC 6455 section 9.1 and not permessage-deflate;
+   * anything else makes the handshake return GHTTP_ERR_INVALID. Ignored at a
    * client.
    */
   char text[GHTTP_WS_EXTENSION_TEXT_MAX];
@@ -144,9 +146,10 @@ typedef struct GHTTP_WsExtensionReply {
 
 /**
  * The seam for further extensions. Called for every offer (server) or every
- * chosen extension (client) other than permessage-deflate, and for
- * permessage-deflate too when its use is not enabled. Without a hook such an
- * extension is ignored by a server and a failure at a client.
+ * chosen extension (client) other than permessage-deflate, which is never
+ * offered to it (a second offer, or one while the
+ * use is disabled, is skipped). Without a hook such an extension is ignored by
+ * a server and a failure at a client.
  *
  * @return GHTTP_OK with @c reply->accept set or clear. Any other value ends the
  *   handshake with that result and no response is built.
@@ -213,6 +216,18 @@ typedef struct GHTTP_WsServerResult {
   const char * reason;
   /** What was agreed, when accepted. */
   GHTTP_WsNegotiated negotiated;
+  /**
+   * The request's `Origin` field, parsed for the caller's policy: 1 if there was
+   * exactly one (a second is refused with 400), and then a view of its value,
+   * valid as long as the request is. This library does not judge it. A server
+   * whose clients are browsers MUST: a page on any site may open a WebSocket to
+   * it with the user's cookies (cross-site WebSocket hijacking, RFC 6455 section
+   * 10.2), and the Origin is the only thing that says which site. Check it
+   * against the sites that may, and refuse the rest before using the connection.
+   */
+  int has_origin;
+  const char * origin;
+  size_t origin_len;
 } GHTTP_WsServerResult;
 
 /**
@@ -224,7 +239,7 @@ typedef struct GHTTP_WsServerResult {
  * request that is not one gets a refusal to send instead: 405 for a method
  * other than GET, 426 with `Sec-WebSocket-Version: 13` for another version,
  * 431 for a handshake over @c max_handshake_bytes, 400 for the rest (HTTP/1.0,
- * a missing or repeated Upgrade, Connection, Key or Version, a key that is not
+ * a missing or repeated Host (RFC 6455 section 4.2.1), Origin, Key or Version, a missing Upgrade or Connection, a key that is not
  * 16 octets of base64, malformed Protocol or Extensions fields). Each
  * refusal closes the connection and has no body.
  *

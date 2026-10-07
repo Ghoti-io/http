@@ -181,20 +181,34 @@ enum {
  * Every unbounded quantity of the handshake and the connection, each a hard
  * cap. Initialise with ghttp_ws_limits_default().
  *
- * The three that count control frames and the per-interval renewals work as
- * in h2conn.h: the interval is @c interval_ms of the clock the caller
- * supplies with ghttp_ws_conn_tick(), and a caller that never ticks gets a
- * count that never renews, which is safe (nothing is left unbounded) and
- * wrong for a long-lived connection.
+ * The control-frame count works as in h2conn.h: the interval is @c interval_ms
+ * of the clock the caller supplies with ghttp_ws_conn_tick(). **A connection
+ * that is never ticked has no interval: its control-frame cap is a total for the
+ * connection's whole life** (and it dies of it, with 1008, after that many
+ * Pings, Pongs and Closes): safe, because nothing is left unbounded, and wrong
+ * for a long-lived connection, which must tick.
+ *
+ * A limit is a hard cap: every field must be non-zero, except
+ * @c max_expansion_ratio where 0 means no ratio limit, and
+ * @c max_frame_payload may not exceed @c max_message_bytes; the creating
+ * functions return GHTTP_ERR_INVALID otherwise.
  */
 typedef struct GHTTP_WsLimits {
   size_t size;  ///< sizeof(GHTTP_WsLimits); set by _default().
-  /** The payload of one frame as it arrives (compressed, if it is). */
+  /**
+   * The payload of one frame as it arrives (compressed, if it is; a compressed
+   * frame may be up to 1/64 of this and 16 octets larger, the overhead of the
+   * extension, before it is refused). A frame over it is refused at its header.
+   */
   uint64_t max_frame_payload;
   /**
-   * One message after decompression. A compressed message may also not arrive
-   * as more than this plus 1/64 of it and 16 octets, so that an incompressible
-   * message of the full size is not refused for the extension's own overhead.
+   * One message after decompression, exact: no octet past it is delivered or
+   * held beyond the one that shows the limit was passed. What arrives
+   * compressed is bounded separately, by this plus 1/64 of it and 16 octets (an
+   * incompressible message of the full size is a little larger compressed), so
+   * "closes before the limit is exceeded by more than one unit" is exact for an
+   * uncompressed message and the inflated size, and is that much looser for the
+   * compressed octets.
    */
   uint64_t max_message_bytes;
   /** Frames in one message, the first included. */
@@ -218,7 +232,9 @@ typedef struct GHTTP_WsLimits {
   /**
    * Output octets per input octet of a permessage-deflate message. 1032 is
    * the format's own ceiling (a 258-octet match in two bits), so no valid
-   * stream is refused at the default; lower it to refuse a bomb sooner.
+   * stream is refused at the default; lower it to refuse a bomb sooner. 0 is no
+   * ratio limit (the message limit still applies). The count has a slack of 256
+   * octets, so that a message of a few octets may still be a sentence.
    */
   uint64_t max_expansion_ratio;
   uint64_t reserved[4];

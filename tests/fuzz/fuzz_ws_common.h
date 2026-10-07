@@ -33,6 +33,9 @@ inline GHTTP_WsLimits ws_limits_for(uint8_t profile) {
     default: l.max_frame_payload = 64; l.max_message_bytes = 100; l.max_fragments = 5;
              l.max_control_per_interval = 5; break;
   }
+  if (l.max_frame_payload > l.max_message_bytes) {
+    l.max_frame_payload = l.max_message_bytes;  // a frame is never larger than its message
+  }
   return l;
 }
 

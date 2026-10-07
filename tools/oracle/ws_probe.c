@@ -339,7 +339,18 @@ typedef struct {
   Buf evs;
   size_t nevs;
   int closed;
+  Buf out;  // what the connection queued, taken after every event as the documented loop does
 } Stream;
+
+/** Take the connection's output: a Pong not yet taken is replaced by the next Ping's. */
+static void take_output(Stream * s, GHTTP_WsConn * c) {
+  size_t n = 0;
+  const unsigned char * p = ghttp_ws_conn_output(c, &n);
+  if (n > 0) {
+    buf_put(&s->out, (const char *)p, n);
+    ghttp_ws_conn_output_consume(c, n);
+  }
+}
 
 static void stream_event(Stream * s, const GHTTP_WsEvent * ev) {
   const char * kind = NULL;
@@ -384,10 +395,12 @@ static GHTTP_Result stream_piece(Stream * s, GHTTP_WsConn * c,
     size_t used = 0;
     GHTTP_Result res = ghttp_ws_conn_feed(c, piece + off, len - off, &used, &ev);
     if (res != GHTTP_OK) {
+      take_output(s, c);
       return res;
     }
     off += used;
     stream_event(s, &ev);
+    take_output(s, c);
   } while (ev.type != GHTTP_WS_EVENT_NEED_MORE);
   return GHTTP_OK;
 }
@@ -427,13 +440,12 @@ static void run_stream(const char * id, int client, int bytewise, const char * a
   if (err != GHTTP_OK) {
     ghttp_ws_conn_error(c, &code, &why);
   }
-  size_t outn = 0;
-  const unsigned char * out = ghttp_ws_conn_output(c, &outn);
+  take_output(&s, c);
   Buf o = {0};
   buf_str(&o, "{\"evs\":[");
   buf_put(&o, s.evs.data ? s.evs.data : "", s.evs.len);
   buf_str(&o, "],\"sent\":");
-  buf_frames(&o, out, outn);
+  buf_frames(&o, (const unsigned char *)(s.out.data ? s.out.data : ""), s.out.len);
   buf_str(&o, ",\"end\":\"");
   buf_str(&o, err != GHTTP_OK ? "failed" : (s.closed ? "closed" : "open"));
   buf_str(&o, "\",\"fail\":");
@@ -445,6 +457,7 @@ static void run_stream(const char * id, int client, int bytewise, const char * a
   printf("%s\t%s\t%s\n", id, bytewise ? "byte" : "whole", o.data);
   free(o.data);
   free(s.evs.data);
+  free(s.out.data);
   ghttp_ws_conn_destroy(c);
 }
 

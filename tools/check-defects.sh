@@ -278,7 +278,7 @@ plant ws-fragment-flood-unbounded src/http/ws_conn.c testWs_conn \
   '  if (frames >= c->limits.max_fragments && 0) {'
 
 plant ws-message-limit-off-by-one src/http/ws_conn.c testWs_conn \
-  'WsLimitsConn.AMessageOfExactlyTheLimitIsAcceptedAndOneOctetMoreIsNot' \
+  'WsLimitsConn.AMessageOverTheMessageLimitIsRefusedBeforeItsLastFrameArrives' \
   '    if (fh->payload_len > cap - (have < cap ? have : cap)) {' \
   '    if (fh->payload_len > cap + 1 - (have < cap ? have : cap)) {'
 
@@ -318,6 +318,127 @@ plant ws-context-takeover-ignored src/http/ws_conn.c testWs_deflate \
       server ? p->client_no_context_takeover : p->server_no_context_takeover,' \
   '      false,
       false,'
+
+# The review round: the handshake's refusals, the negotiation's matching, the
+# Close reply and the send side, each one condition removed.
+plant ws-server-version-unchecked src/http/ws_handshake.c testWs_handshake \
+  'WsServerHandshake.EachWayAHandshakeCanBeWrongIsRefusedWithItsStatus' \
+  '  if (!(vn == 2 && memcmp(v, "13", 2) == 0)) {' \
+  '  if (!(vn == 2 && memcmp(v, "13", 2) == 0) && 0) {'
+
+plant ws-duplicate-key-accepted src/http/ws_handshake.c testWs_handshake \
+  'WsServerHandshake.EachWayAHandshakeCanBeWrongIsRefusedWithItsStatus' \
+  '  if (i == GHTTP_HEADERS_NPOS || count_fields(h, name) != 1) {' \
+  '  if (i == GHTTP_HEADERS_NPOS) {'
+
+plant ws-host-not-required src/http/ws_handshake.c testWs_handshake \
+  'WsServerHandshake.EachWayAHandshakeCanBeWrongIsRefusedWithItsStatus' \
+  '  if (!single_field(h, "host", &host, &host_len)) {' \
+  '  if (!single_field(h, "host", &host, &host_len) && 0) {'
+
+plant ws-duplicate-protocol-accepted src/http/ws_handshake.c testWs_handshake \
+  'WsServerHandshake.ARepeatedOrMalformedSubprotocolListIsRefused' \
+  '    if (o->lens[i] == n && memcmp(o->names[i], t, n) == 0) {' \
+  '    if (o->lens[i] == n && memcmp(o->names[i], t, n) == 0 && 0) {'
+
+plant ws-duplicate-extension-chosen src/http/ws_handshake.c testWs_handshake \
+  'WsExtensionNegotiation.AnExtensionOfferedTwiceIsChosenOnce' \
+  '            && !name_chosen(ext_text, ext_len, reply.text, (size_t)(name_end - reply.text))' \
+  '            && !(name_chosen(ext_text, ext_len, reply.text, (size_t)(name_end - reply.text)) && 0)'
+
+plant ws-hook-reply-not-checked src/http/ws_handshake.c testWs_handshake \
+  'WsExtensionNegotiation.AHookReplyThatIsNotOneExtensionIsAnErrorAndNeverReachesTheHeader' \
+  '        if (!reply_text_valid(reply.text, &name_end)) {' \
+  '        if (!reply_text_valid(reply.text, &name_end) && 0) {'
+
+plant ws-client-accepts-wider-server-window src/http/ws_deflate.c testWs_handshake \
+  'WsDeflateParams.ClientVerificationHoldsTheServerToTheOffer' \
+  '      && (!s.smwb || s.smwb_value > offered->server_max_window_bits)) {' \
+  '      && (!s.smwb || 0)) {'
+
+plant ws-close-reply-without-the-code src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case7_7_AValidCloseCodeIsReportedAndEchoed' \
+  '        c->ctl_len >= 2 ? 2 : 0, kp, true);' \
+  '        0, kp, true);'
+
+plant ws-close-reason-not-checked-as-utf8 src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case7_5_1_AReasonThatIsNotUtf8ClosesWith1007' \
+  '    reason_len = c->ctl_len - 2;
+    GHTTP_WsUtf8 v;
+    ghttp_ws_utf8_init(&v);
+    if (ghttp_ws_utf8_feed(&v, reason, reason_len) != GHTTP_OK
+        || !ghttp_ws_utf8_complete(&v)) {' \
+  '    reason_len = c->ctl_len - 2;
+    GHTTP_WsUtf8 v;
+    ghttp_ws_utf8_init(&v);
+    if ((ghttp_ws_utf8_feed(&v, reason, reason_len) != GHTTP_OK
+        || !ghttp_ws_utf8_complete(&v)) && 0) {'
+
+plant ws-close-of-one-octet-accepted src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case7_3_2_ACloseWithAOneOctetBodyClosesWith1002' \
+  '  if (c->ctl_len == 1) {' \
+  '  if (c->ctl_len == 1 && 0) {'
+
+plant ws-send-message-limit-ignored src/http/ws_conn.c testWs_conn \
+  'WsLimitsConn.AMessageLargerThanTheMessageLimitCannotBeSent' \
+  '  if (total > c->limits.max_message_bytes) {' \
+  '  if (total > c->limits.max_message_bytes && 0) {'
+
+plant ws-send-text-not-checked-for-utf8 src/http/ws_conn.c testWs_conn \
+  'WsSend.ATextMessageThatIsNotUtf8IsRefusedWhereverItIsCut' \
+  '        || (fin && !ghttp_ws_utf8_complete(&v))) {' \
+  '        || (fin && !ghttp_ws_utf8_complete(&v) && 0)) {'
+
+plant ws-send-queue-limit-ignored src/http/ws_conn.c testWs_deflate \
+  'WsDeflate.ACompressedSendThatWouldOverfillTheQueueIsRefusedBeforeTheCompressorIsTouched' \
+  '  if (len > room || extra > room - len) {' \
+  '  if ((len > room || extra > room - len) && 0) {'
+
+plant ws-pongs-not-coalesced src/http/ws_conn.c testWs_conn \
+  'WsConn.PingsThatArriveBeforeTheLastPongIsWrittenAreAnsweredByOnePongOfTheLatest' \
+  '        if (c->pong_pending) {
+          ghttp_buffer_erase' \
+  '        if (c->pong_pending && 0) {
+          ghttp_buffer_erase'
+
+plant ws-truncated-block-delivered src/http/ws_deflate.c testWs_deflate \
+  'WsDeflate.DataCutOffInsideABlockIsNotDeliveredAsAMessage' \
+  '    if (dst.used != 0 || src.used != src.size) {' \
+  '    if ((dst.used != 0 || src.used != src.size) && 0) {'
+
+plant ws-zero-ratio-is-the-slack src/http/ws_deflate.c testWs_deflate \
+  'WsDeflate.ARatioOfZeroIsNoRatioLimitAndTheMessageLimitStillApplies' \
+  '  if (d->max_ratio == 0
+      || d->in_total > (UINT64_MAX - RATIO_SLACK) / d->max_ratio) {
+    by_ratio = UINT64_MAX;
+  } else {
+    by_ratio = d->max_ratio * d->in_total + RATIO_SLACK;
+  }
+  return by_ratio < cap ? by_ratio : cap;' \
+  '  if (d->in_total > (UINT64_MAX - RATIO_SLACK) / (d->max_ratio ? d->max_ratio : 1)) {
+    by_ratio = UINT64_MAX;
+  } else {
+    by_ratio = d->max_ratio * d->in_total + RATIO_SLACK;
+  }
+  return by_ratio < cap ? by_ratio : cap;'
+
+plant ws-compressed-frame-without-slack src/http/ws_conn.c testWs_deflate \
+  'WsDeflate.AnIncompressibleMessageOfTheMessageLimitFitsAFrameOfTheFrameLimit' \
+  '  uint64_t frame_cap = frame_compressed ? wire_cap(c->limits.max_frame_payload)
+                                        : c->limits.max_frame_payload;' \
+  '  uint64_t frame_cap = c->limits.max_frame_payload + 0 * (uint64_t)frame_compressed;'
+
+plant ws-window-bits-swapped src/http/ws_conn.c testWs_deflate \
+  'WsDeflate.ASmallWindowLimitsWhatTheCompressorCanReachBackTo' \
+  '      server ? p->server_max_window_bits : p->client_max_window_bits,' \
+  '      server ? p->client_max_window_bits : p->server_max_window_bits,'
+
+plant ws-close-after-close-not-left-unread src/http/ws_conn.c testWs_conn \
+  'WsAutobahn.Case7_1_2To7_1_5_AnythingAfterTheCloseIsLeftUnreadAndTheClosureStaysClean' \
+  '  if (c->close_received) {
+    // The peer' \
+  '  if (c->close_received && 0) {
+    // The peer'
 
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require

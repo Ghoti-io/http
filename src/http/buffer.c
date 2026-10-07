@@ -116,3 +116,14 @@ void ghttp_buffer_consume(GHTTP_Buffer * buffer, size_t n) {
   memmove(buffer->data, buffer->data + n, buffer->len - n);
   buffer->len -= n;
 }
+
+void ghttp_buffer_erase(GHTTP_Buffer * buffer, size_t off, size_t n) {
+  if (!buffer || off >= buffer->len || n == 0) {
+    return;
+  }
+  if (n > buffer->len - off) {
+    n = buffer->len - off;
+  }
+  memmove(buffer->data + off, buffer->data + off + n, buffer->len - off - n);
+  buffer->len -= n;
+}

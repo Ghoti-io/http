@@ -43,11 +43,16 @@ negotiates it, `ws_conn.h` runs it with the deflate encoder and decoder of the
   octets of RFC 7692 section 7.2.3's examples are in `test_ws_deflate.cpp`,
   from the compressor's own output and not copied from the specification's
   text into the code.
+- A message must end at a block boundary once the trailer is appended: data cut
+  off inside a block would read the trailer as more of itself, so a second empty
+  stored block is fed after it and must be consumed whole with no output, or the
+  message is refused (1007).
 - A message whose last block has BFINAL set is accepted (section 7.2.3.4).
   The decompressor's stream is then over, so it starts afresh, **which ends
   context takeover for the next message even when it was negotiated**: this
   codec does not carry history across a final block. Octets after a final
-  block are accepted if they are all zero (section 7.2.3.4's example has one);
+  block are accepted if they are zero and at most four in all (section 7.2.3.4's
+  example has one);
   anything else after it is an error.
 - Context takeover is held to the agreement. With `*_no_context_takeover` the
   named side's compressor and the other side's decompressor start every message
@@ -56,7 +61,10 @@ negotiates it, `ws_conn.h` runs it with the deflate encoder and decoder of the
 - Windows: this end compresses with the window it agreed (8 to 15 bits) and
   decompresses with 15 bits whatever was agreed, so a peer that does not keep
   its window to the agreement is tolerated rather than refused. A window of 8
-  bits is what the compress library produces, not zlib's silent 9.
+  bits is a real 256-octet window in the compress library (measured: a repeat
+  400 octets back is found at 9 bits and not at 8), so it is negotiated as
+  asked; zlib widens 8 to 9 silently, which a decompressor with 15 bits does
+  not notice.
 
 ## Bounds (this library's addition)
 
@@ -70,7 +78,9 @@ three ways, each judged as the output is made:
   slack of 256 octets so that a short message of a few octets may be a
   sentence. The default, 1032, is the format's own ceiling (a 258-octet match in
   two bits), so no valid stream is refused at the default. It is the
-  connection's CPU bound: set it lower to refuse a bomb sooner;
+  connection's CPU bound: set it lower to refuse a bomb sooner. 0 is no ratio
+  limit, and the message limit then bounds the output alone. The close reason
+  says which fired, the size limit or the ratio;
 - the size of what arrives compressed: the message limit and 1/64 of it and 16
   octets (an incompressible message of exactly the limit is a little larger
   compressed).

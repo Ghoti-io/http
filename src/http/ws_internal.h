@@ -101,7 +101,8 @@ typedef struct GHTTP_WsDeflate GHTTP_WsDeflate;
  * @param enc_reset The compressor forgets its history after each message.
  * @param dec_reset The decompressor does too.
  * @param max_message The most one message may inflate to.
- * @param max_ratio The most output per input octet of one message.
+ * @param max_ratio The most output per input octet of one message; 0 is no
+ *   ratio limit (the message limit still applies).
  */
 GHTTP_Result ghttp_ws_deflate_open(const GHTTP_Allocator * allocator,
     unsigned enc_window_bits, bool enc_reset, bool dec_reset,
@@ -120,6 +121,9 @@ void ghttp_ws_deflate_close(GHTTP_WsDeflate * d);
  */
 GHTTP_Result ghttp_ws_deflate_compress(GHTTP_WsDeflate * d, const void * in,
     size_t n, bool fin, GHTTP_Buffer * out);
+
+/** Whether the last GHTTP_ERR_LIMIT of inflate was the expansion ratio's (and not the message limit's). */
+bool ghttp_ws_inflate_limit_is_ratio(const GHTTP_WsDeflate * d);
 
 /** Start a received message: its counts are zero. */
 void ghttp_ws_inflate_begin(GHTTP_WsDeflate * d);

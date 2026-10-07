@@ -99,6 +99,11 @@ struct GHTTP_WsConn {
   GHTTP_Buffer * out;
   GHTTP_Buffer * scratch;
   bool close_sent;
+  // The Pong this end queued for the latest Ping and has not begun to write:
+  // where it starts in the output, and how long it is. A later Ping replaces it.
+  bool pong_pending;
+  size_t pong_off;
+  size_t pong_len;
   bool send_open;                  // a fragmented message is being sent
   GHTTP_WsMessageType send_type;
   bool send_compressed;
@@ -134,6 +139,18 @@ GHTTP_Result ghttp_ws_conn_create(const GHTTP_Allocator * allocator,
   if (lim.max_buffered_bytes < 2 + GHTTP_WS_MAX_CONTROL_PAYLOAD + 4) {
     return GHTTP_ERR_INVALID;
   }
+  if (negotiated && negotiated->size == 0) {
+    return GHTTP_ERR_INVALID;
+  }
+  if (negotiated && negotiated->deflate) {
+    const GHTTP_WsDeflateParams * dp = &negotiated->deflate_params;
+    unsigned bits[2] = {dp->server_max_window_bits, dp->client_max_window_bits};
+    for (int i = 0; i < 2; i++) {
+      if (bits[i] != 0 && (bits[i] < 8 || bits[i] > 15)) {
+        return GHTTP_ERR_INVALID;
+      }
+    }
+  }
   GHTTP_WsConn * c = gcu_allocator_calloc(allocator, 1, sizeof(*c));
   if (!c) {
     return GHTTP_ERR_OOM;
@@ -143,8 +160,7 @@ GHTTP_Result ghttp_ws_conn_create(const GHTTP_Allocator * allocator,
   c->limits = lim;
   ghttp_ws_negotiated_default(&c->neg);
   if (negotiated) {
-    size_t n = negotiated->size && negotiated->size < sizeof(c->neg)
-        ? negotiated->size : sizeof(c->neg);
+    size_t n = negotiated->size < sizeof(c->neg) ? negotiated->size : sizeof(c->neg);
     memcpy(&c->neg, negotiated, n);
     c->neg.size = sizeof(c->neg);
     c->neg.extension_rsv &= (GHTTP_WS_RSV2 | GHTTP_WS_RSV3);
@@ -204,6 +220,13 @@ const uint8_t * ghttp_ws_conn_output(const GHTTP_WsConn * c, size_t * len) {
 void ghttp_ws_conn_output_consume(GHTTP_WsConn * c, size_t n) {
   if (c) {
     ghttp_buffer_consume(c->out, n);
+    if (c->pong_pending) {
+      if (n > c->pong_off) {
+        c->pong_pending = false;  // its first octet has gone: it is on the wire
+      } else {
+        c->pong_off -= n;
+      }
+    }
   }
 }
 
@@ -326,7 +349,7 @@ GHTTP_Result ghttp_ws_conn_error(
 }
 
 GHTTP_WsState ghttp_ws_conn_state(const GHTTP_WsConn * c) {
-  if (c->failed != GHTTP_OK) {
+  if (!c || c->failed != GHTTP_OK) {
     return GHTTP_WS_STATE_FAILED;
   }
   if (c->close_sent && c->close_received) {
@@ -492,7 +515,9 @@ static GHTTP_Result inflate_failed(GHTTP_WsConn * c, GHTTP_Result r) {
   switch (r) {
     case GHTTP_ERR_LIMIT:
       return fail(c, GHTTP_ERR_LIMIT, GHTTP_WS_CLOSE_MESSAGE_TOO_BIG,
-          "a message inflates past the size or expansion limit");
+          ghttp_ws_inflate_limit_is_ratio(c->defl)
+              ? "a message inflates past the expansion ratio limit"
+              : "a message inflates past the message size limit");
     case GHTTP_ERR_CORRUPT:
       return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_INVALID_PAYLOAD,
           "the compressed data is not valid");
@@ -591,8 +616,21 @@ static GHTTP_Result on_control(GHTTP_WsConn * c, GHTTP_WsEvent * ev) {
           }
           kp = key;
         }
+        // RFC 6455 section 5.5.3 lets a Pong answer only the latest Ping, so a
+        // Pong not yet begun is replaced and a slow reader cannot be made to
+        // queue one per Ping.
+        if (c->pong_pending) {
+          ghttp_buffer_erase(c->out, c->pong_off, c->pong_len);
+          c->pong_pending = false;
+        }
+        size_t at = ghttp_buffer_size(c->out);
         GHTTP_Result r = queue_frame(c, GHTTP_WS_OP_PONG, true, false, c->ctl,
             c->ctl_len, kp, false);
+        if (r == GHTTP_OK) {
+          c->pong_pending = true;
+          c->pong_off = at;
+          c->pong_len = ghttp_buffer_size(c->out) - at;
+        }
         if (r == GHTTP_ERR_LIMIT) {
           return fail(c, GHTTP_ERR_LIMIT, GHTTP_WS_CLOSE_POLICY_VIOLATION,
               "the output queue is full");
@@ -728,10 +766,10 @@ GHTTP_Result ghttp_ws_conn_feed(GHTTP_WsConn * c, const void * data, size_t len,
     c->lent = false;
   }
   if (c->close_received) {
-    if (len > 0) {
-      return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_PROTOCOL_ERROR,
-          "data after a Close frame");
-    }
+    // The peer's Close ended what it may say. Anything after it, in the same
+    // read or a later one, is left unread (consumed stays 0) and is not an
+    // error: the closure that completed stays clean, and a caller that cares
+    // sees that it was not all consumed.
     return GHTTP_OK;
   }
   const uint8_t * in = data;

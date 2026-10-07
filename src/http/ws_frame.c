@@ -276,5 +276,16 @@ GHTTP_Result ghttp_ws_limits_resolve(const GHTTP_WsLimits * in, GHTTP_WsLimits *
   size_t n = in->size < sizeof(*out) ? in->size : sizeof(*out);
   memcpy(out, in, n);
   out->size = sizeof(*out);
+  // Every field is a hard cap and a zero allows none: the one exception is the
+  // expansion ratio, where 0 is "no ratio limit". A frame is never larger than
+  // the message it is part of.
+  if (out->max_frame_payload == 0 || out->max_message_bytes == 0
+      || out->max_fragments == 0 || out->max_control_per_interval == 0
+      || out->interval_ms == 0 || out->max_buffered_bytes == 0
+      || out->max_handshake_bytes == 0 || out->max_extension_offers == 0
+      || out->max_extension_params == 0
+      || out->max_frame_payload > out->max_message_bytes) {
+    return GHTTP_ERR_INVALID;
+  }
   return GHTTP_OK;
 }

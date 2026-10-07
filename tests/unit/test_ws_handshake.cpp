@@ -232,6 +232,9 @@ TEST(WsServerHandshake, EachWayAHandshakeCanBeWrongIsRefusedWithItsStatus) {
   std::vector<Case> cases = {
       {"POST", rfc_fields(), "POST", 1, 405},
       {"HTTP/1.0", rfc_fields(), "GET", 0, 400},
+      {"no Host", without(rfc_fields(), "Host"), "GET", 1, 400},
+      {"two Hosts", plus(rfc_fields(), "Host", "other.example.com"), "GET", 1, 400},
+      {"two Origins", plus(rfc_fields(), "Origin", "http://evil.example"), "GET", 1, 400},
       {"no Upgrade", without(rfc_fields(), "Upgrade"), "GET", 1, 400},
       {"Upgrade names another protocol", with(rfc_fields(), "Upgrade", "h2c"), "GET", 1, 400},
       {"no Connection", without(rfc_fields(), "Connection"), "GET", 1, 400},
@@ -500,13 +503,101 @@ TEST(WsExtensionNegotiation, TwoExtensionsMayNotClaimTheSameReservedBit) {
   EXPECT_EQ(s.header("Sec-WebSocket-Extensions"), "x-foo; level=2");  // only the first
 }
 
-TEST(WsExtensionNegotiation, DeflateWhenNotEnabledAlsoGoesToTheHook) {
+TEST(WsExtensionNegotiation, DeflateNeverReachesTheHookWhetherEnabledOrNot) {
   HookLog log;
   GHTTP_WsServerOptions o = server_options();
   o.extension_fn = hook;
   o.extension_ctx = &log;
-  Served s(plus(rfc_fields(), "Sec-WebSocket-Extensions", "permessage-deflate"), &o);
-  EXPECT_EQ(log.seen, (std::vector<std::string>{"permessage-deflate [offer]"}));
+  Served off(plus(rfc_fields(), "Sec-WebSocket-Extensions", "permessage-deflate"), &o);
+  EXPECT_TRUE(log.seen.empty());
+  o.enable_deflate = 1;
+  // A second offer, after the first is taken or declined, is skipped too.
+  Served on(plus(rfc_fields(), "Sec-WebSocket-Extensions",
+               "permessage-deflate, permessage-deflate; foo, PERMESSAGE-DEFLATE"), &o);
+  EXPECT_TRUE(on.result.negotiated.deflate);
+  EXPECT_TRUE(log.seen.empty());
+  Served bad(plus(rfc_fields(), "Sec-WebSocket-Extensions", "permessage-deflate; foo, permessage-deflate"), &o);
+  EXPECT_TRUE(bad.result.negotiated.deflate);
+  EXPECT_TRUE(log.seen.empty());
+}
+
+TEST(WsExtensionNegotiation, AHookReplyThatIsNotOneExtensionIsAnErrorAndNeverReachesTheHeader) {
+  for (const char * text : {"x-foo\r\nSet-Cookie: a=b", "x-foo, x-bar", ",x-foo", "permessage-deflate", "x-foo;", "x foo",
+           "x-foo; a=\"b\r\n\"", "x-foo; a=b=c", ";x"}) {
+    HookLog log;
+    log.reply = text;
+    GHTTP_WsServerOptions o = server_options();
+    o.extension_fn = hook;
+    o.extension_ctx = &log;
+    Served s(plus(rfc_fields(), "Sec-WebSocket-Extensions", "x-foo"), &o);
+    EXPECT_EQ(s.rc, GHTTP_ERR_INVALID) << text;
+  }
+  // A reply that is one is sent as written.
+  HookLog good;
+  good.reply = "x-foo; level=\"2\"; z";
+  GHTTP_WsServerOptions o = server_options();
+  o.extension_fn = hook;
+  o.extension_ctx = &good;
+  Served s(plus(rfc_fields(), "Sec-WebSocket-Extensions", "x-foo"), &o);
+  EXPECT_EQ(s.header("Sec-WebSocket-Extensions"), "x-foo; level=\"2\"; z");
+}
+
+TEST(WsExtensionNegotiation, AnExtensionOfferedTwiceIsChosenOnce) {
+  HookLog log;
+  GHTTP_WsServerOptions o = server_options();
+  o.extension_fn = hook;
+  o.extension_ctx = &log;
+  Served s(plus(rfc_fields(), "Sec-WebSocket-Extensions", "x-foo; a=1, X-Foo; a=2"), &o);
+  EXPECT_EQ(s.header("Sec-WebSocket-Extensions"), "x-foo; level=2");
+}
+
+TEST(WsServerHandshake, TheOriginIsHandedOverParsedForTheCallersPolicy) {
+  Served with_origin(rfc_fields());
+  ASSERT_TRUE(with_origin.result.accepted);
+  EXPECT_TRUE(with_origin.result.has_origin);
+  EXPECT_EQ(std::string(with_origin.result.origin, with_origin.result.origin_len), "http://example.com");
+  Served padded(with(rfc_fields(), "Origin", "  http://a.example  "));
+  EXPECT_EQ(std::string(padded.result.origin, padded.result.origin_len), "http://a.example");
+  Served none(without(rfc_fields(), "Origin"));
+  ASSERT_TRUE(none.result.accepted);
+  EXPECT_FALSE(none.result.has_origin);
+  EXPECT_EQ(none.result.origin_len, 0u);
+}
+
+TEST(WsServerHandshake, OptionsThatCannotWorkAreInvalid) {
+  Request req(rfc_fields());
+  GHTTP_Response * resp = nullptr;
+  ASSERT_EQ(ghttp_response_create(nullptr, &resp), GHTTP_OK);
+  GHTTP_WsServerResult r;
+  auto call = [&](const GHTTP_WsServerOptions & o) { return ghttp_ws_server_handshake(req.r, &o, resp, &r); };
+  GHTTP_WsServerOptions o = server_options();
+  o.subprotocol_count = 2;  // with no array
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  const char * with_null[] = {"chat", nullptr};
+  o.subprotocols = with_null;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  const char * with_empty[] = {"chat", ""};
+  o.subprotocols = with_empty;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  const char * with_space[] = {"chat", "a b"};
+  o.subprotocols = with_space;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  o = server_options();
+  o.deflate.server_max_window_bits = 7;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  o = server_options();
+  o.deflate.client_max_window_bits = 16;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  GHTTP_WsLimits l;
+  ghttp_ws_limits_default(&l);
+  l.max_handshake_bytes = 0;
+  o = server_options();
+  o.limits = &l;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  ghttp_ws_limits_default(&l);
+  l.max_frame_payload = l.max_message_bytes + 1;
+  EXPECT_EQ(call(o), GHTTP_ERR_INVALID);
+  ghttp_response_destroy(resp);
 }
 
 // ---- The parameters on their own -------------------------------------------------
@@ -735,6 +826,41 @@ TEST(WsClientHandshake, TheRequestOffersExtensionsAsAskedAndAHostIsRequired) {
   badproto.subprotocol_count = 1;
   Client bad2(badproto);
   EXPECT_EQ(bad2.rc, GHTTP_ERR_INVALID);
+}
+
+TEST(WsClientHandshake, OptionsThatCannotWorkAreInvalid) {
+  GHTTP_WsClientOptions o = client_options();
+  const char * empty[] = {""};
+  o.subprotocols = empty;
+  o.subprotocol_count = 1;
+  EXPECT_EQ(Client(o).rc, GHTTP_ERR_INVALID);
+  const char * with_null[] = {nullptr};
+  o.subprotocols = with_null;
+  EXPECT_EQ(Client(o).rc, GHTTP_ERR_INVALID);
+  o = client_options();
+  o.deflate.client_max_window_bits = 7;
+  EXPECT_EQ(Client(o).rc, GHTTP_ERR_INVALID);
+  o = client_options();
+  GHTTP_WsLimits l;
+  ghttp_ws_limits_default(&l);
+  l.max_extension_params = 0;
+  o.limits = &l;
+  EXPECT_EQ(Client(o).rc, GHTTP_ERR_INVALID);
+}
+
+TEST(WsClientHandshake, AServerNamingTheSameExtensionTwiceIsRefused) {
+  HookLog log;
+  GHTTP_WsClientOptions o = client_options();
+  const char * ext[] = {"x-foo"};
+  o.extensions = ext;
+  o.extension_count = 1;
+  o.extension_fn = hook;
+  o.extension_ctx = &log;
+  Client c(o);
+  EXPECT_TRUE(finish(c, plus(good_response(), "Sec-WebSocket-Extensions", "x-foo")).accepted);
+  GHTTP_WsClientResult r = finish(c, plus(good_response(), "Sec-WebSocket-Extensions", "x-foo; a=1, X-Foo; a=2"));
+  EXPECT_FALSE(r.accepted);
+  EXPECT_STREQ(r.reason, "an extension was chosen twice");
 }
 
 TEST(WsClientHandshake, TheRfcResponseIsAcceptedAndNothingIsNegotiated) {

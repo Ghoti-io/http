@@ -310,6 +310,9 @@ public:
         we.fragments = e.fragments;
         we.rsv = e.rsv;
         run.events.push_back(we);
+        // The documented loop takes the output after every event, and a Pong
+        // not yet taken is replaced by the next Ping's, so take it here.
+        run.output += take_output();
       }
       off += n;
     } while (off < bytes.size());
@@ -332,7 +335,7 @@ public:
   std::vector<WsFrame> take_frames() { return ws_parse_frames(take_output()); }
 
 private:
-  void take_output(WsRun & run) { run.output = take_output(); }
+  void take_output(WsRun & run) { run.output += take_output(); }
 
   GHTTP_WsRole role_;
   GHTTP_WsConn * conn_ = nullptr;

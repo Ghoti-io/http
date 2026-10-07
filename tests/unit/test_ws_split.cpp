@@ -98,7 +98,6 @@ TEST(WsSplit, EachKindOfBadStreamGivesTheSameAnswerCutAnywhere) {
       {"close one octet", wsf(8, "\x01")},
       {"close bad code", close_frame(1005)},
       {"close bad reason", close_frame(1000, "\xff")},
-      {"after close", close_frame(1000) + text("x")},
       {"non-minimal length", wsf(2, std::string(5, 'x'), true, true, 0, 0x01020304, 16)},
       {"length top bit", std::string("\x82\xff\x80\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04", 14)},
   };

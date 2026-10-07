@@ -295,7 +295,7 @@ plant_lib ws-utf8-not-carried-across-fragments src/http/ws_conn.c \
   '  ghttp_ws_utf8_init(&c->utf8);
   c->msg_frames++;
   if (c->msg_compressed) {' \
-  'have no rule'
+  'tag=gen:split-frame@utf8.text.frame'
 
 plant_lib ws-allow-fragmented-control-frame src/http/ws_frame.c \
   '  if (ghttp_ws_opcode_is_control(opcode) && !fin) {
@@ -304,22 +304,22 @@ plant_lib ws-allow-fragmented-control-frame src/http/ws_frame.c \
   '  if (ghttp_ws_opcode_is_control(opcode) && !fin && 0) {
     return GHTTP_ERR_CORRUPT;
   }' \
-  'have no rule'
+  'tag=gen:fin@control.ping.b0'
 
 plant_lib ws-allow-reserved-bit-without-extension src/http/ws_conn.c \
   '  if (bits & ~allowed) {' \
   '  if ((bits & ~allowed) && 0) {' \
-  'have no rule'
+  'tag=gen:rsv@control.ping.b0'
 
 plant_harness ws-rule-deleted tools/oracle/known-ws-disagreements.tsv \
   'rfc6455-4.2.1:extension-offer-very-long	*	400/101	ref-limit	' \
   '# rfc6455-4.2.1:extension-offer-very-long	*	400/101	ref-limit	' \
-  'have no rule'
+  'tag=rfc6455-4.2.1:extension-offer-very-long'
 
 plant_harness ws-comparator-blind-to-payloads tools/oracle/diff_ws.py \
   '    evs = tuple((k, hx(d), c) for k, d, c in res["evs"])' \
   '    evs = tuple((k, b"", c) for k, d, c in res["evs"])' \
-  'explains nothing\|did not'
+  'this library did not read a good stream as a server'
 
 plant_harness ws-reference-answers-nothing tools/oracle/diff_ws.py \
   '    return parse_answers(name, done.stdout, want_count(cases, name))
@@ -335,7 +335,7 @@ plant_harness ws-reference-answers-nothing tools/oracle/diff_ws.py \
 
 
 # ---- normalising' \
-  'did not'
+  'wsproto did not read a good stream as a server'
 
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-oracle-gate: FAILED\033[0m\n' >&2

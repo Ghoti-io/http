@@ -39,6 +39,7 @@
 #include <ghoti.io/security/sha1.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 // ---------------------------------------------------------------------------
 // Base64 and the key
@@ -276,6 +277,10 @@ static size_t headers_size(const GHTTP_Headers * h) {
   return total;
 }
 
+static bool window_bits_ok(unsigned v) {
+  return v == 0 || (v >= 8 && v <= 15);
+}
+
 /** How many fields have this name. */
 static size_t count_fields(const GHTTP_Headers * h, const char * name) {
   size_t n = 0;
@@ -463,6 +468,45 @@ static bool list_append(char * out, size_t cap, size_t * len, const char * text)
   return true;
 }
 
+/**
+ * Whether @p text is exactly one extension in the grammar of RFC 6455 section
+ * 9.1 (a token, then `; name[=value]` parameters), and not permessage-deflate.
+ */
+static bool reply_text_valid(const char * text, const char ** name_end) {
+  if (!ghttp_is_tchar((unsigned char)text[0])) {
+    return false;
+  }
+  const char * cur = text;
+  const char * end = text + strlen(text);
+  GHTTP_WsExtItem item;
+  if (ghttp_ws_ext_next(&cur, end, GHTTP_WS_HARD_MAX_PARAMS, &item) != GHTTP_WS_EXT_ITEM) {
+    return false;
+  }
+  if (ghttp_ws_ext_next(&cur, end, GHTTP_WS_HARD_MAX_PARAMS, &item) != GHTTP_WS_EXT_END) {
+    return false;
+  }
+  cur = text;
+  (void)ghttp_ws_ext_next(&cur, end, GHTTP_WS_HARD_MAX_PARAMS, &item);
+  if (ghttp_ieq(item.name, item.name_len, GHTTP_WS_PERMESSAGE_DEFLATE)) {
+    return false;
+  }
+  *name_end = item.name + item.name_len;
+  return true;
+}
+
+/** Whether the list built so far already names the extension that starts @p name. */
+static bool name_chosen(const char * list, size_t list_len, const char * name, size_t n) {
+  const char * cur = list;
+  const char * end = list + list_len;
+  GHTTP_WsExtItem item;
+  while (ghttp_ws_ext_next(&cur, end, GHTTP_WS_HARD_MAX_PARAMS, &item) == GHTTP_WS_EXT_ITEM) {
+    if (item.name_len == n && strncasecmp(item.name, name, n) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     const GHTTP_WsServerOptions * options, GHTTP_Response * response,
     GHTTP_WsServerResult * result) {
@@ -482,6 +526,17 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
   if (ghttp_ws_limits_resolve(options->limits, &resolved) != GHTTP_OK) {
     return GHTTP_ERR_INVALID;
   }
+  if ((options->subprotocol_count > 0 && !options->subprotocols)
+      || !window_bits_ok(options->deflate.server_max_window_bits)
+      || !window_bits_ok(options->deflate.client_max_window_bits)) {
+    return GHTTP_ERR_INVALID;
+  }
+  for (size_t i = 0; i < options->subprotocol_count; i++) {
+    const char * sp = options->subprotocols[i];
+    if (!sp || !ghttp_is_token(sp, strlen(sp)) || strlen(sp) > GHTTP_WS_MAX_SUBPROTOCOL) {
+      return GHTTP_ERR_INVALID;
+    }
+  }
   const GHTTP_WsLimits * limits = &resolved;
   const GHTTP_Headers * h = ghttp_request_headers_const(request);
 
@@ -496,6 +551,12 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
   if (ghttp_request_version(request) != 1) {
     return refuse(response, result, 400, "Bad Request",
         "HTTP/1.1 or later is required");
+  }
+  const char * host;
+  size_t host_len;
+  if (!single_field(h, "host", &host, &host_len)) {
+    return refuse(response, result, 400, "Bad Request",
+        "Host is missing or repeated");  // RFC 6455 section 4.2.1 item 1
   }
   if (!ghttp_headers_list_has(h, "upgrade", "websocket")) {
     return refuse(response, result, 400, "Bad Request",
@@ -522,6 +583,16 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
       || !ghttp_ws_key_is_valid(key, key_len)) {
     return refuse(response, result, 400, "Bad Request",
         "Sec-WebSocket-Key is missing, repeated or not sixteen octets of base64");
+  }
+
+  // Origin is the caller's to judge (cross-site WebSocket hijacking, RFC 6455
+  // section 10.2); it is handed over parsed, and at most one is accepted.
+  if (count_fields(h, "origin") > 1) {
+    return refuse(response, result, 400, "Bad Request", "Origin is repeated");
+  }
+  if (single_field(h, "origin", &result->origin, &result->origin_len)) {
+    ghttp_trim_ows(&result->origin, &result->origin_len);
+    result->has_origin = 1;
   }
 
   // Subprotocol: the first the server serves, in its own order, that the
@@ -579,8 +650,13 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
         return refuse(response, result, 400, "Bad Request",
             "more extension offers than the limit");
       }
-      if (options->enable_deflate && !result->negotiated.deflate
-          && ghttp_ieq(item.name, item.name_len, GHTTP_WS_PERMESSAGE_DEFLATE)) {
+      if (ghttp_ieq(item.name, item.name_len, GHTTP_WS_PERMESSAGE_DEFLATE)) {
+        // The built-in's name is dispatched first and never leaves it: a second
+        // offer, or one while deflate is disabled, is skipped here and does not
+        // reach the hook.
+        if (!options->enable_deflate || result->negotiated.deflate) {
+          continue;
+        }
         GHTTP_WsDeflateParams agreed;
         int accepted = 0;
         GHTTP_Result r = ghttp_ws_deflate_server_negotiate(item.params,
@@ -620,11 +696,21 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
       }
       reply.text[sizeof(reply.text) - 1] = '\0';
       uint8_t rsv = (uint8_t)(reply.rsv & (GHTTP_WS_RSV2 | GHTTP_WS_RSV3));
-      // Two extensions may not use the same bit (RFC 6455 section 5.2).
-      if (reply.accept && reply.text[0] != '\0'
-          && (rsv & result->negotiated.extension_rsv) == 0
-          && list_append(ext_text, sizeof(ext_text), &ext_len, reply.text)) {
-        result->negotiated.extension_rsv |= rsv;
+      if (reply.accept) {
+        // What goes into a header field must be one extension: a token and
+        // parameters, nothing a header could be split with, and not the
+        // built-in's own name.
+        const char * name_end = NULL;
+        if (!reply_text_valid(reply.text, &name_end)) {
+          return GHTTP_ERR_INVALID;
+        }
+        // Two extensions may not use the same bit (RFC 6455 section 5.2), and an
+        // extension is chosen once.
+        if ((rsv & result->negotiated.extension_rsv) == 0
+            && !name_chosen(ext_text, ext_len, reply.text, (size_t)(name_end - reply.text))
+            && list_append(ext_text, sizeof(ext_text), &ext_len, reply.text)) {
+          result->negotiated.extension_rsv |= rsv;
+        }
       }
     }
   }
@@ -721,8 +807,13 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
   if (!allocator) {
     allocator = ghttp_allocator_default();
   }
+  if (!window_bits_ok(options->deflate.server_max_window_bits)
+      || !window_bits_ok(options->deflate.client_max_window_bits)) {
+    return GHTTP_ERR_INVALID;
+  }
   for (size_t i = 0; i < options->subprotocol_count; i++) {
     const char * p = options->subprotocols[i];
+    // An empty name is not a token; it would be a list element with nothing in it.
     if (!p || !ghttp_is_token(p, strlen(p)) || strlen(p) > GHTTP_WS_MAX_SUBPROTOCOL) {
       return GHTTP_ERR_INVALID;
     }
@@ -957,6 +1048,8 @@ GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs
   // Extensions: only ones that were offered, with parameters the offer allows.
   size_t i = 0;
   size_t chosen = 0;
+  const char * seen_name[GHTTP_WS_HARD_MAX_OFFERS];
+  size_t seen_len[GHTTP_WS_HARD_MAX_OFFERS];
   while ((i = ghttp_headers_find(h, "sec-websocket-extensions", i)) != GHTTP_HEADERS_NPOS) {
     GHTTP_Field f;
     if (ghttp_headers_at(h, i, &f) != GHTTP_OK) {
@@ -977,6 +1070,15 @@ GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs
       if (++chosen > hs->limits.max_extension_offers || chosen > GHTTP_WS_HARD_MAX_OFFERS) {
         return reject(result, "more extensions than the limit");
       }
+      // An extension is chosen once (RFC 6455 section 9.1: the response lists
+      // the extensions in use, and using one twice has no meaning).
+      for (size_t k = 0; k + 1 < chosen; k++) {
+        if (seen_len[k] == item.name_len && strncasecmp(seen_name[k], item.name, item.name_len) == 0) {
+          return reject(result, "an extension was chosen twice");
+        }
+      }
+      seen_name[chosen - 1] = item.name;
+      seen_len[chosen - 1] = item.name_len;
       if (hs->offered_deflate
           && ghttp_ieq(item.name, item.name_len, GHTTP_WS_PERMESSAGE_DEFLATE)) {
         if (result->negotiated.deflate) {

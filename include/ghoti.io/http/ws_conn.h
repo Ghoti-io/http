@@ -81,8 +81,19 @@
  * GHTTP_WS_EVENT_CLOSE and answered with a Close that has been queued; a
  * Close this endpoint starts with ghttp_ws_conn_close() waits for the peer's.
  * When both have gone the state is GHTTP_WS_STATE_CLOSED and the server closes
- * the transport (section 7.1.1). Anything the peer sends after its Close is a
- * protocol error with no further output.
+ * the transport (section 7.1.1). The peer's Close is the end of what it may say:
+ * whatever follows it, in the same read or a later one, is **left unread**
+ * (`consumed` stays 0, no event, no error), so a closure that completed stays
+ * clean; a caller that wants to know sees that it was not all consumed.
+ *
+ * ### Pongs
+ *
+ * A Pong answers the most recent Ping (RFC 6455 section 5.5.3 allows it): when
+ * a Ping arrives while the Pong for an earlier one has not yet begun to be
+ * written, that Pong is replaced, so a peer that Pings faster than the output
+ * is taken cannot fill the queue with Pongs. Every Ping is still reported. A
+ * caller that takes the output after every event, as the loop above does, sees
+ * one Pong per Ping.
  *
  * ### Extension seams
  *
@@ -220,7 +231,10 @@ GHTTP_API GHTTP_Result ghttp_ws_conn_feed(GHTTP_WsConn * conn, const void * data
 /**
  * The input has ended. GHTTP_OK if the closing handshake completed;
  * GHTTP_ERR_CORRUPT otherwise: the transport was closed without it (close
- * code 1006, which is never sent). Queues nothing.
+ * code 1006, which is never sent). Queues nothing. It does not say whether the
+ * connection was still open or had failed: both are abnormal ends; ask
+ * ghttp_ws_conn_state() (GHTTP_WS_STATE_FAILED, or OPEN or CLOSING) and
+ * ghttp_ws_conn_error() for which.
  */
 GHTTP_API GHTTP_Result ghttp_ws_conn_finish(const GHTTP_WsConn * conn);
 
