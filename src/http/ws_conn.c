@@ -423,7 +423,13 @@ static GHTTP_Result on_header(GHTTP_WsConn * c) {
     c->ctl_len = 0;
     return GHTTP_OK;
   }
-  if (fh->payload_len > c->limits.max_frame_payload) {
+  // A compressed frame may be the extension's overhead larger than the message
+  // it carries, so its limit is allowed the same slack as a compressed message.
+  bool frame_compressed = fh->opcode == GHTTP_WS_OP_CONTINUATION
+      ? c->in_message && c->msg_compressed : fh->rsv1 != 0;
+  uint64_t frame_cap = frame_compressed ? wire_cap(c->limits.max_frame_payload)
+                                        : c->limits.max_frame_payload;
+  if (fh->payload_len > frame_cap) {
     return fail(c, GHTTP_ERR_LIMIT, GHTTP_WS_CLOSE_MESSAGE_TOO_BIG,
         "a frame is larger than the limit");
   }

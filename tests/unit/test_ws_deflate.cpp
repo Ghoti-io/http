@@ -138,6 +138,33 @@ TEST(WsDeflate, ABlockWithBfinalSetIsReadAndTheNextMessageStartsAfresh) {
   EXPECT_EQ(r.result, GHTTP_OK);
 }
 
+TEST(WsDeflate, TheRfcsFinalBlockFollowedByItsPaddingOctetIsRead) {
+  // Section 7.2.3.4 gives f3 48 cd c9 c9 07 00 00: the octet after the final
+  // block is the empty stored block the receiver's appended trailer completes.
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated();
+  WsSide s(GHTTP_WS_SERVER, nullptr, &neg);
+  WsRun r = s.feed(wsf(1, bytes({0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00}), true, true, 4));
+  EXPECT_EQ(r.events, (Events{ev_text("Hello", 1, true)}));
+  EXPECT_EQ(r.result, GHTTP_OK);
+  WsSide t(GHTTP_WS_SERVER, nullptr, &neg);
+  WsRun q = t.feed(wsf(1, bytes({0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x01}), true, true, 4));
+  EXPECT_EQ(q.code, 1007);
+}
+
+TEST(WsDeflate, AnIncompressibleMessageOfTheMessageLimitFitsAFrameOfTheFrameLimit) {
+  // Compressed, it is a little larger than the limit both are set to.
+  GHTTP_WsLimits l = limits();
+  l.max_message_bytes = 100000;
+  l.max_frame_payload = 100000;
+  GHTTP_WsNegotiated neg = ws_deflate_negotiated();
+  WsPair p(&neg, &l);
+  std::string msg = ws_random_bytes(100000);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.client.get(), GHTTP_WS_MESSAGE_BINARY, msg.data(), msg.size()), GHTTP_OK);
+  p.pump();
+  ASSERT_EQ(p.server_events.size(), 1u);
+  EXPECT_EQ(p.server_result, GHTTP_OK);
+}
+
 TEST(WsDeflate, ADataFrameAfterAFinalBlockInTheSameMessageIsAnError) {
   GHTTP_WsNegotiated neg = ws_deflate_negotiated();
   std::string final_block = bytes({0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00});

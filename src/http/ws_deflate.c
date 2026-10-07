@@ -441,6 +441,7 @@ GHTTP_Result ghttp_ws_deflate_compress(GHTTP_WsDeflate * d, const void * in,
 void ghttp_ws_inflate_begin(GHTTP_WsDeflate * d) {
   d->in_total = 0;
   d->out_total = 0;
+  d->stream_done = false;
 }
 
 /** The most output the message may have had by now, whatever has been fed. */
@@ -497,7 +498,14 @@ static GHTTP_Result inflate_piece(GHTTP_WsDeflate * d, const uint8_t * in,
     // The decompressor stopped taking input with some left and nothing to
     // give: the stream ended in a final block, and this is what follows it.
     d->stream_done = true;
-    return GHTTP_ERR_CORRUPT;
+    // Zero octets are accepted: RFC 7692 section 7.2.3.4's own example has the
+    // octet of the empty stored block that the appended trailer completes,
+    // after a block whose BFINAL was set.
+    for (size_t i = src.used; i < src.size; i++) {
+      if (in[i] != 0) {
+        return GHTTP_ERR_CORRUPT;
+      }
+    }
   }
   return GHTTP_OK;
 }

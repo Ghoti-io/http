@@ -46,8 +46,9 @@ negotiates it, `ws_conn.h` runs it with the deflate encoder and decoder of the
 - A message whose last block has BFINAL set is accepted (section 7.2.3.4).
   The decompressor's stream is then over, so it starts afresh, **which ends
   context takeover for the next message even when it was negotiated**: this
-  codec does not carry history across a final block. Compressed data after a
-  final block in the same message is an error.
+  codec does not carry history across a final block. Octets after a final
+  block are accepted if they are all zero (section 7.2.3.4's example has one);
+  anything else after it is an error.
 - Context takeover is held to the agreement. With `*_no_context_takeover` the
   named side's compressor and the other side's decompressor start every message
   empty, so a peer that references the previous message when it was told not to
