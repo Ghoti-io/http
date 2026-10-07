@@ -1,0 +1,152 @@
+# Disagreements with the WebSocket references that are understood, and why.
+#
+# Five tab-separated fields: a case tag (a glob, `|` separating alternatives),
+# a reference (a glob, `|` too: wsproto, websockets, gows), the kind of
+# difference (a glob), a class (diff_ws.py CLASSES) and a sentence. The first
+# match wins. A disagreement that matches no rule fails the run, and so does a
+# rule that matches nothing. A note that begins [check:NAME] makes a claim the
+# run then CHECKS against the cases the rule explains (diff_ws.py says which).
+#
+# The kind of difference is
+#   ws, wc   "<ours>/<ref>[+evs:<parts>][+pongs]" where each end is how the
+#            connection ended, `open` (the input ended), `closed` (a Close was
+#            received and answered) or `failed` (ended for a violation), with
+#            `:<code>` for the close code that side sent (`empty` for a Close
+#            with no body); `+evs:count|kind,data,code` says the messages
+#            delivered differ; `split` is a reference that answers differently
+#            whole and one octet at a time;
+#   hs       "<our status>/<their status>[+accept,protocol,ext]";
+#   hc       "accepted|refused/accepted|refused[+protocol,deflate]";
+#   wr       "wr:<end>[+evs:<parts>]" for a script this library wrote and the
+#            reference read back differently.
+#
+# MUST, SHOULD and MAY in the notes are RFC 6455's or RFC 7692's own.
+#
+# Three kinds of disagreement are NOT written here, because diff_ws.py classifies
+# and CHECKS them itself (its docstring and the summary it prints say how): both
+# sides end the connection after delivering the same messages and only the close
+# code differs (`code`); both end it and one had delivered more (`timing`); one
+# side was still waiting when the stream stopped inside a frame or a message and
+# ends the connection too once the stream is completed (`timing`); this library
+# failed the connection for what FOLLOWS a Close the reference had answered, and
+# cut after that Close it agrees (`policy`); a reference answers differently
+# whole and in single octets, and in single octets as this library does
+# (`ref-split`).
+#
+# A rule for a generated case (`gen:`) speaks for a family of single mutations
+# of one valid stream, each of which makes it invalid in one way; the families
+# were checked by listing the cases behind each rule (diff_ws.py --rules N).
+
+# ==== hs: this library as a server, against each reference's handshake =====================
+
+# ---- the HTTP request line, and the HTTP layer under the handshake -------------------------
+rfc6455-4.2.1:http-1.0	wsproto|gows	400/101	ref-lenient	section 4.2.1 item 1: an HTTP/1.1 or higher request; the reference serves an HTTP/1.0 one
+rfc6455-4.2.1:http-1.0	websockets	400/505	code	section 4.2.1: an HTTP/1.1 or higher request, so HTTP/1.0 is refused by both; websockets answers 505 and this library 400
+rfc6455-4.2.1:http-1.2|rfc6455-4.2.1:http-2.0	wsproto|gows	400/101	policy	"HTTP/1.1 or higher" would include these, but this library's HTTP/1 parser accepts only 1.0 and 1.1 (documentation/rfc9112.md) and a request line that says another version is not read
+rfc6455-4.2.1:target-star	*	400/101	policy	section 4.2.1 item 1 wants a resource name; "*" is not one, and this library's parser takes it only for OPTIONS (documentation/rfc9112.md)
+rfc6455-4.2.1:bare-lf-line-ends|rfc6455-4.2.1:obs-fold-in-key|rfc6455-4.2.1:content-length-and-te	wsproto|gows	400/101	policy	this library's HTTP parser refuses a bare LF, an obsolete line fold and Content-Length with Transfer-Encoding (documentation/rfc9112.md); the reference's HTTP layer reads them
+rfc6455-4.2.1:blank-lines-first	*	101/400	ref-strict	RFC 9112 section 2.2: a server SHOULD ignore at least one empty line before the request line; the reference refuses it
+rfc6455-4.2.1:body-with-content-length|rfc6455-4.2.1:chunked-body	websockets	101/400	ref-model	a request with a body: this library's handshake serves the request head and the bytes after it are the connection's; websockets' parser refuses a request with a body
+rfc6455-4.2.1:method-*	wsproto	405/400	code	section 4.2.1 item 1: the request MUST be a GET; both refuse, this library with 405 and wsproto with 400
+rfc6455-4.2.1:method-CONNECT	websockets|gows	400/405	code	both refuse a CONNECT request; this library's parser refuses its form (400) and the reference answers 405
+rfc6455-4.2.1:head-*	wsproto|gows	400/101	ref-limit	this library caps a request at 8 KiB of header names and values (GHTTP_WS_DEFAULT_MAX_HANDSHAKE_BYTES, and its HTTP parser's own cap): the reference has no such cap
+rfc6455-4.2.1:head-*	websockets	400/431	code	both refuse a head over their cap; this library's HTTP parser says 400 where its handshake would say 431, and websockets says 431
+rfc6455-4.2.1:extension-offer-very-long	*	400/101	ref-limit	an extension offer of 500 parameters is over this library's cap on parameters and on the size of the head; the reference serves it
+# ---- Host, Upgrade, Connection ---------------------------------------------------------------
+rfc6455-4.2.1:host-missing	websockets|gows	400/101	ref-model	section 4.2.1 item 2: a Host header; websockets documents that the HTTP stack checks Host and Go's net/http server does (not the Upgrader)
+rfc6455-4.2.1:host-twice	websockets	400/101	ref-model	two Host fields: refused here, a check of the HTTP stack in websockets (documented in process_request)
+rfc6455-4.2.1:upgrade-websocket-list|rfc6455-4.2.1:upgrade-list-first-other|rfc6455-4.2.1:upgrade-twice|rfc6455-4.2.1:upgrade-twice-different	wsproto	101/400	ref-strict	item 3: an Upgrade field "containing the value websocket" and RFC 9110 section 7.8 makes Upgrade a list; a list that includes websocket is served here and refused by wsproto, which compares the whole value
+rfc6455-4.2.1:upgrade-websocket-list|rfc6455-4.2.1:upgrade-list-first-other|rfc6455-4.2.1:upgrade-twice|rfc6455-4.2.1:upgrade-twice-different	websockets	101/426	ref-strict	as above: websockets insists on exactly one protocol in Upgrade
+rfc6455-4.2.1:upgrade-missing|rfc6455-4.2.1:upgrade-h2c|rfc6455-4.2.1:upgrade-websocket2|rfc6455-4.2.1:upgrade-websockets|rfc6455-4.2.1:upgrade-version-suffix|rfc6455-4.2.1:connection-missing|rfc6455-4.2.1:connection-close|rfc6455-4.2.1:connection-keep-alive|rfc6455-4.2.1:connection-upgradee	websockets	400/426	code	both refuse a request that is not an upgrade to websocket; this library says 400 and websockets 426 Upgrade Required
+rfc6455-4.2.1:connection-twice-upgrade-first	wsproto	101/400	ref-strict	two Connection fields, one of which has the token Upgrade: the field values are one list (RFC 9110 section 5.3) and this library finds the token; wsproto reads the last one only
+# ---- Sec-WebSocket-Key and -Version -----------------------------------------------------------
+rfc6455-4.2.1:key-empty|rfc6455-4.2.1:key-*-chars|rfc6455-4.2.1:key-22-chars-no-padding|rfc6455-4.2.1:key-*-octets|rfc6455-4.2.1:key-non-base64|rfc6455-4.2.1:key-url-safe-alphabet|rfc6455-4.2.1:key-space-inside|rfc6455-4.2.1:key-padding-mid|rfc6455-4.2.1:key-1-padding-char	wsproto	400/101	ref-lenient	item 5: the key is base64 that decodes to 16 octets and a violation of the grammar MUST be refused; wsproto checks that a key is present, and accepts anything
+rfc6455-4.2.1:key-padding-bits-set|rfc6455-4.2.1:key-lowercase-version	*	400/101	policy	a base64 key whose last character carries padding bits that are not zero decodes to 16 octets in a lenient decoder; this library takes the canonical form only (ws_handshake.h: ghttp_ws_key_is_valid) and none of the three references does
+rfc6455-4.2.1:key-twice|rfc6455-4.2.1:key-twice-different	wsproto|gows	400/101	ref-lenient	two Sec-WebSocket-Key fields are one invalid list value (RFC 9110 section 5.3); wsproto takes the last and gorilla the first
+rfc6455-4.2.1:version-twice-same|rfc6455-4.2.1:version-twice-different	wsproto|gows	400/101	ref-lenient	two Sec-WebSocket-Version fields are one list value that is not "13"; the reference reads one of them
+rfc6455-4.2.1:version-twice-different	wsproto	400/426	code	both refuse; wsproto answers 426 because the last field it read says 8
+rfc6455-4.2.1:version-0|rfc6455-4.2.1:version-12|rfc6455-4.2.1:version-14|rfc6455-4.2.1:version-8|rfc6455-4.2.1:version-013|rfc6455-4.2.1:version-13.0|rfc6455-4.2.1:version-13-with-space-inside|rfc6455-4.2.1:version-x|rfc6455-4.2.1:version-empty	websockets|gows|wsproto	426/400	code	section 4.4: a version the server does not speak is answered with an error such as 426 and a Sec-WebSocket-Version field; this library says 426, the reference 400 (gorilla and websockets), or the reverse for wsproto's empty value
+rfc6455-4.2.1:version-13-list-8|rfc6455-4.2.1:version-8-list-13	websockets	426/400	code	a version list is not "13": both refuse, with 426 and 400
+rfc6455-4.2.1:version-13-list-8|rfc6455-4.2.1:version-8-list-13	gows	426/101	ref-lenient	"13, 8" is not the value 13; gorilla looks for the token 13 in the list and serves it
+# ---- Sec-WebSocket-Protocol -------------------------------------------------------------------
+rfc6455-4.2.1:protocol-offered-name-200-not-served|rfc6455-4.2.1:protocol-case-differs|rfc6455-4.2.1:protocol-empty-value|rfc6455-4.2.1:protocol-no-match|rfc6455-4.2.1:protocol-none-offered-chat-served	websockets	101/400	choice	section 4.2.2 item 5.2: the server MAY choose a subprotocol; with none in common this library serves the request without one (section 1.9: the application decides), websockets answers 400
+rfc6455-4.2.1:protocol-space-in-token|rfc6455-4.2.1:protocol-non-token-char|rfc6455-4.2.1:protocol-quoted	wsproto|gows	400/101	ref-lenient	a subprotocol is a token (section 4.1 item 10 and 11.3.4) and a violation of the grammar MUST be refused; the reference accepts it
+rfc6455-4.2.1:protocol-two-fields	gows	101/101+protocol	choice	two Sec-WebSocket-Protocol fields are one list: this library takes the first of its own subprotocols found in either field, gorilla looks at the first field only
+# ==== hs: permessage-deflate negotiation ====================================================
+rfc6455-4.2.1:extensions-*	gows	101/101+ext	ref-model	gorilla/websocket supports permessage-deflate without context takeover only and answers every offer it takes with both server_no_context_takeover and client_no_context_takeover and no window bits, whatever the offer or its own configuration said; this library answers with the parameters RFC 7692 section 7.1 describes
+rfc6455-4.2.1:full-chat-deflate	gows	101/101+ext	ref-model	as above
+
+# wsproto negotiates with its own PerMessageDeflate.accept, one offer after another on one object
+rfc6455-4.2.1:extensions-offer-smb-valueless|rfc6455-4.2.1:extensions-offer-smb-leading-zero|rfc6455-4.2.1:extensions-offer-smb-plus|rfc6455-4.2.1:extensions-offer-snct-with-value|rfc6455-4.2.1:extensions-offer-cnct-with-value|rfc6455-4.2.1:extensions-offer-snct-twice|rfc6455-4.2.1:extensions-offer-cnct-twice|rfc6455-4.2.1:extensions-offer-smb-twice|rfc6455-4.2.1:extensions-offer-cmb-twice|rfc6455-4.2.1:extensions-offer-unknown-param|rfc6455-4.2.1:extensions-offer-unknown-param-valueless|rfc6455-4.2.1:extensions-offer-unknown-param-after-valid	wsproto	101/101+ext	ref-lenient	RFC 7692 section 7: a server MUST decline an offer with an unknown parameter, a parameter with an invalid value (a window with no value, a leading zero or a sign, a value on a flag) or a parameter repeated; wsproto accepts such an offer and answers it
+rfc6455-4.2.1:extensions-offer-smb-abc|rfc6455-4.2.1:extensions-offer-smb-decimal|rfc6455-4.2.1:extensions-offer-smb-quoted|rfc6455-4.2.1:extensions-offer-smb-quoted-bad|rfc6455-4.2.1:extensions-offer-smb-empty	wsproto	101/500|400/500	ref-bug	wsproto's PerMessageDeflate.accept calls int() on the window value and raises ValueError out of the handshake for a value that is not a number, which a server answers with an error of its own (500); RFC 7692 says to decline the offer
+rfc6455-4.2.1:extensions-offer-smb-8|rfc6455-4.2.1:extensions-offer-cmb-8	wsproto|websockets	101/101+ext	ref-model	a window of 8 bits: this library agrees to it (RFC 7692 allows 8 to 15); zlib cannot compress with a window of 8, so wsproto declines the offer and websockets declines a server_max_window_bits of 8 (and takes client_max_window_bits=8 only as 9)
+rfc6455-4.2.1:extensions-offer-param-case|rfc6455-4.2.1:extensions-offer-name-case|rfc6455-4.2.1:extensions-offer-name-upper	*	101/101+ext	choice	RFC 6455 section 9.1 does not say whether extension and parameter names are case-sensitive; this library compares them without regard to case (they are HTTP tokens) and the references do not
+rfc6455-4.2.1:extensions-offer-trailing-semicolon|rfc6455-4.2.1:extensions-offer-double-semicolon|rfc6455-4.2.1:extensions-offer-param-empty-name	wsproto|gows	400/101	ref-lenient	a Sec-WebSocket-Extensions value that breaks the ABNF of section 9.1 MUST be refused (4.2.1); wsproto reads past it
+rfc6455-4.2.1:extensions-offer-name-with-space|rfc6455-4.2.1:extensions-offer-name-token-bad	wsproto|gows	400/101	ref-lenient	an extension name that is not a token breaks the ABNF; wsproto skips an offer it does not know
+rfc6455-4.2.1:extensions-offer-quoted-string-param-with-semicolon	wsproto	101/101+ext	ref-model	a parameter value that is a quoted string with a semicolon in it (valid, section 9.1) on an unknown extension: wsproto accepts the extension this library declines (an unknown parameter)
+rfc6455-4.2.1:extensions-offer-quoted-string-param-with-semicolon|rfc6455-4.2.1:extensions-offer-unknown-with-comma-param	websockets	101/400	ref-bug	websockets' header parser refuses a quoted-string that holds a semicolon or a comma (websockets.headers: "invalid quoted header content"), which RFC 9110 section 5.6.4 and RFC 6455 section 9.1 allow
+rfc6455-4.2.1:extensions-offer-two-offers-different-params	wsproto	101/101+ext	ref-bug	wsproto runs every offer through one PerMessageDeflate object, so the parameters of the first offer stay set when the second is read, and the response carries both (RFC 7692 section 7.1.1: the server answers one offer)
+rfc6455-4.2.1:extensions-offer-empty|rfc6455-4.2.1:extensions-offer-only-comma	websockets	101/400	ref-strict	an empty Sec-WebSocket-Extensions value, or one that is only a comma, is an empty list, which RFC 9110 section 5.6.1.2 tells a recipient to ignore; websockets refuses it
+rfc6455-4.2.1:extensions-offer-many-offers-9|rfc6455-4.2.1:extensions-offer-many-params-9	*	400/101	ref-limit	this library reads at most 8 extension offers and 8 parameters to one (GHTTP_WsLimits); the reference reads as many as there are
+rfc6455-4.2.1:extensions-policy-smb-10-offer-plain|rfc6455-4.2.1:extensions-policy-smb-10-offer-smb-12|rfc6455-4.2.1:extensions-policy-cmb-10-offer-cmb-12|rfc6455-4.2.1:extensions-policy-everything-offer-plain	wsproto	101/101+ext	ref-model	a server's own window and no-context-takeover policy: this library applies it to the response (the limit RFC 7692 7.1.2 lets a server impose), wsproto's PerMessageDeflate echoes the window of the offer and answers no window of its own
+
+# ==== hc: this library as a client, against each reference's check of a response ============
+
+rfc6455-4.2.2:head-300-fields|rfc6455-4.2.2:head-70000-of-extra-field|rfc6455-4.2.2:extension-answer-very-long	wsproto|gows	refused/accepted	ref-limit	this library caps a response head at 8 KiB of header names and values and its parser caps the number of fields; the reference has no such cap
+rfc6455-4.2.2:lf-line-ends|rfc6455-4.2.2:http-1.2-101|rfc6455-4.2.2:http-2.0-101	wsproto|gows	refused/accepted	policy	this library's HTTP parser refuses a bare LF and a version other than 1.0 and 1.1 (documentation/rfc9112.md)
+rfc6455-4.2.2:status-101	wsproto|gows	refused/accepted	ref-lenient	a status line with no space after the code ("HTTP/1.1 101") breaks RFC 9112 section 4; the reference reads it as a 101
+rfc6455-4.2.2:accept-twice-same|rfc6455-4.2.2:accept-twice-different|rfc6455-4.2.2:accept-twice-wrong-first	wsproto|gows	refused/accepted	ref-lenient	two Sec-WebSocket-Accept fields are one list value that is not the accept value (RFC 9110 section 5.3); the reference reads one of them
+rfc6455-4.2.2:protocol-two-fields|rfc6455-4.2.2:protocol-two-fields-different	wsproto|gows	refused/accepted	ref-lenient	section 4.1 step 6: at most one subprotocol; two Sec-WebSocket-Protocol fields name two (or one twice), which the reference accepts
+rfc6455-4.2.2:protocol-case-differs|rfc6455-4.2.2:protocol-none-offered-chosen|rfc6455-4.2.2:protocol-not-offered-chosen|rfc6455-4.2.2:protocol-quoted|rfc6455-4.2.2:protocol-two-chosen-in-one-field	gows	refused/accepted	ref-lenient	section 4.1 step 6: a subprotocol the client did not offer MUST fail the connection (and two in one field, or a quoted one, are not one token); gorilla records whatever the server named
+rfc7692-7.1:offer--:answer-all|rfc7692-7.1:offer--:answer-unknown-extension	gows	refused/accepted	ref-lenient	section 4.1 step 6: an extension the client did not offer MUST fail the connection; a gorilla Dialer that did not enable compression ignores the field
+rfc6455-4.2.2:protocol-trailing-comma	gows	accepted/accepted+protocol	choice	a trailing comma in Sec-WebSocket-Protocol: this library reads it as one subprotocol and an empty element, gorilla keeps the raw value
+rfc6455-4.2.2:protocol-trailing-comma|rfc6455-4.2.2:protocol-empty|rfc7692-7.1:offer-*:answer-empty	wsproto|websockets	accepted/refused	ref-strict	an empty element in a list (a trailing comma, an empty field value) is ignored by a recipient (RFC 9110 section 5.6.1.2); the reference refuses the response
+rfc6455-4.2.2:upgrade-list|rfc6455-4.2.2:upgrade-twice|rfc6455-4.2.2:http-1.0-101	websockets	accepted/refused	ref-strict	an Upgrade field that is a list containing websocket (or two fields), and a 101 sent as HTTP/1.0, are accepted here (section 4.1 asks for the token, and for no version of the response); websockets wants one value and HTTP/1.1
+rfc6455-4.2.2:upgrade-list	wsproto	accepted/refused	ref-strict	as above: wsproto compares the whole Upgrade value
+rfc7692-7.1:offer-*:answer-name-case	wsproto|websockets	accepted/refused	choice	section 9.1 does not say whether an extension name is case-sensitive; this library compares without regard to case
+rfc7692-7.1:offer-*:answer-smb-8|rfc7692-7.1:offer-*:answer-cmb-8	wsproto|websockets	accepted/refused	ref-model	a window of 8 bits is valid (RFC 7692 section 7.1.2); zlib cannot compress with one, wsproto raises when told of it and websockets refuses a client_max_window_bits of 8
+rfc7692-7.1:offer-*:answer-smb-quoted	wsproto	accepted/refused	choice	a quoted-string window value (RFC 6455 section 9.1 allows quoting a parameter value; RFC 7692 writes the value as 1*DIGIT): this library unquotes it, wsproto raises on it
+rfc7692-7.1:offer-cmb-12:answer-cmb-13|rfc7692-7.1:offer-cmb-12:answer-cmb-15|rfc7692-7.1:offer-cmb-8:answer-cmb-9|rfc7692-7.1:offer-cmb-8:answer-cmb-10|rfc7692-7.1:offer-cmb-8:answer-cmb-12|rfc7692-7.1:offer-cmb-8:answer-cmb-13|rfc7692-7.1:offer-cmb-8:answer-cmb-15	wsproto	refused/accepted	policy	a client_max_window_bits in the response larger than the one in the offer: RFC 7692 section 7.1.2.2 says "equal to or smaller" for a server that uses the value, but it is the client's hint and its compressor is bound by what the response says, which it meets; this library refuses it (ws_deflate.h: "a window larger than offered") and does not need to
+rfc7692-7.1:*	wsproto	refused/accepted	ref-lenient	RFC 7692 section 7: a client MUST fail the connection if the response has an unknown parameter, an invalid value (a leading zero, a value on a flag), a repeated parameter, a client_max_window_bits the offer did not carry, or a configuration the client does not support (a response that does not carry an offered server_no_context_takeover or server_max_window_bits, or a window larger than the offer's); wsproto's finalize() reads whatever it is given
+rfc7692-7.1:offer-*:answer-*	wsproto	accepted/accepted+deflate	scope	this library reports the parameters that bind its own compressor, which include a limit the client offered and the server did not change (client_no_context_takeover, client_max_window_bits); wsproto reports only what the response said
+
+# ==== ws and wc: streams ====================================================================
+
+# ---- findings: defects in THIS library, open (not excuses: listed on every run) -----------------
+
+# ---- framing (RFC 6455 section 5.2) ---------------------------------------------------------------
+rfc6455-5.2:length-*-in-16-bit-form|rfc6455-5.2:length-*-in-64-bit-form	websockets|gows	failed:1002/open*	ref-lenient	section 5.2: "the minimal number of bytes MUST be used to encode the length"; the reference reads a length in a longer form than it needs
+rfc6455-5.2:length-64-bit-2pow63-1|rfc6455-5.2:length-64-bit-2pow32|rfc6455-5.2:length-64-bit-2pow31|limit:header-claims-1MiB-plus-1|limit:header-claims-1MiB-plus-1-then-data|limit:second-fragment-header-pushes-over	wsproto	failed:1009/open*	ref-limit	a header that claims more than the 1 MiB every implementation was given, at the header: wsproto has no limit and waits for the payload
+rfc6455-5.4:many-fragments-1025|rfc6455-5.4:many-fragments-5000	*	failed:1009/open*	ref-limit	this library allows 1024 fragments to a message (GHTTP_WsLimits::max_fragments); the reference has no such limit
+rfc6455-5.5:pings-129|rfc6455-5.5:pings-1000|rfc6455-5.5:pongs-1000	*	failed:1008/open*	ref-limit	this library counts control frames per interval (128 by default, and no tick ever renews it here); the reference answers every Ping and has no limit
+limit:message-1048577-binary|limit:message-1048577-text|limit:fragments-total-1MiB-plus-1|rfc7692-bomb:zeros-*|rfc7692-bomb:repeated-pattern-2097152|rfc7692-bomb:incompressible-1MiB-plus-1	wsproto	failed:1009/open*	ref-limit	wsproto has no limit on the size of a message, compressed or not; every other implementation here was given 1 MiB
+# ---- reserved bits, opcodes, control frames: where the stream is cut inside a frame header ----------
+unit:frame:L154:827e0005:stream	websockets|gows	failed:1002/open	ref-lenient	82 7e 00 05 is a 16-bit length of 5, not the minimal form (section 5.2); the reference reads it
+# ---- after a Close ------------------------------------------------------------------------------------
+rfc6455-5.4:close-ends-incomplete-message|rfc6455-7.4:close-code-after-fragment	websockets	closed:*/failed:1002+evs:count	ref-strict	a Close frame between the fragments of a message is a control frame, allowed there (section 5.4), and ends the connection; this library answers it, websockets fails the connection with "incomplete fragmented message"
+rfc6455-7.4:close-code-1014-valid|autobahn-7.9.8:*	wsproto|gows	closed:1014/failed:1002+evs:count	ref-strict	the IANA registry of WebSocket close codes lists 1012, 1013 and 1014 (service restart, try again later, bad gateway); RFC 6455 section 7.4.2 reserves 1000-2999 for the protocol and its registry, so this library accepts them
+# ---- close bodies ----------------------------------------------------------------------------------------
+rfc6455-5.5.1:close-one-octet|rfc6455-5.5.1:close-one-octet-zero|unit:*:as-close-body|unit:*:as-ping	gows	failed:1002/closed:empty+evs:count	ref-lenient	section 5.5.1: a Close body is empty or has a two-octet code; one octet breaks that, and gorilla reads it as a Close with no status
+# ---- UTF-8 (RFC 6455 section 5.6, 8.1) ----------------------------------------------------------------------
+rfc6455-8.1:*|rfc6455-5.6:*|autobahn-6.*|unit:*:as-text|rfc7692-8.1:*	gows	failed:1007/open*	ref-model	gorilla/websocket leaves the check that a text message is UTF-8 to the application (its README) and delivers the octets as they are; this library, wsproto and websockets refuse them with 1007
+rfc6455-8.1:*|rfc6455-5.6:*|autobahn-6.*|unit:*:as-text	gows	failed:1007/closed:*	ref-model	as above, and the Close that follows is answered
+# ---- permessage-deflate (RFC 7692) -----------------------------------------------------------------------------
+rfc7692-7.2:*:fragments-3-with-pings|rfc7692-7.2:*:lorem-fragmented|wr:*:fragments-with-controls	wsproto	open/failed:1007+evs:count+pongs	ref-bug	[check:strip-controls] wsproto's PerMessageDeflate treats the end of a Ping inside a compressed message as the end of that message's compression (it clears _inbound_compressed), so the rest of the message is read as if it were not compressed and fails to decompress; with the control frames removed this library and wsproto agree
+wr:*:fragments-with-controls	wsproto	wr:failed+evs:count	ref-bug	the same wsproto defect, read back from what this library wrote: a Ping between the fragments of a compressed message
+rfc7692-7.1.2:window-*-agreed-compressed-with-15-distance-4000	wsproto	split	ref-split	zlib's raw inflate with a small window checks a distance against the window as it stands at the end of the input it is given: a stream whose distance exceeds the agreed window is read when it is given whole and refused when it arrives a piece at a time; this library reads it either way (it decompresses with the full 32 KiB, as the documentation says)
+rfc7692-7.2.2:invalid-deflate-dynamic-block-bad-header*	*	failed:1007/open+evs:count	ref-lenient	a DEFLATE block cut inside its dynamic Huffman header: the message does not end at a block boundary after the appended 00 00 ff ff, which RFC 7692 section 7.2.2 requires of it; the references hand it to zlib, which has nothing more to say and waits
+rfc7692-7.2.2:invalid-deflate-trailing-garbage-after-bfinal*	*	failed:1007/open+evs:count	choice	octets after a BFINAL block (section 7.2.3.4 allows one padding octet): this library refuses them, the references read the message and drop what follows
+
+rfc6455-4.2.1:extensions-offer-smb-empty	gows	400/101	ref-lenient	a parameter with an empty value breaks the ABNF; gorilla answers the offer it takes
+
+# ---- generated streams (single mutations of valid ones) --------------------------------------------
+gen:*	gows	failed:1007/*	ref-model	gorilla/websocket does not check that a text message is UTF-8 (its README leaves it to the application): the mutation made a text message invalid, this library, wsproto and websockets refuse it with 1007 and gorilla delivers it
+gen:*@pmd*	wsproto	open/open+evs:data	ref-bug	[check:strip-controls] the mutation put a Ping inside a compressed fragmented message (gen:inject-ping), which wsproto's PerMessageDeflate mishandles (it ends the message's compressed state at the control frame); with the control frames removed this library and wsproto agree
+gen:*	gows	failed:1002/closed:empty+evs:count	ref-lenient	a mutation made a Close frame with a one-octet body (section 5.5.1 allows none or a code and a reason): gorilla reads it as a Close with no status
+gen:*@pmd*	gows	failed:1002/open+evs:count+pongs	ref-lenient	RSV1 on a control frame once permessage-deflate is agreed (RFC 7692 section 6.1 allows it on the first frame of a data message only): gorilla lets the bit through on a Ping and answers it
+gen:*	websockets	closed:*/failed:1002+evs:count	ref-strict	a Close frame inside a fragmented message (allowed, section 5.4): this library answers it and websockets fails the connection with "incomplete fragmented message"
+rfc7692-7.2.2:*|gen:*@pmd*	websockets	failed:1007/open*	ref-lenient	a mutation left a DEFLATE stream that ends inside a block (or with garbage that is not a block): zlib returns what it decoded and goes on, with no error, so websockets delivers the garbage; this library's inflater refuses a message that does not end at a block boundary after the appended 00 00 ff ff (RFC 7692 section 7.2.2)
+gen:*@pmd*	gows	open/failed+evs:count	choice	a mutation (a continuation frame one octet shorter) left a compressed message that this library's inflater and zlib read as the original and Go's compress/flate refuses as corrupt; RFC 7692 does not say what to do with a DEFLATE stream that is damaged and still decodes
+rfc7692-7.2.3.4:bfinal-block-then-another-message	wsproto	open/failed:1007*	ref-strict	after a message whose last block has BFINAL set the reference's decompressor cannot go on and fails the connection; this library starts the decompressor afresh and reads the next message (RFC 7692 section 7.2.3.4 allows the sender to do this; documentation/permessage-deflate.md)
+rfc7692-7.2.3.4:bfinal-block-then-another-message	websockets	open/open+evs:data	choice	after a BFINAL block this library forgets the history (its stream is over) and the reference keeps it: the next message, if it refers back, is read differently; RFC 7692 does not say which
+rfc7692-bomb:incompressible-1MiB|wr:*:takeover:big-1MiB	websockets	*	ref-limit	a message of exactly 1 MiB that does not compress is a little larger compressed than the reference's own 1 MiB limit allows it to read; this library gives the extension's overhead slack (GHTTP_WsLimits::max_message_bytes)

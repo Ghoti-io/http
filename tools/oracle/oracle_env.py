@@ -46,6 +46,10 @@ REFS = {
     "nghttp2": (["nghttp2-version"], ["ref-nghttp2"]),
     "h2": (["h2-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-h2.py"]),
     "gox2": (["gox2-version"], ["ref-gox2"]),
+    # WebSocket (diff_ws.py)
+    "wsproto": (["wsproto-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-wsproto.py"]),
+    "websockets": (["websockets-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-websockets.py"]),
+    "gows": (["gows-version"], ["ref-gows"]),
 }
 
 

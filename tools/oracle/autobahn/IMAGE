@@ -1,0 +1,23 @@
+# The Autobahn|Testsuite reference, pinned.
+#
+# One line, tab-separated: <name> <image> <version> <what it answers>.
+#
+# Unlike the other references (tools/oracle/containers/IMAGES) this image is
+# not built here: it is the upstream image, so the pin is its manifest digest,
+# and run.py ALSO asks the running container what it is, because a digest that
+# was re-tagged or a mirror that served something else is only caught by the
+# answer. The version field is exactly what the probe in run.py prints:
+# autobahntestsuite, autobahn (the library under it), Twisted and PyPy.
+#
+# Raising the pin is deliberate and a separate commit from any change that
+# makes a run green: a new suite is new cases and new expectations, and
+# expected.tsv has to be re-derived (run.py --propose) and every difference
+# read, not accepted.
+#
+# To resolve a newer digest:
+#   docker pull docker.io/crossbario/autobahn-testsuite
+#   docker image inspect docker.io/crossbario/autobahn-testsuite --format '{{index .RepoDigests 0}}'
+# To fetch the pinned one on a new machine:
+#   docker pull <the image column below>
+
+autobahn	docker.io/crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074	autobahntestsuite 25.10.1 autobahn 0.10.9 twisted 19.10.0 pypy 7.3.20	The WebSocket conformance suite: 517 cases of RFC 6455 and permessage-deflate (RFC 7692), fuzzingclient against our server and fuzzingserver against our client

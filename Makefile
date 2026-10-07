@@ -1085,10 +1085,12 @@ test-asan: $(ASAN_TEST_EXECUTABLES)
 ORACLE := tools/oracle
 HTTP_PROBE := $(APP_DIR)/oracle/http_probe$(EXE_EXTENSION)
 H2_PROBE := $(APP_DIR)/oracle/h2_probe$(EXE_EXTENSION)
-ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-2
+WS_PROBE := $(APP_DIR)/oracle/ws_probe$(EXE_EXTENSION)
+ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-3
 # More cases than the default is `make check-oracle ORACLE_ARGS='--count 40000'`.
 ORACLE_ARGS ?=
 ORACLE_H2_ARGS ?=
+ORACLE_WS_ARGS ?=
 
 # Built like an example (the archive, whole): it must carry the code under
 # test and not whatever is installed. Not a test: a differential needs this
@@ -1105,25 +1107,34 @@ $(H2_PROBE): $(ORACLE)/h2_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
-oracle-probe: ## Build the probes the differentials drive
-oracle-probe: $(HTTP_PROBE) $(H2_PROBE)
+$(WS_PROBE): $(ORACLE)/ws_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: ws_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
-oracle-build: ## Build the pinned reference image: llhttp, h11, Go net/http, nghttp2, h2 and Go x/net/http2
+oracle-probe: ## Build the probes the differentials drive
+oracle-probe: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE)
+
+oracle-build: ## Build the pinned reference image: llhttp, h11, Go net/http, nghttp2, h2, Go x/net/http2, wsproto, websockets and gorilla/websocket
 	docker build -t $(ORACLE_IMAGE) -f $(ORACLE)/containers/refs/Containerfile \
 		$(ORACLE)/containers/refs
 
 oracle-version: ## Print which references would answer, and fail if any would not
 	@python3 $(ORACLE)/oracle_env.py
 
-check-oracle: ## Fail unless every disagreement with the references is explained (HTTP/1.1 and HTTP/2)
+check-oracle: ## Fail unless every disagreement with the references is explained (HTTP/1.1, HTTP/2 and WebSocket)
 ifeq ($(OS_NAME), Linux)
-check-oracle: $(HTTP_PROBE) $(H2_PROBE)
+check-oracle: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/oracle_run.py llhttp,h11,gohttp -- \
 		python3 $(ORACLE)/diff.py --probe $(HTTP_PROBE) $(ORACLE_ARGS)
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 		python3 $(ORACLE)/oracle_run.py nghttp2,h2,gox2 -- \
 		python3 $(ORACLE)/diff_h2.py --probe $(H2_PROBE) $(ORACLE_H2_ARGS)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+		python3 $(ORACLE)/oracle_run.py wsproto,websockets,gows -- \
+		python3 $(ORACLE)/diff_ws.py --probe $(WS_PROBE) $(ORACLE_WS_ARGS)
 else
 # No probe is built: it is POSIX C, and the references are containers.
 	@printf "check-oracle: skipped (Linux only)\n"
@@ -1132,6 +1143,33 @@ endif
 check-oracle-gate: ## Show that the oracle gate fails: planted defects and harness controls
 check-oracle-gate:
 	@tools/oracle/check-gate.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) SECURITY_PC=$(SECURITY_PC) COMPRESS_PC=$(COMPRESS_PC)
+
+# Autobahn|Testsuite against ws_echo, a socket program around the WebSocket codec
+# (tools/oracle/autobahn/run.py has the design). Linux only, like the oracle.
+WS_ECHO := $(APP_DIR)/oracle/ws_echo$(EXE_EXTENSION)
+
+$(WS_ECHO): $(ORACLE)/autobahn/ws_echo.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Program: ws_echo ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
+
+.PHONY: check-autobahn check-autobahn-full check-autobahn-gate
+check-autobahn: ## Autobahn cases against expected.tsv, both directions, quick set; NOT a gate (server direction flaky, see run.py)
+ifeq ($(OS_NAME), Linux)
+check-autobahn: $(WS_ECHO)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" python3 $(ORACLE)/autobahn/run.py --ws-echo $(WS_ECHO) --quick
+else
+	@printf "check-autobahn: skipped (Linux only)\n"
+endif
+
+check-autobahn-full: ## The same with every one of the 517 cases (about half an hour)
+check-autobahn-full: $(WS_ECHO)
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" python3 $(ORACLE)/autobahn/run.py --ws-echo $(WS_ECHO) --full
+
+check-autobahn-gate: ## Show that the Autobahn gate fails: planted defects and harness controls
+check-autobahn-gate:
+	@tools/oracle/autobahn/check-gate.sh "$(MAKE)" "$(BUILD_DIR)" $(if $(PREFIX),PREFIX=$(PREFIX)) CUTIL_PC=$(CUTIL_PC) SECURITY_PC=$(SECURITY_PC) COMPRESS_PC=$(COMPRESS_PC)
 
 ####################################################################
 # Fuzzing (libFuzzer)

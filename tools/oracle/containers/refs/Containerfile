@@ -7,6 +7,18 @@
 # gox2/main.go). Left out: Node's http2 (it is nghttp2), curl and every proxy
 # built on nghttp2 (the same), hyper/h2 in Rust (a fourth, not wanted here).
 #
+# WebSocket (tools/oracle/diff_ws.py): wsproto (Python, sans-I/O, on h11),
+# websockets (Python, its sans-I/O protocol layer, which shares no code with
+# wsproto) and gorilla/websocket (Go, compiled in the first stage), three
+# implementations of RFC 6455 and RFC 7692 that share no code, each driven as
+# either end of a connection and through its opening handshake (containers/
+# refs/ref-wsproto.py, ref-websockets.py, gows/main.go). The Autobahn|Testsuite
+# is the fourth, run elsewhere and not from this image. Left out: Node's `ws`
+# and `undici` (a Node reference would be a fourth runtime for the same
+# question), Tornado and aiohttp (their frame codecs are written for their own
+# event loops and cannot be driven from bytes), nhooyr/coder websocket (a second
+# Go implementation is a second Go, which this image already has).
+#
 # HTTP/1.1:
 # Three independent implementations of the message syntax this library
 # parses, none of them sharing a line with another:
@@ -64,6 +76,11 @@ COPY gox2/go.mod gox2/go.sum gox2/main.go /src/gox2/
 RUN cd /src/gox2 && GOTOOLCHAIN=local /usr/lib/go-1.24/bin/go mod download
 RUN cd /src/gox2 && CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
     /usr/lib/go-1.24/bin/go build -trimpath -o /out/ref-gox2 .
+# github.com/gorilla/websocket v1.5.3, likewise by go.mod and go.sum.
+COPY gows/go.mod gows/go.sum gows/main.go /src/gows/
+RUN cd /src/gows && GOTOOLCHAIN=local /usr/lib/go-1.24/bin/go mod download
+RUN cd /src/gows && CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+    /usr/lib/go-1.24/bin/go build -trimpath -o /out/ref-gows .
 
 FROM ${BASE} AS nghttp2build
 ARG SNAPSHOT
@@ -107,16 +124,26 @@ RUN pip install --no-cache-dir --no-compile --break-system-packages h11==0.16.0
 RUN pip install --no-cache-dir --no-compile --break-system-packages \
     h2==4.4.1 hpack==4.2.0 hyperframe==6.1.0
 
-COPY --from=gobuild /out/ref-go /out/ref-gox2 /usr/local/bin/
+# The WebSocket Python references. wsproto 1.3.2 needs h11 >= 0.16.0, which is
+# the pin above; it is named again so that a change to one fails the build
+# instead of moving the other. websockets 17.2 has no dependencies. Its wheel
+# carries a C speedup for masking (websockets/speedups.c); the answers do not
+# depend on it, and the version check below names the release.
+RUN pip install --no-cache-dir --no-compile --break-system-packages \
+    h11==0.16.0 wsproto==1.3.2 websockets==17.2
+
+COPY --from=gobuild /out/ref-go /out/ref-gox2 /out/ref-gows /usr/local/bin/
 COPY --from=nghttp2build /out/ref-nghttp2 /usr/local/bin/ref-nghttp2
-COPY ref-llhttp.js ref-h11.py ref-h2.py /usr/local/lib/ghttp-ref/
-COPY llhttp-version h11-version go-version nghttp2-version h2-version gox2-version /usr/local/bin/
+COPY ref-llhttp.js ref-h11.py ref-h2.py ref-wsproto.py ref-websockets.py wsref_common.py /usr/local/lib/ghttp-ref/
+COPY llhttp-version h11-version go-version nghttp2-version h2-version gox2-version \
+     wsproto-version websockets-version gows-version /usr/local/bin/
 RUN chmod +x /usr/local/bin/llhttp-version /usr/local/bin/h11-version \
       /usr/local/bin/go-version /usr/local/bin/ref-go /usr/local/bin/nghttp2-version \
       /usr/local/bin/h2-version /usr/local/bin/gox2-version /usr/local/bin/ref-gox2 \
-      /usr/local/bin/ref-nghttp2
+      /usr/local/bin/ref-nghttp2 /usr/local/bin/wsproto-version \
+      /usr/local/bin/websockets-version /usr/local/bin/gows-version /usr/local/bin/ref-gows
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 NODE_OPTIONS=--no-warnings
 
 ENTRYPOINT []
-CMD ["sh", "-c", "llhttp-version; h11-version; go-version; nghttp2-version; h2-version; gox2-version"]
+CMD ["sh", "-c", "llhttp-version; h11-version; go-version; nghttp2-version; h2-version; gox2-version; wsproto-version; websockets-version; gows-version"]

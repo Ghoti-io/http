@@ -132,7 +132,7 @@ plant_lib() {
   # The control's probe and archive came along: a path make did not match would
   # leave the OLD binary to run against nothing patched.
   rm -f "$dir/$BUILD_DIR"/apps/*.a "$dir/$BUILD_DIR"/apps/*.so* "$dir/$BUILD_DIR"/apps/oracle/http_probe \
-    "$dir/$BUILD_DIR"/apps/oracle/h2_probe
+    "$dir/$BUILD_DIR"/apps/oracle/h2_probe "$dir/$BUILD_DIR"/apps/oracle/ws_probe
   if ! ( cd "$dir" && "$MAKE_CMD" --no-print-directory oracle-probe $MARGS ) > "$dir-build.log" 2>&1; then
     printf 'check-oracle-gate: %s: the patched copy does not build\n' "$name" >&2
     tail -10 "$dir-build.log" >&2
@@ -270,6 +270,72 @@ plant_harness h2-reference-answers-nothing tools/oracle/diff_h2.py \
 
 # ---- normalising' \
   'did not accept a good request'
+
+# ---- WebSocket (story 3c): the same, against diff_ws.py -------------------------
+
+DIFF_SCRIPT=diff_ws.py
+PROBE_NAME=ws_probe
+rm -rf "$SCRATCH/control.log"
+if ! run_diff "$SCRATCH/control"; then
+  printf 'check-oracle-gate: the CONTROL copy fails the WebSocket differential, so no\n' >&2
+  printf 'WebSocket result below would mean anything. Its log:\n' >&2
+  tail -30 "$SCRATCH/control.log" >&2
+  exit 1
+fi
+printf 'check-oracle-gate: WebSocket control passes\n'
+
+plant_lib ws-accept-unmasked-client-frame src/http/ws_conn.c \
+  '  if (c->role == GHTTP_WS_SERVER && !fh->masked) {' \
+  '  if (c->role == GHTTP_WS_SERVER && !fh->masked && 0) {' \
+  'did not refuse an unmasked client frame'
+
+plant_lib ws-utf8-not-carried-across-fragments src/http/ws_conn.c \
+  '  c->msg_frames++;
+  if (c->msg_compressed) {' \
+  '  ghttp_ws_utf8_init(&c->utf8);
+  c->msg_frames++;
+  if (c->msg_compressed) {' \
+  'have no rule'
+
+plant_lib ws-allow-fragmented-control-frame src/http/ws_frame.c \
+  '  if (ghttp_ws_opcode_is_control(opcode) && !fin) {
+    return GHTTP_ERR_CORRUPT;  // section 5.5: control frames must not be fragmented
+  }' \
+  '  if (ghttp_ws_opcode_is_control(opcode) && !fin && 0) {
+    return GHTTP_ERR_CORRUPT;
+  }' \
+  'have no rule'
+
+plant_lib ws-allow-reserved-bit-without-extension src/http/ws_conn.c \
+  '  if (bits & ~allowed) {' \
+  '  if ((bits & ~allowed) && 0) {' \
+  'have no rule'
+
+plant_harness ws-rule-deleted tools/oracle/known-ws-disagreements.tsv \
+  'rfc6455-4.2.1:extension-offer-very-long	*	400/101	ref-limit	' \
+  '# rfc6455-4.2.1:extension-offer-very-long	*	400/101	ref-limit	' \
+  'have no rule'
+
+plant_harness ws-comparator-blind-to-payloads tools/oracle/diff_ws.py \
+  '    evs = tuple((k, hx(d), c) for k, d, c in res["evs"])' \
+  '    evs = tuple((k, b"", c) for k, d, c in res["evs"])' \
+  'explains nothing\|did not'
+
+plant_harness ws-reference-answers-nothing tools/oracle/diff_ws.py \
+  '    return parse_answers(name, done.stdout, want_count(cases, name))
+
+
+# ---- normalising' \
+  '    got = parse_answers(name, done.stdout, want_count(cases, name))
+    if name == "wsproto":
+        for v in got.values():
+            if "evs" in v:
+                v.update(evs=[], end="open", sent=[])
+    return got
+
+
+# ---- normalising' \
+  'did not'
 
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-oracle-gate: FAILED\033[0m\n' >&2
