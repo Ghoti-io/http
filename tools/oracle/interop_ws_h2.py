@@ -153,7 +153,13 @@ def scenarios(probe):
               ours(probe, "server", "--raw"), go("client", str(1 << 20))))
     s.append(("Go's x/net/http2 serves an echo tunnel, this library is the client (1 MiB)",
               go("server"), ours(probe, "client", "--raw", str(1 << 20))))
-    s.append(("the same, 1 octet",
+    # No container: two of this library's probes, each writing a lot while the other
+    # echoes. Before the probes read while their output waited this stalled for
+    # good (both ends blocked in write() on full pipes), which showed up as the
+    # Go client scenario failing now and then under load. Here it is deterministic.
+    s.append(("this library against itself, a 4 MiB echo tunnel (more than the pipes hold before either end reads)",
+              ours(probe, "server", "--raw"), ours(probe, "client", "--raw", str(4 << 20))))
+    s.append(("Go's x/net/http2 serves an echo tunnel, this library is the client (1 octet)",
               go("server"), ours(probe, "client", "--raw", "1")))
     return s
 

@@ -57,6 +57,7 @@
 
 #include <ghoti.io/http/http.h>
 #include <stdio.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -131,6 +132,11 @@ typedef struct {
   uint32_t mask_state;
 } Conn;
 
+// What was read from stdin while output was waiting to be written, and whether
+// stdin has ended. See flush_out().
+static Bytes inq;
+static int in_eof;
+
 static void flush_out(Conn * c) {
   size_t n = 0;
   const uint8_t * p = ghttp_h2_conn_output(c->h2, &n);
@@ -143,13 +149,37 @@ static void flush_out(Conn * c) {
     ghttp_h2_conn_output_consume(c->h2, n);
     return;
   }
+  // The two ends of this connection are single-threaded programs joined by
+  // pipes. If each blocked in write() while the other did the same, neither would
+  // ever read and both would stall for good (a Go client sending a megabyte while
+  // this end echoes it did, under load). So while output waits, input is read
+  // (and queued for the main loop), and a write is made only when the pipe has
+  // room for it.
   while (n > 0) {
-    ssize_t w = write(1, p, n);
-    if (w <= 0) {
+    struct pollfd fds[2] = {{1, POLLOUT, 0}, {0, POLLIN, 0}};
+    if (poll(fds, in_eof ? 1 : 2, -1) < 0) {
       exit(3);
     }
-    p += w;
-    n -= (size_t)w;
+    if (!in_eof && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+      unsigned char tmp[65536];
+      ssize_t got = read(0, tmp, sizeof tmp);
+      if (got > 0) {
+        bytes_add(&inq, tmp, (size_t)got);
+      } else {
+        in_eof = 1;
+      }
+    }
+    if (fds[0].revents & (POLLERR | POLLHUP)) {
+      exit(3);
+    }
+    if (fds[0].revents & POLLOUT) {
+      ssize_t w = write(1, p, n < 4096 ? n : 4096);  // PIPE_BUF: room was promised for this much
+      if (w <= 0) {
+        exit(3);
+      }
+      p += w;
+      n -= (size_t)w;
+    }
   }
   ghttp_h2_conn_output_consume(c->h2, ghttp_h2_conn_output_size(c->h2));
 }
@@ -602,7 +632,17 @@ int main(int argc, char ** argv) {
   flush_out(&c);
   unsigned char buf[65536];
   for (;;) {
-    ssize_t got = read(0, buf, sizeof buf);
+    ssize_t got;
+    if (inq.n > 0) {
+      // Read while output was waiting.
+      got = (ssize_t)(inq.n < sizeof buf ? inq.n : sizeof buf);
+      memcpy(buf, inq.p, (size_t)got);
+      bytes_drop(&inq, (size_t)got);
+    } else if (in_eof) {
+      break;
+    } else {
+      got = read(0, buf, sizeof buf);
+    }
     if (got <= 0) {
       break;
     }

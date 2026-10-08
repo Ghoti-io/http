@@ -27,7 +27,7 @@ set -u
 MAKE_CMD="${1:?usage: check-gate.sh <make> <build-dir> [make args]}"
 BUILD_DIR="${2:?usage: check-gate.sh <make> <build-dir> [make args]}"
 shift 2
-MARGS="-j$(nproc 2>/dev/null || echo 4) $*"
+MARGS="-j${GHOTI_CHECK_JOBS:-$(nproc 2>/dev/null || echo 4)} $*"
 unset MAKEFLAGS MFLAGS
 
 ROOT=$(pwd)
@@ -429,6 +429,11 @@ plant_lib ws-h2-server-answers-101 src/http/ws_handshake.c \
   '  result->status = h2 ? 200 : 101;' \
   '  result->status = 200;
   if (h2) { (void)ghttp_response_set_status(response, 101, "Switching Protocols"); }' \
+  'interoperability check FAILED'
+
+plant_lib ws-h2-probe-stops-reading-while-it-writes tools/oracle/ws_h2_probe.c \
+  '    if (poll(fds, in_eof ? 1 : 2, -1) < 0) {' \
+  '    if (poll(fds, 1, -1) < 0) {' \
   'interoperability check FAILED'
 
 plant_harness ws-h2-control-blind tools/oracle/interop_ws_h2.py \
