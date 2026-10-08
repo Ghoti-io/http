@@ -50,6 +50,10 @@ REFS = {
     "wsproto": (["wsproto-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-wsproto.py"]),
     "websockets": (["websockets-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-websockets.py"]),
     "gows": (["gows-version"], ["ref-gows"]),
+    # Extended CONNECT interoperability (interop_ws_h2.py): the driver is
+    # chosen by the caller's argv.
+    "gox2tunnel": (["gox2tunnel-version"], ["ref-gox2tunnel"]),
+    "h2ws": (["wsh2-version"], ["python3", "/usr/local/lib/ghttp-ref/ref-wsh2-client.py"]),
 }
 
 

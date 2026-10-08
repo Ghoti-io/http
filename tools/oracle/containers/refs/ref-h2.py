@@ -49,6 +49,7 @@ exception (a stream error h2 raises as ProtocolError and answers with an
 RST_STREAM, say) is recorded and the rest of the buffer is drained.
 """
 import json
+import os
 import re
 import struct
 import sys
@@ -59,6 +60,7 @@ import hyperframe
 import h2.config
 import h2.connection
 import h2.events
+import h2.settings
 import h2.settings
 from h2.connection import ConnectionState
 
@@ -106,6 +108,9 @@ class Case:
         self.errs = []
         self.out = b""
         self.c.initiate_connection()
+        if os.environ.get("GHTTP_REF_XCONNECT"):
+            # The server enables Extended CONNECT (RFC 8441).
+            self.c.update_settings({h2.settings.SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
         self.collect()
 
     def collect(self):

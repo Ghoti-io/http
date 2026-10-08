@@ -442,6 +442,134 @@ plant ws-bytes-after-close-not-refused src/http/ws_conn.c testWs_conn \
       return fail(c, GHTTP_ERR_CORRUPT, GHTTP_WS_CLOSE_PROTOCOL_ERROR,
           "data after a Close frame");'
 
+# Extended CONNECT and WebSocket over HTTP/2 (story 3d). The four the spec
+# names - the setting accepted from a client, a :protocol without the setting, a
+# tunnel that ignores END_STREAM, a key accepted over HTTP/2 - and the rest of
+# the rules RFC 8441 adds, each one condition removed.
+plant h2-connect-setting-accepted-from-client src/http/h2conn.c testH2connect \
+  'H2ConnectSetting.AClientThatSendsItIsAProtocolError_Rfc8441_3' \
+  '      if (c->role == GHTTP_H2_SERVER) {
+        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
+  '      if (c->role == GHTTP_H2_SERVER && 0) {
+        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");'
+
+plant h2-connect-setting-above-one-accepted src/http/h2conn.c testH2connect \
+  'H2ConnectSetting.AValueAboveOneIsAProtocolError_Rfc8441_3' \
+  '      if (v > 1) {
+        return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL is neither 0 nor 1");' \
+  '      if (v > 2) {
+        return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL is neither 0 nor 1");'
+
+plant h2-connect-setting-one-to-zero-accepted src/http/h2conn.c testH2connect \
+  'H2ConnectSetting.ChangingItFromOneToZeroIsAProtocolError_Rfc8441_3' \
+  '      if (v == 0 && c->peer.enable_connect_protocol == 1) {' \
+  '      if (v == 0 && c->peer.enable_connect_protocol == 1 && 0) {'
+
+plant h2-protocol-without-the-setting src/http/h2msg.c testH2connect \
+  'H2ConnectRequest.WithoutTheSettingItIsMalformedAndTheConnectionStays_Rfc8441_4' \
+  '    if (!allow_protocol || !info->connect' \
+  '    if ((allow_protocol && 0) || !info->connect'
+
+plant h2-protocol-on-any-method src/http/h2msg.c testH2connect \
+  'H2ConnectRequest.EachMalformedFormIsAStreamErrorNotAConnectionError' \
+  '    if (!allow_protocol || !info->connect
+        || (ps.seen' \
+  '    if (!allow_protocol
+        || (ps.seen'
+
+plant h2-protocol-without-authority-accepted src/http/h2msg.c testH2connect \
+  'H2ConnectRequest.EachMalformedFormIsAStreamErrorNotAConnectionError' \
+  '        || (ps.seen & (P_SCHEME | P_PATH | P_AUTHORITY))
+            != (P_SCHEME | P_PATH | P_AUTHORITY)) {' \
+  '        || (ps.seen & (P_SCHEME | P_PATH))
+            != (P_SCHEME | P_PATH)) {'
+
+plant h2-protocol-syntax-unchecked src/http/util.c testH2connect \
+  'H2ConnectRequest.EachMalformedFormIsAStreamErrorNotAConnectionError' \
+  '  if (!slash) {
+    return ghttp_is_token(s, n);
+  }' \
+  '  if (!slash) {
+    return n > 0;
+  }'
+
+plant h2-protocol-limit-off-by-one src/http/h2msg.c testH2connect \
+  'H2ConnectRequest.AHugeProtocolIsStoppedAtItsLimit' \
+  '    if (ps.protocol_len > max_protocol_bytes) {' \
+  '    if (ps.protocol_len > max_protocol_bytes + 1) {'
+
+plant h2-tunnel-ignores-end-stream src/http/h2conn.c testH2connect \
+  'H2ConnectTunnel.EndStreamHalfClosesAndTheOtherSideMayKeepSending' \
+  '  if (f->end_stream) {
+    s->remote_ended = true;
+  }
+  GHTTP_Result r = GHTTP_OK;
+  if (pad > 0) {' \
+  '  if (f->end_stream && s->mode != GHTTP_H2_STREAM_TUNNEL) {
+    s->remote_ended = true;
+  }
+  GHTTP_Result r = GHTTP_OK;
+  if (pad > 0) {'
+
+plant h2-tunnel-bound-by-the-body-limit src/http/h2conn.c testH2connect \
+  'H2ConnectTunnel.TheBodyLimitDoesNotApplyToATunnel' \
+  '  if (s->mode == GHTTP_H2_STREAM_MESSAGE) {
+    bool bad = false;' \
+  '  if (1) {
+    bool bad = false;'
+
+plant h2-client-sends-protocol-before-the-setting src/http/h2conn.c testH2connect \
+  'H2ConnectClient.ARequestIsRefusedUntilTheServerHasEnabledIt' \
+  '  if (ghttp_request_protocol(request) && c->peer.enable_connect_protocol != 1) {' \
+  '  if (ghttp_request_protocol(request) && c->peer.enable_connect_protocol != 1 && 0) {'
+
+plant ws-h2-key-accepted src/http/ws_handshake.c testWs_h2 \
+  'WsH2Handshake.ASecWebSocketKeyOverHttp2IsRefused_Rfc8441_5' \
+  '    if (count_fields(h, "sec-websocket-key") != 0) {' \
+  '    if (count_fields(h, "sec-websocket-key") != 0 && 0) {'
+
+plant ws-h2-accept-value-accepted src/http/ws_handshake.c testWs_h2 \
+  'WsH2ClientHandshake.EachWayAResponseCanBeWrongIsRefused' \
+  '    if (count_fields(h, "sec-websocket-accept") != 0) {' \
+  '    if (count_fields(h, "sec-websocket-accept") != 0 && 0) {'
+
+plant ws-h2-status-101-accepted src/http/ws_handshake.c testWs_h2 \
+  'WsH2ClientHandshake.EachWayAResponseCanBeWrongIsRefused' \
+  '  if (ghttp_response_status(response) != (h2 ? 200 : 101)) {' \
+  '  if (ghttp_response_status(response) != 101) {'
+
+plant ws-h2-version-unchecked src/http/ws_handshake.c testWs_h2 \
+  'WsH2Handshake.EachWayARequestCanBeWrongIsRefusedWithItsStatus' \
+  '  if (!(vn == 2 && memcmp(v, "13", 2) == 0)) {' \
+  '  if (!(vn == 2 && memcmp(v, "13", 2) == 0) && 0) {'
+
+plant ws-h2-refusal-carries-connection src/http/ws_handshake.c testWs_h2 \
+  'WsH2Handshake.EachWayARequestCanBeWrongIsRefusedWithItsStatus' \
+  '  if (r == GHTTP_OK && !h2) {
+    r = ghttp_headers_add(h, "Connection", "close");' \
+  '  if (r == GHTTP_OK) {
+    r = ghttp_headers_add(h, "Connection", "close");'
+
+plant ws-h2-abrupt-end-not-1006 src/http/ws_h2.c testWs_h2 \
+  'WsH2EndToEnd.AnEndStreamBeforeTheCloseIsAnAbnormalClosure1006' \
+  '  } else if (a->remote_ended) {
+    s->state = GHTTP_WS_H2_ABNORMAL;
+    s->code = 1006;' \
+  '  } else if (a->remote_ended) {
+    s->state = GHTTP_WS_H2_CLOSED;
+    s->code = 0;'
+
+plant ws-h2-no-end-stream-after-close src/http/ws_h2.c testWs_h2 \
+  'WsH2EndToEnd.TheClosingHandshakeEndsBothSidesCleanlyAndTheStreamsAreGone' \
+  '  if (st == GHTTP_WS_STATE_CLOSED || st == GHTTP_WS_STATE_FAILED || a->remote_ended) {' \
+  '  if (st == GHTTP_WS_STATE_FAILED || a->remote_ended) {'
+
+plant ws-h2-reset-not-reported src/http/ws_h2.c testWs_h2 \
+  'WsH2EndToEnd.AResetMidMessageIsAbnormalWithTheCodeReported' \
+  '        a->reset = true;
+        a->reset_code = ev->error_code;' \
+  '        a->reset_code = ev->error_code;'
+
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require
 # that gate to fail (and to pass on the copy before it).

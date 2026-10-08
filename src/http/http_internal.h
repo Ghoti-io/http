@@ -54,6 +54,8 @@ typedef enum {
 bool ghttp_is_tchar(unsigned char c);
 /** A non-empty run of token characters. */
 bool ghttp_is_token(const char * s, size_t n);
+/** A token, or two tokens joined by one "/": the shape of an Upgrade token and so of an RFC 8441 :protocol. */
+bool ghttp_is_protocol_name(const char * s, size_t n);
 /** Visible characters, space, tab and bytes of 0x80 and above: no control. */
 bool ghttp_is_field_text(const char * s, size_t n);
 /** A non-empty run of visible ASCII: no space and no control. */

@@ -252,6 +252,7 @@ struct Side {
             << fields_text(ghttp_request_headers_const(r))
             << " scheme=" << (ev.scheme ? ev.scheme : "-")
             << " authority=" << (ev.authority ? ev.authority : "-");
+          if (ev.protocol) o << " protocol=" << ev.protocol;
         } else {
           const GHTTP_Response * r = ghttp_h2_conn_response(c);
           o << " " << ghttp_response_status(r)

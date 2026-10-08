@@ -176,6 +176,7 @@ void ghttp_h2_settings_default(GHTTP_H2Settings * s) {
   s->initial_window_size = GHTTP_H2_DEFAULT_WINDOW;
   s->max_frame_size = GHTTP_H2_DEFAULT_MAX_FRAME_SIZE;
   s->max_header_list_size = UINT32_MAX;
+  s->enable_connect_protocol = 0;
 }
 
 void ghttp_h2_limits_default(GHTTP_H2Limits * l) {
@@ -208,6 +209,8 @@ void ghttp_h2_limits_default(GHTTP_H2Limits * l) {
   l->max_ignored_window_updates_per_interval =
       GHTTP_H2_DEFAULT_MAX_IGNORED_WINDOW_UPDATES_PER_INTERVAL;
   l->interval_ms = GHTTP_H2_DEFAULT_INTERVAL_MS;
+  l->enable_connect_protocol = 0;
+  l->max_protocol_bytes = GHTTP_H2_DEFAULT_MAX_PROTOCOL_BYTES;
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +504,10 @@ static GHTTP_Result normalise_limits(GHTTP_H2Limits * dst, const GHTTP_H2Limits 
       || dst->max_header_count == 0 || dst->max_header_block_bytes == 0
       || dst->max_body_bytes == 0 || dst->max_streams == 0
       || dst->max_concurrent_streams == 0 || dst->max_settings_per_interval == 0
-      || dst->interval_ms == 0) {
+      || dst->interval_ms == 0
+      // Only a server sends SETTINGS_ENABLE_CONNECT_PROTOCOL (checked by the
+      // caller, which knows the role); a flag is 0 or 1.
+      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)) {
     return GHTTP_ERR_INVALID;
   }
   return GHTTP_OK;
@@ -544,6 +550,9 @@ GHTTP_Result ghttp_h2_conn_create(const GHTTP_Allocator * allocator,
   c->allocator = allocator;
   c->role = role;
   GHTTP_Result r = normalise_limits(&c->limits, limits);
+  if (r == GHTTP_OK && role == GHTTP_H2_CLIENT && c->limits.enable_connect_protocol) {
+    r = GHTTP_ERR_INVALID;  // RFC 8441 section 3: only a server sends the setting
+  }
   if (r != GHTTP_OK) {
     gcu_allocator_free(allocator, c);
     return r;
@@ -596,6 +605,7 @@ GHTTP_Result ghttp_h2_conn_create(const GHTTP_Allocator * allocator,
   c->local.initial_window_size = l->initial_window_size;
   c->local.max_frame_size = (uint32_t)l->max_frame_size;
   c->local.max_header_list_size = (uint32_t)l->max_header_list_bytes;
+  c->local.enable_connect_protocol = l->enable_connect_protocol ? 1u : 0u;
 
   c->next_local_id = 1;
   c->send_window = GHTTP_H2_DEFAULT_WINDOW;
@@ -608,8 +618,8 @@ GHTTP_Result ghttp_h2_conn_create(const GHTTP_Allocator * allocator,
   if (role == GHTTP_H2_CLIENT) {
     r = ghttp_buffer_append(c->out, GHTTP_H2_PREFACE, GHTTP_H2_PREFACE_SIZE);
   }
-  uint16_t ids[6];
-  uint32_t vals[6];
+  uint16_t ids[7];
+  uint32_t vals[7];
   size_t n = 0;
   if (r == GHTTP_OK) {
     if (c->local.header_table_size != 4096) {
@@ -632,6 +642,10 @@ GHTTP_Result ghttp_h2_conn_create(const GHTTP_Allocator * allocator,
     }
     ids[n] = GHTTP_H2_SETTINGS_MAX_HEADER_LIST_SIZE;
     vals[n++] = c->local.max_header_list_size;
+    if (c->local.enable_connect_protocol) {
+      ids[n] = GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+      vals[n++] = 1;
+    }
     r = ghttp_h2_write_settings(c->out, ids, vals, n, 0);
   }
   if (r == GHTTP_OK && l->connection_window > GHTTP_H2_DEFAULT_WINDOW) {
@@ -909,9 +923,15 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
       return stream_error(c, id, GHTTP_H2_REFUSED_STREAM, HOW_SENT_RST);
     }
     GHTTP_H2MsgInfo info;
-    r = ghttp_h2msg_read_request(c->allocator, c->list, c->req, &info);
+    // A :protocol is allowed when this server has said so in its SETTINGS
+    // (RFC 8441 section 4); the client may use it as soon as it has read them.
+    r = ghttp_h2msg_read_request(c->allocator, c->list, c->req, &info,
+        c->local.enable_connect_protocol != 0, c->limits.max_protocol_bytes);
     if (r == GHTTP_ERR_OOM) {
       return oom(c);
+    }
+    if (r == GHTTP_ERR_LIMIT) {
+      return stream_error(c, id, GHTTP_H2_ENHANCE_YOUR_CALM, HOW_SENT_RST);
     }
     if (r != GHTTP_OK
         || (c->hb_end_stream && info.has_length && info.length != 0
@@ -934,6 +954,8 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
     c->ev.end_stream = c->hb_end_stream;
     c->ev.scheme = info.scheme;
     c->ev.authority = info.authority;
+    c->ev.protocol = info.protocol;
+    c->ev.tunnel = info.connect;
     return GHTTP_OK;
   }
 
@@ -980,6 +1002,7 @@ static GHTTP_Result complete_block(GHTTP_H2Conn * c) {
   if (s->connect && info.status >= 200 && info.status < 300) {
     s->mode = GHTTP_H2_STREAM_TUNNEL;
     s->has_length = false;
+    c->ev.tunnel = 1;
   }
   s->remote_ended = c->hb_end_stream;
   c->ev.type = GHTTP_H2_EVENT_HEADERS;
@@ -1109,6 +1132,19 @@ static GHTTP_Result apply_peer_setting(
       break;
     case GHTTP_H2_SETTINGS_MAX_HEADER_LIST_SIZE:
       c->peer.max_header_list_size = v;
+      break;
+    case GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL:
+      // RFC 8441 section 3.
+      if (v > 1) {
+        return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL is neither 0 nor 1");
+      }
+      if (c->role == GHTTP_H2_SERVER) {
+        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");
+      }
+      if (v == 0 && c->peer.enable_connect_protocol == 1) {
+        return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL changed from 1 to 0");
+      }
+      c->peer.enable_connect_protocol = v;
       break;
     default:
       call_extension_setting(c, id, v);  // section 5.5: otherwise ignored
@@ -1559,6 +1595,11 @@ static uint32_t count_local_streams(const GHTTP_H2Conn * c) {
   return n;
 }
 
+int ghttp_h2_conn_can_send_extended_connect(const GHTTP_H2Conn * c) {
+  return c && c->peer.enable_connect_protocol == 1
+      && ghttp_h2_conn_can_open_stream(c);
+}
+
 int ghttp_h2_conn_can_open_stream(const GHTTP_H2Conn * c) {
   return c && c->role == GHTTP_H2_CLIENT && c->failed == GHTTP_OK
       && !c->goaway_received && c->next_local_id <= GHTTP_H2_MAX_STREAM_ID
@@ -1665,6 +1706,9 @@ GHTTP_Result ghttp_h2_conn_send_request(GHTTP_H2Conn * c,
   }
   if (c->goaway_received || c->next_local_id > GHTTP_H2_MAX_STREAM_ID) {
     return GHTTP_ERR_INVALID;
+  }
+  if (ghttp_request_protocol(request) && c->peer.enable_connect_protocol != 1) {
+    return GHTTP_ERR_INVALID;  // RFC 8441 section 3: not before the server said so
   }
   if (count_local_streams(c) >= c->peer.max_concurrent_streams
       || c->nstreams >= c->limits.max_streams) {
@@ -1788,7 +1832,8 @@ GHTTP_Result ghttp_h2_conn_send_data(GHTTP_H2Conn * c, uint32_t stream_id,
   if (take > room) {
     take = room;
   }
-  const uint8_t * p = data;
+  // NULL with len 0 is an empty final frame; adding an offset to NULL is not defined.
+  const uint8_t * p = data ? (const uint8_t *)data : (const uint8_t *)"";
   size_t sent = 0;
   bool all = take == len;
   size_t max_frame = c->peer.max_frame_size;

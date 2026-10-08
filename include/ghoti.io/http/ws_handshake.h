@@ -22,7 +22,9 @@
  * @file ws_handshake.h
  *
  * The WebSocket opening handshake over HTTP/1.1: RFC 6455 section 4, with the
- * subprotocol of section 1.9 and the extension negotiation of section 9.
+ * subprotocol of section 1.9 and the extension negotiation of section 9; and,
+ * in the functions with an `_h2` suffix, over an HTTP/2 stream by Extended
+ * CONNECT (RFC 8441 sections 4 and 5), see "HTTP/2" below.
  *
  * Both functions work on the message objects the parser produces and the
  * writer takes, so the flow is
@@ -45,10 +47,29 @@
  *
  * Nothing about the connection is specific to HTTP/1.1: it takes only the
  * agreed ::GHTTP_WsNegotiated, and the permessage-deflate negotiation
- * (ws_deflate.h) takes the parameters of an offer, so a handshake of another
- * kind (the Extended CONNECT of RFC 8441) builds the same things and reuses
- * both.
+ * (ws_deflate.h) takes the parameters of an offer, so the handshake of RFC
+ * 8441 builds the same things and reuses both.
  *
+ * ### HTTP/2
+ *
+ * Over HTTP/2 the request is a CONNECT with `:protocol` `websocket` (in a
+ * GHTTP_Request: ghttp_request_protocol()), sent on a connection whose server
+ * enabled SETTINGS_ENABLE_CONNECT_PROTOCOL (h2conn.h); the response is a 200.
+ * These differ from the HTTP/1.1 handshake, and each difference is enforced:
+ *
+ *  - no `Sec-WebSocket-Key` in the request, so none is made, and none is
+ *    accepted (a request that has one is refused with 400);
+ *  - no `Sec-WebSocket-Accept` in the response, and one that is there makes the
+ *    client refuse the response;
+ *  - no `Upgrade` and `Connection` (HTTP/2 does not have them), and so no
+ *    `Connection: close` on a refusal: the caller ends the stream;
+ *  - the status is 200 and not 101;
+ *  - `Sec-WebSocket-Version` is still required and still 13 (426 and the
+ *    field in the refusal otherwise), the subprotocol and the extensions
+ *    (permessage-deflate included) are negotiated exactly as for HTTP/1.1.
+ *
+ * ws_h2.h joins the resulting stream to a ::GHTTP_WsConn.
+
  * Policy that is not the codec's: an Origin check (a server that serves
  * browsers must apply one, to refuse cross-site WebSocket hijacking; the
  * request is the caller's to inspect before it calls this) and authentication.
@@ -173,6 +194,14 @@ GHTTP_API GHTTP_Result ghttp_ws_accept_key(
     const char * key, size_t len, char accept[GHTTP_WS_ACCEPT_LEN + 1]);
 
 /**
+ * Whether an HTTP/2 request asks for a WebSocket: a CONNECT whose `:protocol`
+ * is `websocket` (RFC 8441 section 4). The counterpart of
+ * ghttp_ws_is_upgrade_request(), for a server that serves other things on the
+ * same path.
+ */
+GHTTP_API int ghttp_ws_is_h2_request(const GHTTP_Request * request);
+
+/**
  * Whether a request asks for a WebSocket: GET with `Upgrade` naming
  * `websocket` and `Connection` naming `upgrade`. For a server that serves
  * other things on the same path, to decide whether to call
@@ -256,6 +285,25 @@ GHTTP_API GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     const GHTTP_WsServerOptions * options, GHTTP_Response * response,
     GHTTP_WsServerResult * result);
 
+/**
+ * ghttp_ws_server_handshake() for an Extended CONNECT request (RFC 8441
+ * section 5): the request is the one an h2 server read (method CONNECT,
+ * `:protocol` websocket, `Host` from the `:authority`), the response is a 200
+ * with `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions` as chosen, or a
+ * refusal with no `Connection` field. The refusals are those of
+ * ghttp_ws_server_handshake() with these changes: 405 (`Allow: CONNECT`) for a
+ * method other than CONNECT, 400 for another `:protocol`, 400 for a request
+ * with a `Sec-WebSocket-Key`. The caller sends the response with
+ * ghttp_h2_conn_send_response() - ending the stream when it is a refusal - and
+ * then creates the connection and the adapter of ws_h2.h.
+ *
+ * @p result->status is 200 when accepted. Everything else is as for the
+ * HTTP/1.1 function.
+ */
+GHTTP_API GHTTP_Result ghttp_ws_server_handshake_h2(const GHTTP_Request * request,
+    const GHTTP_WsServerOptions * options, GHTTP_Response * response,
+    GHTTP_WsServerResult * result);
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -335,6 +383,20 @@ GHTTP_API GHTTP_Result ghttp_ws_client_handshake_create(
 GHTTP_API void ghttp_ws_client_handshake_destroy(GHTTP_WsClientHandshake * handshake);
 
 /**
+ * ghttp_ws_client_handshake_create() for an Extended CONNECT (RFC 8441 section
+ * 4): the request is a CONNECT whose target is @c options->target (the
+ * `:path`, "/" if NULL) and whose `:protocol` is `websocket`; its `Host` field
+ * becomes the `:authority`. It has no `Upgrade`, `Connection` or
+ * `Sec-WebSocket-Key`, so nothing is drawn from the kernel generator and
+ * @c options->nonce is ignored. Send it with ghttp_h2_conn_send_request() (the
+ * `:scheme` is that function's argument) after the server's SETTINGS have
+ * enabled the protocol; finish with ghttp_ws_client_handshake_finish_h2().
+ */
+GHTTP_API GHTTP_Result ghttp_ws_client_handshake_create_h2(
+    const GHTTP_Allocator * allocator, const GHTTP_WsClientOptions * options,
+    GHTTP_Request * request, GHTTP_WsClientHandshake ** out);
+
+/**
  * Check the server's response (RFC 6455 section 4.2.2 and the client's side of
  * section 9.1): status 101, `Upgrade`, `Connection`, the exact accept value,
  * at most one subprotocol and one of those offered, and only extensions that
@@ -348,6 +410,16 @@ GHTTP_API void ghttp_ws_client_handshake_destroy(GHTTP_WsClientHandshake * hands
  *   extension hook returned.
  */
 GHTTP_API GHTTP_Result ghttp_ws_client_handshake_finish(
+    const GHTTP_WsClientHandshake * handshake, const GHTTP_Response * response,
+    GHTTP_WsClientResult * result);
+
+/**
+ * ghttp_ws_client_handshake_finish() for an Extended CONNECT: the status must
+ * be 200, `Sec-WebSocket-Accept` must be absent, and the subprotocol and
+ * extensions are checked as there. A @p handshake made by the HTTP/1.1
+ * function, or an HTTP/1.1 handshake finished here, is GHTTP_ERR_INVALID.
+ */
+GHTTP_API GHTTP_Result ghttp_ws_client_handshake_finish_h2(
     const GHTTP_WsClientHandshake * handshake, const GHTTP_Response * response,
     GHTTP_WsClientResult * result);
 

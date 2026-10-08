@@ -27,6 +27,15 @@
  * ghttp_h2_conn_output() holds to wherever, and supplies a clock reading
  * through ghttp_h2_conn_tick() if the per-interval limits are to renew.
  *
+ * Extended CONNECT (RFC 8441) is here: a server that sets
+ * GHTTP_H2Limits::enable_connect_protocol sends SETTINGS_ENABLE_CONNECT_PROTOCOL
+ * and accepts a CONNECT request that carries a `:protocol`; a client may send
+ * one (a GHTTP_Request with ghttp_request_set_protocol()) once the server's
+ * SETTINGS have said so. Such a stream, like a plain CONNECT, is a
+ * GHTTP_H2_STREAM_TUNNEL: see "Tunnels" below. The codec checks the syntax of
+ * the `:protocol` and reports it; what it means (`websocket`, for the WebSocket
+ * of ws_h2.h) is the application's.
+ *
  * Only the prior-knowledge start (RFC 9113 section 3.3) exists: the client
  * connection preface "PRI * HTTP/2.0", then SETTINGS. The `Upgrade: h2c` path
  * was removed from the protocol and is not here.
@@ -73,6 +82,18 @@
  * GHTTP_H2Limits::manual_flow_control is set, in which case the caller returns
  * it with ghttp_h2_conn_consume() as it uses the data.
  *
+ * ### Tunnels
+ *
+ * A stream that answers a CONNECT with a 2xx (plain, RFC 9113 section 8.5, or
+ * extended, RFC 8441) carries opaque octets in its DATA frames: there is no
+ * content-length and no message body limit (the stream's flow-control window
+ * and the connection's still apply, and the concurrent-stream, closed-stream
+ * and rapid-reset limits count it like any other). END_STREAM from one side
+ * half-closes the tunnel (the DATA or HEADERS event says `end_stream`), a
+ * RST_STREAM aborts it (GHTTP_H2_EVENT_STREAM_RESET with the code), and trailers
+ * are malformed. The HEADERS event that opens it says `tunnel`, and at a server
+ * `protocol` for an Extended CONNECT.
+ *
  * ### Extension seams
  *
  * Unknown frame types and unknown SETTINGS are not dropped: they go to the
@@ -107,7 +128,7 @@ typedef enum GHTTP_H2Role {
   GHTTP_H2_SERVER
 } GHTTP_H2Role;
 
-/** A set of the six SETTINGS of RFC 9113 section 6.5.2. */
+/** A set of the six SETTINGS of RFC 9113 section 6.5.2, and the one of RFC 8441. */
 typedef struct GHTTP_H2Settings {
   size_t size;  ///< sizeof(GHTTP_H2Settings); set by _default().
   uint32_t header_table_size;       ///< Default 4096.
@@ -116,6 +137,8 @@ typedef struct GHTTP_H2Settings {
   uint32_t initial_window_size;     ///< Default 65535.
   uint32_t max_frame_size;          ///< Default 16384.
   uint32_t max_header_list_size;    ///< Default UINT32_MAX: no limit.
+  /** SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): 0 or 1; default 0. */
+  uint32_t enable_connect_protocol;
   uint64_t reserved[4];
 } GHTTP_H2Settings;
 
@@ -209,6 +232,21 @@ typedef struct GHTTP_H2Limits {
   /** Length of an interval. */
   uint32_t interval_ms;
 
+  // Extended CONNECT (RFC 8441).
+  /**
+   * A server: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 and accept a
+   * `:protocol`. Default 0 (the setting is not sent and `:protocol` is
+   * malformed), so a server behaves as before until the application opts in.
+   * A client that sets it fails ghttp_h2_conn_create() with GHTTP_ERR_INVALID:
+   * only a server sends the setting.
+   */
+  int enable_connect_protocol;
+  /**
+   * The longest `:protocol` accepted, in octets. A longer one is a stream error
+   * ENHANCE_YOUR_CALM. The default holds any registered Upgrade token.
+   */
+  size_t max_protocol_bytes;
+
   /** Non-zero: window credit is returned only by ghttp_h2_conn_consume(). */
   int manual_flow_control;
   uint64_t reserved[4];
@@ -233,6 +271,7 @@ typedef struct GHTTP_H2Limits {
 #define GHTTP_H2_DEFAULT_MAX_EXTENSION_PER_INTERVAL 1000u
 #define GHTTP_H2_DEFAULT_MAX_IGNORED_WINDOW_UPDATES_PER_INTERVAL 1000u
 #define GHTTP_H2_DEFAULT_INTERVAL_MS 10000u
+#define GHTTP_H2_DEFAULT_MAX_PROTOCOL_BYTES 64u
 
 GHTTP_API void ghttp_h2_limits_default(GHTTP_H2Limits * limits);
 
@@ -255,6 +294,8 @@ typedef enum GHTTP_H2EventType {
    * A header section decoded and validated. A server gets the request
    * (ghttp_h2_conn_request()), a client a response
    * (ghttp_h2_conn_response()); `interim` marks a 1xx. A new stream starts here.
+   * `tunnel` is set when the stream is now a tunnel (a CONNECT request at a
+   * server; a 2xx answer to a CONNECT at a client).
    */
   GHTTP_H2_EVENT_HEADERS,
   /** Message content: `data`, valid until the next feed. */
@@ -289,6 +330,7 @@ typedef struct GHTTP_H2Event {
   uint32_t stream_id;
   int end_stream;           ///< HEADERS, DATA: the peer's last frame on the stream.
   int interim;              ///< HEADERS: a 1xx response.
+  int tunnel;               ///< HEADERS: the stream is a tunnel (see "Tunnels").
   uint32_t error_code;      ///< STREAM_RESET, STREAM_ERROR, GOAWAY.
   uint32_t last_stream_id;  ///< GOAWAY.
   uint32_t increment;       ///< WINDOW_UPDATE.
@@ -298,6 +340,8 @@ typedef struct GHTTP_H2Event {
    *  or NULL when absent. Valid until the next feed. */
   const char * scheme;
   const char * authority;
+  /** HEADERS at a server: the `:protocol` of an Extended CONNECT, NUL-terminated, or NULL. Valid until the next feed. */
+  const char * protocol;
   uint64_t reserved[4];
 } GHTTP_H2Event;
 
@@ -385,6 +429,10 @@ GHTTP_API void ghttp_h2_conn_tick(GHTTP_H2Conn * conn, uint64_t now_ms);
  * @param scheme for the :scheme, unless the target names one or the method is
  *   CONNECT; NULL means "https".
  * @param[out] stream_id The new stream's identifier.
+ * A request with a `:protocol` (ghttp_request_set_protocol()) is an Extended
+ * CONNECT: its method must be CONNECT and its target origin-form or
+ * absolute-form; see ghttp_h2_conn_can_send_extended_connect().
+ *
  * @return GHTTP_ERR_LIMIT when the peer's SETTINGS_MAX_CONCURRENT_STREAMS or
  *   MAX_HEADER_LIST_SIZE would be exceeded, or too much output is queued:
  *   nothing was sent, try again later. GHTTP_ERR_INVALID after GOAWAY.
@@ -455,6 +503,14 @@ GHTTP_API void ghttp_h2_conn_peer_settings(
 /** This endpoint's settings, as advertised. */
 GHTTP_API void ghttp_h2_conn_local_settings(
     const GHTTP_H2Conn * conn, GHTTP_H2Settings * out);
+
+/**
+ * Whether a request with a `:protocol` may be sent now: the peer's SETTINGS
+ * have said SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 (RFC 8441 section 3), and
+ * ghttp_h2_conn_can_open_stream(). ghttp_h2_conn_send_request() refuses such a
+ * request with GHTTP_ERR_INVALID before that.
+ */
+GHTTP_API int ghttp_h2_conn_can_send_extended_connect(const GHTTP_H2Conn * conn);
 
 /** Whether ghttp_h2_conn_send_request() would be accepted now. */
 GHTTP_API int ghttp_h2_conn_can_open_stream(const GHTTP_H2Conn * conn);

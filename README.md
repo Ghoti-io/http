@@ -11,9 +11,7 @@ forbids, so that two parties reading one connection cannot be made to disagree
 about where a message ends.
 
 It is a codec and nothing more: no client, no server, no routing, no cookies, no
-content codings, no HTTP/3, no server push, no stream priorities, and no WebSocket
-over HTTP/2 (RFC 8441: the connection is carrier-neutral, the handshake for it is
-a later story). A request target is classified into its four forms
+content codings, no HTTP/3, no server push and no stream priorities. A request target is classified into its four forms
 and kept verbatim; decoding and normalising it belongs to the caller.
 
 ## What it enforces
@@ -49,7 +47,11 @@ streams, SETTINGS, PING and RST_STREAM per interval, buffered bytes) is capped b
 `GHTTP_H2Limits`, and a decision is the same however the input is cut.
 [documentation/rfc9113.md](documentation/rfc9113.md) and
 [documentation/hpack.md](documentation/hpack.md) list what is enforced, what is
-not, and the extension seams.
+not, and the extension seams. Extended CONNECT (RFC 8441) is there too: a server
+that sets `GHTTP_H2Limits::enable_connect_protocol` sends
+`SETTINGS_ENABLE_CONNECT_PROTOCOL` and accepts a CONNECT with a `:protocol`,
+which the codec validates and reports and never interprets; a CONNECT stream is
+a tunnel whose DATA is opaque.
 
 ## WebSocket
 
@@ -73,6 +75,14 @@ write the frames, masking a client's with fresh keys from the kernel generator.
 [documentation/permessage-deflate.md](documentation/permessage-deflate.md) list
 what is enforced, what is not, and the seams. SHA-1 and the random source come
 from `security`, and deflate from `compress`; there is no build without them.
+
+A WebSocket also runs over an HTTP/2 stream (RFC 8441): `ghttp_ws_server_handshake_h2()`
+and `ghttp_ws_client_handshake_create_h2()` / `_finish_h2()` are the handshake of
+sections 4 and 5 (no key and no accept value, a 200 for the 101, the same
+negotiation), and `<ghoti.io/http/ws_h2.h>` joins the tunnel stream of an
+`h2conn` to a `ghttp_ws_conn` unchanged: DATA in, queued bytes out as the windows
+allow, END_STREAM for the closing handshake, and an abrupt end or a reset reported
+as 1006.
 
 ```c
 GHTTP_WsServerOptions options;
@@ -177,14 +187,18 @@ Content-Length with Transfer-Encoding, ignoring a limit twice, a result that
 depends on where the input was split, an HTTP/2 flow-control off by one, an
 unbounded CONTINUATION run, an HPACK table-size update not enforced, a skipped
 stream-state check, an unmasked WebSocket frame accepted, UTF-8 not carried across
-fragments, a fragmented control frame allowed, an inflate bomb limit off) and
+fragments, a fragmented control frame allowed, an inflate bomb limit off, a setting
+accepted from a client, a `:protocol` without the setting, a tunnel that ignores
+END_STREAM, a handshake key accepted over HTTP/2) and
 requires the tests to go red for each, and
 `check-oracle`, which parses a generated corpus (valid and invalid) with this
 library and with llhttp, h11 and Go's net/http in one pinned container image
 and requires every disagreement to be explained by a rule in
 `tools/oracle/known-disagreements.tsv`; the HTTP/2 half does the same for
-connections and HPACK against nghttp2, h2 (Python) and Go's `x/net/http2`, with
-`tools/oracle/known-h2-disagreements.tsv`.
+connections and HPACK (Extended CONNECT included) against nghttp2, h2 (Python)
+and Go's `x/net/http2`, with `tools/oracle/known-h2-disagreements.tsv`, and a
+WebSocket carried over HTTP/2 between this library and h2 with websockets (both
+ends) and between this library and Go's `x/net/http2` (a tunnel, both ends).
 It needs docker or podman and the image (`make oracle-build`), and **fails**
 without them; `make check-oracle-gate` shows the gate going red for planted
 defects. `make test-valgrind`,

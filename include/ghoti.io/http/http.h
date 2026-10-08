@@ -43,6 +43,7 @@
 #include <ghoti.io/http/ws_conn.h>
 #include <ghoti.io/http/ws_deflate.h>
 #include <ghoti.io/http/ws_frame.h>
+#include <ghoti.io/http/ws_h2.h>
 #include <ghoti.io/http/ws_handshake.h>
 
 #endif // GHOTI_IO_GHTTP_HTTP_H

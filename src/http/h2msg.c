@@ -92,10 +92,15 @@ typedef struct Pseudo {
   size_t path_len;
   const char * status;
   size_t status_len;
+  const char * protocol;
+  size_t protocol_len;
   unsigned seen;  // bit per pseudo-header
 } Pseudo;
 
-enum { P_METHOD = 1, P_SCHEME = 2, P_AUTHORITY = 4, P_PATH = 8, P_STATUS = 16 };
+enum {
+  P_METHOD = 1, P_SCHEME = 2, P_AUTHORITY = 4, P_PATH = 8, P_STATUS = 16,
+  P_PROTOCOL = 32
+};
 
 /**
  * Walk the list once, applying every per-field rule, and collect the pseudo-
@@ -138,6 +143,9 @@ static GHTTP_Result scan(const GHTTP_Headers * list, Kind kind, Pseudo * ps,
           bit = P_AUTHORITY; pp = &ps->authority; pl = &ps->authority_len;
         } else if (nl == 4 && memcmp(nm, "path", 4) == 0) {
           bit = P_PATH; pp = &ps->path; pl = &ps->path_len;
+        } else if (nl == 8 && memcmp(nm, "protocol", 8) == 0) {
+          // RFC 8441 section 4. Whether it may appear is the caller's to say.
+          bit = P_PROTOCOL; pp = &ps->protocol; pl = &ps->protocol_len;
         }
       } else if (nl == 6 && memcmp(nm, "status", 6) == 0) {
         bit = P_STATUS; pp = &ps->status; pl = &ps->status_len;
@@ -260,7 +268,8 @@ static void length_info(const GHTTP_Headers * h, GHTTP_H2MsgInfo * info,
 }
 
 GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
-    const GHTTP_Headers * list, GHTTP_Request * req, GHTTP_H2MsgInfo * info) {
+    const GHTTP_Headers * list, GHTTP_Request * req, GHTTP_H2MsgInfo * info,
+    bool allow_protocol, size_t max_protocol_bytes) {
   Pseudo ps;
   size_t regular;
   memset(info, 0, sizeof(*info));
@@ -272,9 +281,27 @@ GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
     return GHTTP_ERR_CORRUPT;
   }
   info->connect = ps.method_len == 7 && memcmp(ps.method, "CONNECT", 7) == 0;
+  // RFC 8441 section 4: an Extended CONNECT carries :protocol, and then also
+  // :scheme, :path and :authority like any other request. Without the setting
+  // having been sent, or on any other method, :protocol is malformed.
+  bool extended = (ps.seen & P_PROTOCOL) != 0;
+  if (extended) {
+    if (!allow_protocol || !info->connect
+        || (ps.seen & (P_SCHEME | P_PATH | P_AUTHORITY))
+            != (P_SCHEME | P_PATH | P_AUTHORITY)) {
+      return GHTTP_ERR_CORRUPT;
+    }
+    if (ps.protocol_len > max_protocol_bytes) {
+      return GHTTP_ERR_LIMIT;
+    }
+    if (!ghttp_is_protocol_name(ps.protocol, ps.protocol_len)) {
+      return GHTTP_ERR_CORRUPT;
+    }
+  }
+  bool plain_connect = info->connect && !extended;
   const char * target;
   size_t target_len;
-  if (info->connect) {
+  if (plain_connect) {
     // Section 8.5: :scheme and :path omitted, :authority present.
     if ((ps.seen & (P_SCHEME | P_PATH)) || !(ps.seen & P_AUTHORITY)) {
       return GHTTP_ERR_CORRUPT;
@@ -291,7 +318,7 @@ GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
   if (!ghttp_is_target_text(target, target_len)) {
     return GHTTP_ERR_CORRUPT;  // empty, or a space or control character
   }
-  if (!info->connect) {
+  if (!plain_connect) {
     bool asterisk = target_len == 1 && target[0] == '*';
     bool is_options = ps.method_len == 7 && memcmp(ps.method, "OPTIONS", 7) == 0;
     if (!(target[0] == '/' || (asterisk && is_options))) {
@@ -337,8 +364,15 @@ GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
   if (r != GHTTP_OK) {
     return r;
   }
+  if (extended) {
+    r = ghttp_request_set_protocol(req, ps.protocol);
+    if (r != GHTTP_OK) {
+      return r == GHTTP_ERR_INVALID ? GHTTP_ERR_CORRUPT : r;
+    }
+  }
   info->scheme = (ps.seen & P_SCHEME) ? ps.scheme : NULL;
   info->authority = (ps.seen & P_AUTHORITY) ? ps.authority : NULL;
+  info->protocol = extended ? ps.protocol : NULL;
   length_info(out, info, &r);
   return r;
 }
@@ -489,8 +523,21 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
   const char * target = ghttp_request_target(request);
   size_t mlen = strlen(method);
   GHTTP_TargetForm form;
-  if (!ghttp_is_token(method, mlen)
-      || ghttp_request_target_form(request, &form) != GHTTP_OK) {
+  const char * protocol = ghttp_request_protocol(request);
+  if (!ghttp_is_token(method, mlen)) {
+    return GHTTP_ERR_INVALID;
+  }
+  if (protocol) {
+    // RFC 8441: an Extended CONNECT takes the target of any other request, an
+    // origin-form or absolute-form one; it is not an authority-form CONNECT.
+    if (mlen != 7 || memcmp(method, "CONNECT", 7) != 0
+        || !ghttp_is_protocol_name(protocol, strlen(protocol))
+        || ghttp_target_classify("GET", ghttp_request_target(request), &form)
+            != GHTTP_OK
+        || (form != GHTTP_TARGET_ORIGIN && form != GHTTP_TARGET_ABSOLUTE)) {
+      return GHTTP_ERR_INVALID;
+    }
+  } else if (ghttp_request_target_form(request, &form) != GHTTP_OK) {
     return GHTTP_ERR_INVALID;
   }
   const GHTTP_Headers * h = ghttp_request_headers_const(request);
@@ -517,7 +564,7 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
 
   switch (form) {
     case GHTTP_TARGET_ORIGIN:
-      if (is_connect) {
+      if (is_connect && !protocol) {
         return GHTTP_ERR_INVALID;  // CONNECT takes authority-form
       }
       path = target;
@@ -539,7 +586,7 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
       break;
     case GHTTP_TARGET_ABSOLUTE: {
       const char * sep = memchr(target, ':', tlen);
-      if (is_connect || !sep || sep + 3 > target + tlen
+      if ((is_connect && !protocol) || !sep || sep + 3 > target + tlen
           || memcmp(sep, "://", 3) != 0) {
         return GHTTP_ERR_INVALID;
       }
@@ -593,7 +640,8 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
   if (r == GHTTP_OK && is_connect && !authority) {
     r = GHTTP_ERR_INVALID;
   }
-  if (r == GHTTP_OK && !is_connect) {
+  bool plain_connect = is_connect && !protocol;
+  if (r == GHTTP_OK && !plain_connect) {
     // :scheme and :path are required, and the path is a path.
     if (!scheme_ok(sch, sch_len) || path_len == 0
         || !ghttp_is_target_text(path, path_len)
@@ -607,14 +655,30 @@ GHTTP_Result ghttp_h2msg_build_request(const GHTTP_Allocator * alloc,
   if (r == GHTTP_OK) {
     r = add_pseudo(list, ":method", method, mlen);
   }
-  if (r == GHTTP_OK && !is_connect) {
-    r = add_pseudo(list, ":scheme", sch, sch_len);
-  }
-  if (r == GHTTP_OK && authority) {
-    r = add_pseudo(list, ":authority", authority, authority_len);
-  }
-  if (r == GHTTP_OK && !is_connect) {
-    r = add_pseudo(list, ":path", path, path_len);
+  if (protocol) {
+    // The order of the examples in RFC 8441 sections 4 and 5.
+    if (r == GHTTP_OK) {
+      r = add_pseudo(list, ":protocol", protocol, strlen(protocol));
+    }
+    if (r == GHTTP_OK) {
+      r = add_pseudo(list, ":scheme", sch, sch_len);
+    }
+    if (r == GHTTP_OK) {
+      r = add_pseudo(list, ":path", path, path_len);
+    }
+    if (r == GHTTP_OK) {
+      r = add_pseudo(list, ":authority", authority, authority_len);
+    }
+  } else {
+    if (r == GHTTP_OK && !is_connect) {
+      r = add_pseudo(list, ":scheme", sch, sch_len);
+    }
+    if (r == GHTTP_OK && authority) {
+      r = add_pseudo(list, ":authority", authority, authority_len);
+    }
+    if (r == GHTTP_OK && !is_connect) {
+      r = add_pseudo(list, ":path", path, path_len);
+    }
   }
   gcu_allocator_free(alloc, path_buf);
   size_t n = ghttp_headers_count(h);

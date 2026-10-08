@@ -47,6 +47,7 @@
 typedef struct GHTTP_H2MsgInfo {
   const char * scheme;     ///< The :scheme, into the list; NULL if absent.
   const char * authority;  ///< The :authority, likewise.
+  const char * protocol;   ///< The :protocol of an Extended CONNECT, likewise.
   bool connect;            ///< A CONNECT request.
   bool has_length;         ///< A Content-Length was present and valid.
   uint64_t length;
@@ -58,9 +59,15 @@ typedef struct GHTTP_H2MsgInfo {
  * and 8.5, and fill @p req and its headers. GHTTP_ERR_CORRUPT means the
  * request is malformed (section 8.1.1: a stream error); GHTTP_ERR_OOM.
  * @p req is cleared first. The list is not changed.
+ *
+ * A `:protocol` (RFC 8441 section 4) is malformed unless @p allow_protocol,
+ * and then only on a CONNECT that also has :scheme, :path and :authority;
+ * GHTTP_ERR_LIMIT if it is longer than @p max_protocol_bytes. The request
+ * then carries it (ghttp_request_protocol()) and its target is the :path.
  */
 GHTTP_Result ghttp_h2msg_read_request(const GHTTP_Allocator * alloc,
-    const GHTTP_Headers * list, GHTTP_Request * req, GHTTP_H2MsgInfo * info);
+    const GHTTP_Headers * list, GHTTP_Request * req, GHTTP_H2MsgInfo * info,
+    bool allow_protocol, size_t max_protocol_bytes);
 
 /** The same for a response (sections 8.2 and 8.3.2). 101 is malformed. */
 GHTTP_Result ghttp_h2msg_read_response(const GHTTP_Allocator * alloc,

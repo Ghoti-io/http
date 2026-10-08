@@ -1086,7 +1086,8 @@ ORACLE := tools/oracle
 HTTP_PROBE := $(APP_DIR)/oracle/http_probe$(EXE_EXTENSION)
 H2_PROBE := $(APP_DIR)/oracle/h2_probe$(EXE_EXTENSION)
 WS_PROBE := $(APP_DIR)/oracle/ws_probe$(EXE_EXTENSION)
-ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-3
+WS_H2_PROBE := $(APP_DIR)/oracle/ws_h2_probe$(EXE_EXTENSION)
+ORACLE_IMAGE := localhost/ghoti-http-oracle-refs:deb13-4
 # More cases than the default is `make check-oracle ORACLE_ARGS='--count 40000'`.
 ORACLE_ARGS ?=
 ORACLE_H2_ARGS ?=
@@ -1107,6 +1108,12 @@ $(H2_PROBE): $(ORACLE)/h2_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
+$(WS_H2_PROBE): $(ORACLE)/ws_h2_probe.c $(APP_DIR)/$(STATIC_TARGET) \
+		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
+	@printf "\n### Compiling Oracle Probe: ws_h2_probe ###\n"
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
+
 $(WS_PROBE): $(ORACLE)/ws_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 		$(FLAGS_STAMP) | $(APP_DIR)/$(TARGET)
 	@printf "\n### Compiling Oracle Probe: ws_probe ###\n"
@@ -1114,7 +1121,7 @@ $(WS_PROBE): $(ORACLE)/ws_probe.c $(APP_DIR)/$(STATIC_TARGET) \
 	$(CC) $(CFLAGS) $(INCLUDE) -o $@ $< $(LDFLAGS) $(HTTPLIBRARY) $(DEP_LIBS)
 
 oracle-probe: ## Build the probes the differentials drive
-oracle-probe: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE)
+oracle-probe: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE) $(WS_H2_PROBE)
 
 oracle-build: ## Build the pinned reference image: llhttp, h11, Go net/http, nghttp2, h2, Go x/net/http2, wsproto, websockets and gorilla/websocket
 	docker build -t $(ORACLE_IMAGE) -f $(ORACLE)/containers/refs/Containerfile \
@@ -1132,7 +1139,7 @@ ifeq ($(OS_NAME), Linux)
 ifeq ($(GHOTI_ORACLE_REPLAY),1)
 check-oracle:
 else
-check-oracle: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE)
+check-oracle: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE) $(WS_H2_PROBE)
 endif
 	@set -e; \
 	if [ -n "$$GHOTI_BUILD_CONTAINER" ]; then \
@@ -1147,6 +1154,9 @@ endif
 		LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
 			python3 $(ORACLE)/oracle_run.py wsproto,websockets,gows -- \
 			python3 $(ORACLE)/diff_ws.py --probe $(WS_PROBE) $(ORACLE_WS_ARGS); \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+			python3 $(ORACLE)/oracle_run.py h2ws,gox2tunnel -- \
+			python3 $(ORACLE)/interop_ws_h2.py --probe $(WS_H2_PROBE); \
 	fi
 else
 # No probe is built: it is POSIX C, and the references are containers.
@@ -1249,9 +1259,10 @@ $(eval $(call fuzz-rule,fuzz_h2conn,h2conn))
 $(eval $(call fuzz-rule,fuzz_ws_conn,ws-conn))
 $(eval $(call fuzz-rule,fuzz_ws_roundtrip,ws-roundtrip))
 $(eval $(call fuzz-rule,fuzz_ws_handshake,ws-handshake))
+$(eval $(call fuzz-rule,fuzz_ws_h2,ws-h2))
 
 fuzz: ## Build and run every fuzzer for $(FUZZ_TIME) seconds each
-fuzz: fuzz-run-parse fuzz-run-roundtrip fuzz-run-hpack fuzz-run-hpack-roundtrip fuzz-run-h2conn fuzz-run-ws-conn fuzz-run-ws-roundtrip fuzz-run-ws-handshake
+fuzz: fuzz-run-parse fuzz-run-roundtrip fuzz-run-hpack fuzz-run-hpack-roundtrip fuzz-run-h2conn fuzz-run-ws-conn fuzz-run-ws-roundtrip fuzz-run-ws-handshake fuzz-run-ws-h2
 
 fuzz-clean: ## Remove the fuzz build (keeps the corpus)
 	-@rm -rf $(FUZZ_DIR)

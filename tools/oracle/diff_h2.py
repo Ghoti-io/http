@@ -134,12 +134,26 @@ def run_ours(probe, cases):
     return parse_answers("this library", done.stdout, want_count(cases))
 
 
+# A case whose arg is `xc` is run against a server that has enabled Extended
+# CONNECT (RFC 8441). The references are told by their environment, so their
+# drivers need no arguments of their own: the C and Python drivers read
+# GHTTP_REF_XCONNECT, and Go's x/net/http2 its own GODEBUG switch.
+XC_ENV = {"GHTTP_REF_XCONNECT": "1", "GODEBUG": "http2xconnect=1"}
+
+
 def run_ref(name, cases):
-    argv = oracle_env.command(name)
-    done = subprocess.run(argv, input=lines(cases), capture_output=True, text=True)
-    if done.returncode != 0:
-        raise SystemExit("%s exited %d: %s" % (name, done.returncode, done.stderr[-2000:]))
-    return parse_answers(name, done.stdout, want_count(cases))
+    groups = [({}, [c for c in cases if c.get("arg") != "xc"]),
+              (XC_ENV, [c for c in cases if c.get("arg") == "xc"])]
+    merged = {}
+    for env, sub in groups:
+        if not sub:
+            continue
+        argv = oracle_env.command(name, env=env)
+        done = subprocess.run(argv, input=lines(sub), capture_output=True, text=True)
+        if done.returncode != 0:
+            raise SystemExit("%s exited %d: %s" % (name, done.returncode, done.stderr[-2000:]))
+        merged.update(parse_answers(name, done.stdout, want_count(sub)))
+    return merged
 
 
 # ---- normalising and comparing -----------------------------------------------------
@@ -173,7 +187,9 @@ def norm_h2(res, ref=None):
         conn = "CRASH"  # the reference's own process died (gox2.main supervises)
     if ref == "gox2":
         # Go's RequestURI for CONNECT is the authority: there is no :path.
-        msgs = [m[:4] + (None if m[1] == b"CONNECT" else m[4],) + m[5:] for m in msgs]
+        # An Extended CONNECT (:protocol) has one, like any other request.
+        has_protocol = lambda m: any(k == ":protocol" for k, _ in m[5])
+        msgs = [m[:4] + (None if m[1] == b"CONNECT" and not has_protocol(m) else m[4],) + m[5:] for m in msgs]
         # Go runs each handler in its own goroutine, so the order requests are
         # recorded in is the scheduler's; they are compared in stream order.
         msgs.sort(key=lambda m: (m[0], m[1] or b""))
@@ -282,6 +298,10 @@ def controls(probe):
         {"id": 6, "kind": "he", "arg": "4096", "tag": "c",
          "data": corpus_h2.blob([(b":method", b"GET"), (b"x-a", b"1")])},
         {"id": 7, "kind": "h2", "arg": "-", "tag": "c", "data": corpus_h2.PREFACE + corpus_h2.frame(corpus_h2.PING, 0, 0, b"12345678")},
+        # Extended CONNECT is understood where it is enabled (and a reference
+        # that ignored its switch would fail here, not agree by accident).
+        {"id": 8, "kind": "h2", "arg": "xc", "tag": "c", "data": O + corpus_h2.hdrs(1, corpus_h2.xreq(), corpus_h2.END_HEADERS)},
+        {"id": 9, "kind": "h2", "arg": "-", "tag": "c", "data": O + corpus_h2.hdrs(1, corpus_h2.xreq(), corpus_h2.END_HEADERS)},
     ]
     problems = []
     runs = [("this library", lambda: run_ours(probe, cases), None)] + [
@@ -310,6 +330,15 @@ def controls(probe):
         ping_first = norm_h2(got[(7, "whole")], ref)
         if name == "this library" and ping_first[2] is None:
             problems.append("this library accepted a PING in place of the preface SETTINGS")
+        xc = norm_h2(got[(8, "whole")], ref)
+        if not (len(xc[0]) == 1 and xc[2] is None and xc[0][0][1] == b"CONNECT"
+                and (":protocol", (b"websocket",)) in xc[0][0][5]
+                and xc[0][0][4] == b"/chat"):
+            problems.append("%s did not accept an Extended CONNECT where it was enabled: %r" % (name, got[(8, "whole")]))
+        if name == "this library":
+            off = norm_h2(got[(9, "whole")], ref)
+            if off[0]:
+                problems.append("this library accepted an Extended CONNECT where it was not enabled: %r" % (got[(9, "whole")],))
     return problems
 
 

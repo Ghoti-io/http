@@ -90,6 +90,27 @@ def main(root):
     write(h2, "client-interim.seed", bytes([0x01 | 0x10 | 0x40, 16])
           + hdr(bytes.fromhex("4803333033"), 1, 4) + hdr(bytes.fromhex("88"), 1, 5))
 
+    # Extended CONNECT (RFC 8441): bit 7 enables it at a server. Blocks are
+    # plain literals (RFC 7541 section 6.2.2), so that a mutation stays near a
+    # valid request.
+    def lit(n, v):
+        return b"\x00" + bytes([len(n)]) + n + bytes([len(v)]) + v
+
+    def xblock(protocol=b"websocket", method=b"CONNECT", path=b"/chat"):
+        f = [(b":method", method), (b":protocol", protocol), (b":scheme", b"https"),
+             (b":path", path), (b":authority", b"h.example"), (b"sec-websocket-version", b"13")]
+        return b"".join(lit(n, v) for n, v in f)
+
+    xc = srv | 0x80
+    write(h2, "xc-websocket.seed", bytes([xc, 20]) + settings(ack=True) + hdr(xblock(), 1, 4)
+          + frame(0, 0, 1, bytes.fromhex("818537fa213d7f9f4d5158")) + frame(0, 1, 1, b""))
+    write(h2, "xc-protocol-on-get.seed", bytes([xc, 21]) + hdr(xblock(method=b"GET"), 1))
+    write(h2, "xc-long-protocol.seed", bytes([xc, 22]) + hdr(xblock(protocol=b"p" * 13), 1))
+    write(h2, "xc-reset-tunnels.seed", bytes([xc | 0x0a, 23]) + hdr(xblock(), 1, 4) + frame(3, 0, 1, struct.pack(">I", 8))
+          + hdr(xblock(), 3, 4) + frame(3, 0, 3, struct.pack(">I", 8)) + hdr(xblock(), 5, 4))
+    write(h2, "xc-client-setting.seed", bytes([xc, 24]) + settings([(8, 1)]) + hdr(xblock(), 1))
+    write(h2, "xc-trailers.seed", bytes([xc, 25]) + hdr(xblock(), 1, 4) + frame(0, 0, 1, b"d") + hdr(lit(b"x", b"1"), 1, 5))
+
     hp = os.path.join(root, "hpack")
     # options: bits0-2 limit profile, bit3 OOM pass, bit4 small table; then
     # length-prefixed blocks.
@@ -116,6 +137,16 @@ def main(root):
     write(rt, "custom-names.seed", bytes([0, 0x80, 3]) + b"name" + bytes([6]) + b"value1" + bytes([0x82, 2]) + b"nm" + bytes([2]) + b"v2")
 
     ws(root)
+
+    # ws-h2: byte 0 bit0 deflate, bit1 small windows, bit2 end abruptly; byte 1
+    # the cut seed; then operations (see fuzz_ws_h2.cpp).
+    w = os.path.join(root, "ws-h2")
+    write(w, "plain.seed", bytes([0, 1, 0x05]) + b"hello" + bytes([0x95]) + b"\x00\x01\x02\x03\x04" + bytes([0x40]))
+    write(w, "deflate.seed", bytes([1, 2, 0x04]) + b"lorem ipsum" + bytes([0x84]) + b"dolor sit amet" + bytes([0x42]))
+    write(w, "small-window.seed", bytes([2, 3, 0x0f]) + b"x" * 91 + bytes([0x8f]) + b"y" * 91 + bytes([0x40]))
+    write(w, "small-window-deflate.seed", bytes([3, 4, 0x0e]) + b"abc" * 90 + bytes([0xc0]))
+    write(w, "abrupt.seed", bytes([4, 5, 0x03]) + b"abc" + bytes([0x40]))
+    write(w, "ping.seed", bytes([0, 6, 0x35]) + b"ping!" + bytes([0x95]) + b"pong?" + bytes([0x40]))
 
 
 def ws(root):

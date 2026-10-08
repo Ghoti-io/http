@@ -8,7 +8,7 @@
  * Byte 0 is the options byte: bit 0 chooses the role, bits 1-3 a limit profile,
  * bit 4 whether the input is preceded by a valid preface and SETTINGS so that
  * the fuzzer reaches past it, bit 5 whether to run the allocation-failure
- * pass, bit 6 whether a client opens a stream first. Byte 1 seeds the split.
+ * pass, bit 6 whether a client opens a stream first, bit 7 (a server) whether Extended CONNECT is enabled. Byte 1 seeds the split.
  * The rest is the byte stream from the peer.
  *
  * The invariants: whole, byte by byte and in pseudo-random pieces the input
@@ -35,6 +35,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
   GHTTP_H2Role role = (options & 1) ? GHTTP_H2_CLIENT : GHTTP_H2_SERVER;
   GHTTP_H2Limits limits = fuzz::h2_limits_for(static_cast<uint8_t>(options >> 1));
   bool send_first = (options & 0x40) != 0;
+  if ((options & 0x80) && role == GHTTP_H2_SERVER) {
+    limits.enable_connect_protocol = 1;  // Extended CONNECT (RFC 8441) is accepted
+    limits.max_protocol_bytes = 12;
+  }
   if (options & 0x10) {
     // SETTINGS (empty), as a peer's preface ends.
     std::string open = role == GHTTP_H2_SERVER ? std::string(GHTTP_H2_PREFACE) : std::string();

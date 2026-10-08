@@ -48,6 +48,12 @@
  *       4-octet name length, the name, a 4-octet value length, the value,
  *       repeated): {"hex":the encoded block}
  *
+ * `arg` of an h2 case is `-`, or `xc` for a server that enables Extended CONNECT
+ * (RFC 8441): then SETTINGS_ENABLE_CONNECT_PROTOCOL is sent, a request's
+ * `:protocol` is reported as a field named `:protocol` (the references report
+ * an unknown pseudo-header field in the same list), and a CONNECT that has one
+ * reports its `:path` like any other request.
+ *
  * "incomplete" is this library's only (ghttp_h2_conn_finish): the input ended
  * inside a frame or a header block. A msg is a request that was accepted whole. The Host field this library adds
  * from :authority (RFC 9113 section 8.3.1) is left out of "headers" so that
@@ -116,10 +122,19 @@ static void buf_opt(Buf * b, const char * s) {
 }
 
 /** The fields of @p h as [[n,v]...], dropping a leading Host equal to @p authority. */
-static void buf_fields(Buf * b, const GHTTP_Headers * h, const char * authority) {
+static void buf_fields(Buf * b, const GHTTP_Headers * h, const char * authority,
+    const char * protocol) {
   buf_str(b, "[");
   size_t n = ghttp_headers_count(h);
   size_t out = 0;
+  if (protocol) {
+    buf_str(b, "[\"");
+    buf_hex(b, ":protocol", 9);
+    buf_str(b, "\",\"");
+    buf_hex(b, protocol, strlen(protocol));
+    buf_str(b, "\"]");
+    out++;
+  }
   for (size_t i = 0; i < n; i++) {
     GHTTP_Field f;
     if (ghttp_headers_at(h, i, &f) != GHTTP_OK) {
@@ -197,7 +212,8 @@ static void h2_event(H2Run * r, GHTTP_H2Conn * c, const GHTTP_H2Event * ev) {
     const GHTTP_Request * q = ghttp_h2_conn_request(c);
     const char * method = ghttp_request_method(q);
     const char * target = ghttp_request_target(q);
-    int connect = strcmp(method, "CONNECT") == 0;
+    const char * protocol = ghttp_request_protocol(q);
+    int connect = strcmp(method, "CONNECT") == 0 && !protocol;
     Buf * h = &m->head;
     buf_str(h, "\"method\":");
     buf_opt(h, method);
@@ -208,7 +224,7 @@ static void h2_event(H2Run * r, GHTTP_H2Conn * c, const GHTTP_H2Event * ev) {
     buf_str(h, ",\"path\":");
     buf_opt(h, connect ? NULL : target);
     buf_str(h, ",\"headers\":");
-    buf_fields(h, ghttp_request_headers_const(q), ev->authority);
+    buf_fields(h, ghttp_request_headers_const(q), ev->authority, protocol);
     buf_str(&m->trailers, "[]");
     break;
   }
@@ -224,7 +240,7 @@ static void h2_event(H2Run * r, GHTTP_H2Conn * c, const GHTTP_H2Event * ev) {
     Msg * m = find_msg(r, ev->stream_id);
     if (m) {
       m->trailers.len = 0;
-      buf_fields(&m->trailers, ghttp_h2_conn_trailers(c), NULL);
+      buf_fields(&m->trailers, ghttp_h2_conn_trailers(c), NULL, NULL);
       m->ended = 1;
     }
     break;
@@ -256,9 +272,13 @@ static GHTTP_Result h2_piece(H2Run * r, GHTTP_H2Conn * c,
   return GHTTP_OK;
 }
 
-static void run_h2(const char * id, int bytewise, const unsigned char * data, size_t len) {
+static void run_h2(const char * id, const char * arg, int bytewise,
+    const unsigned char * data, size_t len) {
   GHTTP_H2Conn * c = NULL;
-  if (ghttp_h2_conn_create(NULL, GHTTP_H2_SERVER, NULL, &c) != GHTTP_OK) {
+  GHTTP_H2Limits limits;
+  ghttp_h2_limits_default(&limits);
+  limits.enable_connect_protocol = strcmp(arg, "xc") == 0;
+  if (ghttp_h2_conn_create(NULL, GHTTP_H2_SERVER, &limits, &c) != GHTTP_OK) {
     fputs("h2_probe: cannot create a connection\n", stderr);
     exit(2);
   }
@@ -348,7 +368,7 @@ static void run_hd(const char * id, size_t table, const unsigned char * data, si
   GHTTP_Result r = ghttp_hpack_decode(d, data, len, h);
   Buf out = {0};
   buf_str(&out, "{\"list\":");
-  buf_fields(&out, h, NULL);
+  buf_fields(&out, h, NULL, NULL);
   buf_str(&out, r == GHTTP_OK ? ",\"error\":false,\"err\":\"\"}" : ",\"error\":true,\"err\":\"");
   if (r != GHTTP_OK) {
     buf_str(&out, ghttp_result_string(r));
@@ -487,7 +507,7 @@ int main(void) {
       data[k] = (unsigned char)(a << 4 | b);
     }
     if (strcmp(f[1], "h2") == 0) {
-      run_h2(f[0], strcmp(f[2], "byte") == 0, data, hl / 2);
+      run_h2(f[0], f[3], strcmp(f[2], "byte") == 0, data, hl / 2);
     } else if (strcmp(f[1], "hd") == 0) {
       run_hd(f[0], (size_t)strtoul(f[3], NULL, 10), data, hl / 2);
     } else if (strcmp(f[1], "he") == 0) {

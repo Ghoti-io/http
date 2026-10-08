@@ -10,3 +10,4 @@
 !ws-conn/
 !ws-roundtrip/
 !ws-handshake/
+!ws-h2/

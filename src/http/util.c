@@ -59,6 +59,16 @@ bool ghttp_is_token(const char * s, size_t n) {
   return true;
 }
 
+bool ghttp_is_protocol_name(const char * s, size_t n) {
+  // RFC 9110 section 7.8: protocol = protocol-name ["/" protocol-version], each a token.
+  const char * slash = n ? memchr(s, '/', n) : NULL;
+  if (!slash) {
+    return ghttp_is_token(s, n);
+  }
+  size_t first = (size_t)(slash - s);
+  return ghttp_is_token(s, first) && ghttp_is_token(slash + 1, n - first - 1);
+}
+
 bool ghttp_is_field_text(const char * s, size_t n) {
   for (size_t i = 0; i < n; i++) {
     unsigned char c = (unsigned char)s[i];
@@ -395,6 +405,9 @@ GHTTP_Result ghttp_request_validate(const GHTTP_Request * request) {
   const char * method = ghttp_request_method(request);
   if (!ghttp_is_token(method, strlen(method))) {
     return GHTTP_ERR_CORRUPT;
+  }
+  if (ghttp_request_protocol(request)) {
+    return GHTTP_ERR_CORRUPT;  // a :protocol exists only in HTTP/2 (RFC 8441)
   }
   GHTTP_TargetForm form;
   GHTTP_Result r = ghttp_target_classify(

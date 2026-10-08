@@ -155,7 +155,10 @@ inline H2Run h2_run(GHTTP_H2Role role, const GHTTP_H2Limits & limits,
             t += std::string("REQ ") + ghttp_request_method(q) + " " + ghttp_request_target(q) + "\n";
             put_h2_fields(t, ghttp_request_headers_const(q));
             t += std::string("SA ") + (ev.scheme ? ev.scheme : "-") + " "
-                + (ev.authority ? ev.authority : "-") + "\n";
+                + (ev.authority ? ev.authority : "-") + " "
+                + (ev.protocol ? ev.protocol : "-") + " t" + std::to_string(ev.tunnel) + "\n";
+            REQUIRE((ev.protocol != nullptr) == (ghttp_request_protocol(q) != nullptr),
+                "the event and the request disagree about :protocol");
             GHTTP_Response * rs = nullptr;
             if (ghttp_response_create(alloc, &rs) == GHTTP_OK) {
               GHTTP_Result sr = ghttp_response_set_status(

@@ -35,6 +35,7 @@ struct GHTTP_Request {
   const GHTTP_Allocator * allocator;
   char * method;
   char * target;
+  char * protocol;  // the :protocol of an Extended CONNECT (RFC 8441); NULL for none
   int minor;
   GHTTP_Headers * headers;
 };
@@ -85,6 +86,7 @@ void ghttp_request_destroy(GHTTP_Request * r) {
   const GHTTP_Allocator * a = r->allocator;
   gcu_allocator_free(a, r->method);
   gcu_allocator_free(a, r->target);
+  gcu_allocator_free(a, r->protocol);
   ghttp_headers_destroy(r->headers);
   gcu_allocator_free(a, r);
 }
@@ -103,6 +105,9 @@ GHTTP_Result ghttp_request_assign(GHTTP_Request * r, const char * method,
   r->method = m;
   r->target = t;
   r->minor = minor;
+  // A new request line is a new request: it has no :protocol until one is set.
+  gcu_allocator_free(r->allocator, r->protocol);
+  r->protocol = NULL;
   return GHTTP_OK;
 }
 
@@ -139,6 +144,30 @@ GHTTP_Result ghttp_request_set_version(GHTTP_Request * r, int minor) {
   }
   r->minor = minor;
   return GHTTP_OK;
+}
+
+GHTTP_Result ghttp_request_set_protocol(
+    GHTTP_Request * r, const char * protocol) {
+  if (!r) {
+    return GHTTP_ERR_INVALID;
+  }
+  char * p = NULL;
+  if (protocol) {
+    if (!ghttp_is_protocol_name(protocol, strlen(protocol))) {
+      return GHTTP_ERR_INVALID;
+    }
+    p = ghttp_strndup(r->allocator, protocol, strlen(protocol));
+    if (!p) {
+      return GHTTP_ERR_OOM;
+    }
+  }
+  gcu_allocator_free(r->allocator, r->protocol);
+  r->protocol = p;
+  return GHTTP_OK;
+}
+
+const char * ghttp_request_protocol(const GHTTP_Request * r) {
+  return r ? r->protocol : NULL;
 }
 
 const char * ghttp_request_method(const GHTTP_Request * r) {

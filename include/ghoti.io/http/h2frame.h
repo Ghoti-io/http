@@ -106,7 +106,9 @@ typedef enum GHTTP_H2SettingId {
   GHTTP_H2_SETTINGS_MAX_CONCURRENT_STREAMS = 0x3,
   GHTTP_H2_SETTINGS_INITIAL_WINDOW_SIZE = 0x4,
   GHTTP_H2_SETTINGS_MAX_FRAME_SIZE = 0x5,
-  GHTTP_H2_SETTINGS_MAX_HEADER_LIST_SIZE = 0x6
+  GHTTP_H2_SETTINGS_MAX_HEADER_LIST_SIZE = 0x6,
+  /** RFC 8441 section 3: the server accepts the `:protocol` pseudo-header field (Extended CONNECT). */
+  GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x8
 } GHTTP_H2SettingId;
 
 /** A name for an error code, such as "PROTOCOL_ERROR"; "UNKNOWN" if none. */

@@ -100,6 +100,28 @@ GHTTP_API GHTTP_Result ghttp_request_set_target(
 GHTTP_API GHTTP_Result ghttp_request_set_version(
     GHTTP_Request * request, int minor);
 
+/**
+ * @brief Set the `:protocol` of an Extended CONNECT request (RFC 8441), or
+ *   clear it with NULL.
+ *
+ * Only HTTP/2 carries one: the HTTP/2 connection sends it, and reports it for
+ * a request it read, as a `:protocol` pseudo-header field. The HTTP/1.1 writer
+ * refuses a request that has one. Such a request is a CONNECT whose target is
+ * the `:path` (origin-form) or an absolute-form target that gives the
+ * `:scheme`, `:authority` and `:path`; ghttp_request_target_form() does not
+ * classify it, because it is not an HTTP/1.1 CONNECT. The library checks the
+ * syntax (a token, optionally followed by "/" and a second token, the shape of
+ * an HTTP Upgrade token) and never interprets it.
+ *
+ * @return GHTTP_OK; GHTTP_ERR_INVALID for a NULL request or a value that is
+ *   not such a name; GHTTP_ERR_OOM. Unchanged on failure.
+ */
+GHTTP_API GHTTP_Result ghttp_request_set_protocol(
+    GHTTP_Request * request, const char * protocol);
+
+/** @brief The `:protocol` (see ghttp_request_set_protocol()), or NULL if the request has none. */
+GHTTP_API const char * ghttp_request_protocol(const GHTTP_Request * request);
+
 /** @brief The method, NUL-terminated, owned by the request. */
 GHTTP_API const char * ghttp_request_method(const GHTTP_Request * request);
 

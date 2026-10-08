@@ -278,7 +278,10 @@ static int on_header(nghttp2_session *ses, const nghttp2_frame *frame, const uin
         return 0;
       }
     }
-    note(c, "unknown pseudo-header reached the application");
+    /* :protocol (RFC 8441) is reported with the fields, as a name and value. */
+    if (!(namelen == 9 && !memcmp(name, ":protocol", 9))) {
+      note(c, "unknown pseudo-header reached the application");
+    }
     list_add(&s->pending, name, namelen, value, valuelen);
     return 0;
   }
@@ -399,8 +402,12 @@ static void run_h2(const buf_t *in, int byte, buf_t *res) {
         {NGHTTP2_SETTINGS_MAX_FRAME_SIZE, 16384},
         {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 4096},
         {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, 65536},
+        {NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1},
     };
-    rv = nghttp2_submit_settings(ses, NGHTTP2_FLAG_NONE, iv, sizeof iv / sizeof *iv);
+    /* GHTTP_REF_XCONNECT=1: the server enables Extended CONNECT (RFC 8441),
+     * which is what lets nghttp2 pass a :protocol to the application. */
+    size_t niv = sizeof iv / sizeof *iv - (getenv("GHTTP_REF_XCONNECT") ? 0 : 1);
+    rv = nghttp2_submit_settings(ses, NGHTTP2_FLAG_NONE, iv, niv);
     if (rv) note(c, nghttp2_strerror(rv));
     pump(ses, &out);
 

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python3 /usr/local/lib/ghttp-ref/ref-wsh2-client.py --version

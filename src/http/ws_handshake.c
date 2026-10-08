@@ -399,15 +399,18 @@ int ghttp_ws_is_upgrade_request(const GHTTP_Request * request) {
 // Server
 // ---------------------------------------------------------------------------
 
-static GHTTP_Result refuse(GHTTP_Response * response, GHTTP_WsServerResult * result,
-    int status, const char * phrase, const char * reason) {
+static GHTTP_Result refuse_as(bool h2, GHTTP_Response * response,
+    GHTTP_WsServerResult * result, int status, const char * phrase,
+    const char * reason) {
   GHTTP_Result r = ghttp_response_set_status(response, status, phrase);
   if (r == GHTTP_OK) {
     r = ghttp_response_set_version(response, 1);
   }
   GHTTP_Headers * h = ghttp_response_headers(response);
   ghttp_headers_clear(h);
-  if (r == GHTTP_OK) {
+  // HTTP/2 has no Connection field (RFC 9113 section 8.2.2): the stream ends
+  // instead, and the caller ends it with the response.
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(h, "Connection", "close");
   }
   if (r == GHTTP_OK) {
@@ -417,7 +420,7 @@ static GHTTP_Result refuse(GHTTP_Response * response, GHTTP_WsServerResult * res
     r = ghttp_headers_add(h, "Sec-WebSocket-Version", "13");
   }
   if (r == GHTTP_OK && status == 405) {
-    r = ghttp_headers_add(h, "Allow", "GET");
+    r = ghttp_headers_add(h, "Allow", h2 ? "CONNECT" : "GET");
   }
   if (r != GHTTP_OK) {
     return r;
@@ -507,9 +510,17 @@ static bool name_chosen(const char * list, size_t list_len, const char * name, s
   return false;
 }
 
-GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
+/**
+ * The server's handshake for either carrier. @p h2 selects the differences of
+ * RFC 8441 section 5: a CONNECT request with `:protocol` websocket in place of
+ * a GET with Upgrade and Connection, no Sec-WebSocket-Key (so no accept value
+ * either), and a 200 in place of the 101. Everything else - the version, the
+ * Origin, the subprotocol and the extensions - is one code path.
+ */
+static GHTTP_Result server_handshake(bool h2, const GHTTP_Request * request,
     const GHTTP_WsServerOptions * options, GHTTP_Response * response,
     GHTTP_WsServerResult * result) {
+#define refuse(...) refuse_as(h2, __VA_ARGS__)
   if (!request || !response || !result) {
     return GHTTP_ERR_INVALID;
   }
@@ -544,13 +555,25 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     return refuse(response, result, 431, "Request Header Fields Too Large",
         "the handshake is larger than the limit");
   }
-  if (strcmp(ghttp_request_method(request), "GET") != 0) {
-    return refuse(response, result, 405, "Method Not Allowed",
-        "the method is not GET");
-  }
-  if (ghttp_request_version(request) != 1) {
-    return refuse(response, result, 400, "Bad Request",
-        "HTTP/1.1 or later is required");
+  if (h2) {
+    if (strcmp(ghttp_request_method(request), "CONNECT") != 0) {
+      return refuse(response, result, 405, "Method Not Allowed",
+          "the method is not CONNECT");
+    }
+    const char * protocol = ghttp_request_protocol(request);
+    if (!protocol || !ghttp_ieq(protocol, strlen(protocol), "websocket")) {
+      return refuse(response, result, 400, "Bad Request",
+          "the :protocol is not websocket");
+    }
+  } else {
+    if (strcmp(ghttp_request_method(request), "GET") != 0) {
+      return refuse(response, result, 405, "Method Not Allowed",
+          "the method is not GET");
+    }
+    if (ghttp_request_version(request) != 1) {
+      return refuse(response, result, 400, "Bad Request",
+          "HTTP/1.1 or later is required");
+    }
   }
   const char * host;
   size_t host_len;
@@ -558,11 +581,11 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     return refuse(response, result, 400, "Bad Request",
         "Host is missing or repeated");  // RFC 6455 section 4.2.1 item 1
   }
-  if (!ghttp_headers_list_has(h, "upgrade", "websocket")) {
+  if (!h2 && !ghttp_headers_list_has(h, "upgrade", "websocket")) {
     return refuse(response, result, 400, "Bad Request",
         "no Upgrade: websocket");
   }
-  if (!ghttp_headers_list_has(h, "connection", "upgrade")) {
+  if (!h2 && !ghttp_headers_list_has(h, "connection", "upgrade")) {
     return refuse(response, result, 400, "Bad Request",
         "no Connection: Upgrade");
   }
@@ -577,9 +600,17 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     return refuse(response, result, 426, "Upgrade Required",
         "the version is not 13");
   }
-  const char * key;
-  size_t key_len;
-  if (!single_field(h, "sec-websocket-key", &key, &key_len)
+  const char * key = NULL;
+  size_t key_len = 0;
+  if (h2) {
+    // RFC 8441 section 5: the key and the accept value are not used. A key here
+    // is a client written for the other carrier, or one probing for a server
+    // that takes either; there is nothing for it to prove, so it is refused.
+    if (count_fields(h, "sec-websocket-key") != 0) {
+      return refuse(response, result, 400, "Bad Request",
+          "Sec-WebSocket-Key is not used over HTTP/2");
+    }
+  } else if (!single_field(h, "sec-websocket-key", &key, &key_len)
       || !ghttp_ws_key_is_valid(key, key_len)) {
     return refuse(response, result, 400, "Bad Request",
         "Sec-WebSocket-Key is missing, repeated or not sixteen octets of base64");
@@ -716,23 +747,30 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
   }
 
   char accept[GHTTP_WS_ACCEPT_LEN + 1];
-  GHTTP_Result r = ghttp_ws_accept_key(key, key_len, accept);
-  if (r != GHTTP_OK) {
-    return r;
+  GHTTP_Result r = GHTTP_OK;
+  if (!h2) {
+    r = ghttp_ws_accept_key(key, key_len, accept);
+    if (r != GHTTP_OK) {
+      return r;
+    }
   }
-  r = ghttp_response_set_status(response, 101, "Switching Protocols");
+  if (h2) {
+    r = ghttp_response_set_status(response, 200, "OK");
+  } else {
+    r = ghttp_response_set_status(response, 101, "Switching Protocols");
+  }
   if (r == GHTTP_OK) {
     r = ghttp_response_set_version(response, 1);
   }
   GHTTP_Headers * rh = ghttp_response_headers(response);
   ghttp_headers_clear(rh);
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(rh, "Upgrade", "websocket");
   }
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(rh, "Connection", "Upgrade");
   }
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(rh, "Sec-WebSocket-Accept", accept);
   }
   if (r == GHTTP_OK && chosen) {
@@ -748,8 +786,27 @@ GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
     memcpy(result->negotiated.subprotocol, chosen, strlen(chosen) + 1);
   }
   result->accepted = 1;
-  result->status = 101;
+  result->status = h2 ? 200 : 101;
   return GHTTP_OK;
+#undef refuse
+}
+
+GHTTP_Result ghttp_ws_server_handshake(const GHTTP_Request * request,
+    const GHTTP_WsServerOptions * options, GHTTP_Response * response,
+    GHTTP_WsServerResult * result) {
+  return server_handshake(false, request, options, response, result);
+}
+
+GHTTP_Result ghttp_ws_server_handshake_h2(const GHTTP_Request * request,
+    const GHTTP_WsServerOptions * options, GHTTP_Response * response,
+    GHTTP_WsServerResult * result) {
+  return server_handshake(true, request, options, response, result);
+}
+
+int ghttp_ws_is_h2_request(const GHTTP_Request * request) {
+  const char * protocol = request ? ghttp_request_protocol(request) : NULL;
+  return protocol && strcmp(ghttp_request_method(request), "CONNECT") == 0
+      && ghttp_ieq(protocol, strlen(protocol), "websocket");
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +817,7 @@ struct GHTTP_WsClientHandshake {
   const GHTTP_Allocator * allocator;
   GHTTP_WsLimits limits;
   char accept[GHTTP_WS_ACCEPT_LEN + 1];
+  bool h2;  // built for Extended CONNECT: no key, no accept value
   bool offered_deflate;
   GHTTP_WsDeflateParams offered;
   char ** protocols;
@@ -794,7 +852,7 @@ static size_t extension_name_len(const char * text) {
   return n;
 }
 
-GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
+static GHTTP_Result client_create(bool h2, const GHTTP_Allocator * allocator,
     const GHTTP_WsClientOptions * options, GHTTP_Request * request,
     GHTTP_WsClientHandshake ** out) {
   if (!options || !request || !out || !options->host) {
@@ -833,6 +891,7 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
     gcu_allocator_free(allocator, hs);
     return GHTTP_ERR_INVALID;
   }
+  hs->h2 = h2;
   hs->offered_deflate = options->enable_deflate != 0;
   hs->offered = options->deflate;
   hs->extension_fn = options->extension_fn;
@@ -840,13 +899,16 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
   GHTTP_Result r = GHTTP_OK;
 
   uint8_t nonce[16];
-  if (options->nonce) {
+  if (h2) {
+    // RFC 8441 section 5: no key, so nothing to draw and no accept to expect.
+  } else if (options->nonce) {
     memcpy(nonce, options->nonce, sizeof(nonce));
   } else if (gsec_random_bytes(nonce, sizeof(nonce), NULL) != GSEC_OK) {
     r = GHTTP_ERR_IO;
   }
   char key[GHTTP_WS_KEY_LEN + 1];
-  if (r == GHTTP_OK) {
+  key[0] = '\0';
+  if (r == GHTTP_OK && !h2) {
     ghttp_ws_base64_encode(nonce, sizeof(nonce), key);
     key[GHTTP_WS_KEY_LEN] = '\0';
     r = ghttp_ws_accept_key(key, GHTTP_WS_KEY_LEN, hs->accept);
@@ -888,7 +950,7 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
   // The request.
   GHTTP_Headers * h = ghttp_request_headers(request);
   if (r == GHTTP_OK) {
-    r = ghttp_request_set_method(request, "GET");
+    r = ghttp_request_set_method(request, h2 ? "CONNECT" : "GET");
   }
   if (r == GHTTP_OK) {
     r = ghttp_request_set_target(request, options->target ? options->target : "/");
@@ -896,17 +958,21 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
   if (r == GHTTP_OK) {
     r = ghttp_request_set_version(request, 1);
   }
+  if (r == GHTTP_OK) {
+    // Clears a :protocol left by an earlier use of the object.
+    r = ghttp_request_set_protocol(request, h2 ? "websocket" : NULL);
+  }
   ghttp_headers_clear(h);
   if (r == GHTTP_OK) {
     r = ghttp_headers_add(h, "Host", options->host);
   }
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(h, "Upgrade", "websocket");
   }
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(h, "Connection", "Upgrade");
   }
-  if (r == GHTTP_OK) {
+  if (r == GHTTP_OK && !h2) {
     r = ghttp_headers_add(h, "Sec-WebSocket-Key", key);
   }
   if (r == GHTTP_OK) {
@@ -971,6 +1037,18 @@ GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
   return GHTTP_OK;
 }
 
+GHTTP_Result ghttp_ws_client_handshake_create(const GHTTP_Allocator * allocator,
+    const GHTTP_WsClientOptions * options, GHTTP_Request * request,
+    GHTTP_WsClientHandshake ** out) {
+  return client_create(false, allocator, options, request, out);
+}
+
+GHTTP_Result ghttp_ws_client_handshake_create_h2(const GHTTP_Allocator * allocator,
+    const GHTTP_WsClientOptions * options, GHTTP_Request * request,
+    GHTTP_WsClientHandshake ** out) {
+  return client_create(true, allocator, options, request, out);
+}
+
 static GHTTP_Result reject(GHTTP_WsClientResult * result, const char * reason) {
   result->accepted = 0;
   result->reason = reason;
@@ -992,10 +1070,10 @@ static bool check_protocol(void * ctx, const char * t, size_t n) {
   return true;
 }
 
-GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs,
+static GHTTP_Result client_finish(bool h2, const GHTTP_WsClientHandshake * hs,
     const GHTTP_Response * response, GHTTP_WsClientResult * result) {
-  if (!hs || !response || !result) {
-    return GHTTP_ERR_INVALID;
+  if (!hs || !response || !result || hs->h2 != h2) {
+    return GHTTP_ERR_INVALID;  // a handshake finishes on the carrier it began on
   }
   memset(result, 0, sizeof(*result));
   result->size = sizeof(*result);
@@ -1003,26 +1081,35 @@ GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs
   ghttp_ws_negotiated_default(&result->negotiated);
   const GHTTP_Headers * h = ghttp_response_headers_const(response);
 
-  if (ghttp_response_status(response) != 101) {
-    return reject(result, "the status is not 101");
+  if (ghttp_response_status(response) != (h2 ? 200 : 101)) {
+    return reject(result, h2 ? "the status is not 200" : "the status is not 101");
   }
   if (headers_size(h) > hs->limits.max_handshake_bytes) {
     return reject(result, "the handshake is larger than the limit");
   }
-  if (!ghttp_headers_list_has(h, "upgrade", "websocket")) {
-    return reject(result, "no Upgrade: websocket");
-  }
-  if (!ghttp_headers_list_has(h, "connection", "upgrade")) {
-    return reject(result, "no Connection: Upgrade");
-  }
-  const char * acc;
-  size_t acc_len;
-  if (!single_field(h, "sec-websocket-accept", &acc, &acc_len)) {
-    return reject(result, "Sec-WebSocket-Accept is missing or repeated");
-  }
-  ghttp_trim_ows(&acc, &acc_len);
-  if (acc_len != GHTTP_WS_ACCEPT_LEN || memcmp(acc, hs->accept, acc_len) != 0) {
-    return reject(result, "Sec-WebSocket-Accept is not the value for the key sent");
+  if (h2) {
+    // RFC 8441 section 5: there was no key, so there is no accept value to
+    // check, and one that is present is a server that answered the other
+    // carrier's handshake.
+    if (count_fields(h, "sec-websocket-accept") != 0) {
+      return reject(result, "Sec-WebSocket-Accept is not used over HTTP/2");
+    }
+  } else {
+    if (!ghttp_headers_list_has(h, "upgrade", "websocket")) {
+      return reject(result, "no Upgrade: websocket");
+    }
+    if (!ghttp_headers_list_has(h, "connection", "upgrade")) {
+      return reject(result, "no Connection: Upgrade");
+    }
+    const char * acc;
+    size_t acc_len;
+    if (!single_field(h, "sec-websocket-accept", &acc, &acc_len)) {
+      return reject(result, "Sec-WebSocket-Accept is missing or repeated");
+    }
+    ghttp_trim_ows(&acc, &acc_len);
+    if (acc_len != GHTTP_WS_ACCEPT_LEN || memcmp(acc, hs->accept, acc_len) != 0) {
+      return reject(result, "Sec-WebSocket-Accept is not the value for the key sent");
+    }
   }
 
   // Subprotocol: none, or exactly one that was offered.
@@ -1131,4 +1218,14 @@ GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs
   }
   result->accepted = 1;
   return GHTTP_OK;
+}
+
+GHTTP_Result ghttp_ws_client_handshake_finish(const GHTTP_WsClientHandshake * hs,
+    const GHTTP_Response * response, GHTTP_WsClientResult * result) {
+  return client_finish(false, hs, response, result);
+}
+
+GHTTP_Result ghttp_ws_client_handshake_finish_h2(const GHTTP_WsClientHandshake * hs,
+    const GHTTP_Response * response, GHTTP_WsClientResult * result) {
+  return client_finish(true, hs, response, result);
 }

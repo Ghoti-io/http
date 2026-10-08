@@ -118,9 +118,18 @@ expect_red() {  # name dir needle [forbidden]
   fi
 }
 
+# GATE_ONLY="name name": run only those plants (the controls still run). For
+# re-running the few that a change to the gate itself touched, not for a verdict.
+wanted() {
+  [ -z "${GATE_ONLY:-}" ] && return 0
+  case " $GATE_ONLY " in *" $1 "*) return 0;; esac
+  return 1
+}
+
 # plant_lib <name> <file> <old> <new> <needle> [forbidden]
 plant_lib() {
   name=$1 file=$2 old=$3 new=$4 needle=$5 forbid=${6:-}
+  wanted "$name" || return
   dir="$SCRATCH/$name"
   cp -a "$SCRATCH/control" "$dir"
   if ! edit "$dir" "$file" "$old" "$new"; then
@@ -132,7 +141,8 @@ plant_lib() {
   # The control's probe and archive came along: a path make did not match would
   # leave the OLD binary to run against nothing patched.
   rm -f "$dir/$BUILD_DIR"/apps/*.a "$dir/$BUILD_DIR"/apps/*.so* "$dir/$BUILD_DIR"/apps/oracle/http_probe \
-    "$dir/$BUILD_DIR"/apps/oracle/h2_probe "$dir/$BUILD_DIR"/apps/oracle/ws_probe
+    "$dir/$BUILD_DIR"/apps/oracle/h2_probe "$dir/$BUILD_DIR"/apps/oracle/ws_probe \
+    "$dir/$BUILD_DIR"/apps/oracle/ws_h2_probe
   if ! ( cd "$dir" && "$MAKE_CMD" --no-print-directory oracle-probe $MARGS ) > "$dir-build.log" 2>&1; then
     printf 'check-oracle-gate: %s: the patched copy does not build\n' "$name" >&2
     tail -10 "$dir-build.log" >&2
@@ -146,6 +156,7 @@ plant_lib() {
 # run with the control's unpatched probe.
 plant_harness() {
   name=$1 file=$2 old=$3 new=$4 needle=$5
+  wanted "$name" || return
   dir="$SCRATCH/$name"
   cp -a "$SCRATCH/control" "$dir"
   if ! edit "$dir" "$file" "$old" "$new"; then
@@ -257,19 +268,54 @@ plant_harness h2-comparator-blind-to-bodies tools/oracle/diff_h2.py \
   'did not deliver a 3-octet body'
 
 plant_harness h2-reference-answers-nothing tools/oracle/diff_h2.py \
-  '    return parse_answers(name, done.stdout, want_count(cases))
+  '    return merged
 
 
 # ---- normalising' \
-  '    got = parse_answers(name, done.stdout, want_count(cases))
-    if name == "h2":
-        for v in got.values():
+  '    if name == "h2":
+        for v in merged.values():
             v.update(msgs=[], resets=[], conn_error=None, closed=False)
-    return got
+    return merged
 
 
 # ---- normalising' \
   'did not accept a good request'
+
+# Extended CONNECT (story 3d), in the same differential. The cases that show
+# them are the `rfc8441-` hand cases (and, for a defect only a mutation
+# reaches, the `genxc:` ones).
+plant_lib h2-accept-protocol-on-any-method src/http/h2msg.c \
+  '    if (!allow_protocol || !info->connect
+        || (ps.seen' \
+  '    if (!allow_protocol
+        || (ps.seen' \
+  'tag=rfc8441-4:protocol-on-'
+
+plant_lib h2-accept-protocol-without-the-setting src/http/h2msg.c \
+  '    if (!allow_protocol || !info->connect' \
+  '    if ((allow_protocol && 0) || !info->connect' \
+  'accepted an Extended CONNECT where it was not enabled'
+
+plant_lib h2-accept-protocol-without-authority src/http/h2msg.c \
+  '        || (ps.seen & (P_SCHEME | P_PATH | P_AUTHORITY))
+            != (P_SCHEME | P_PATH | P_AUTHORITY)) {' \
+  '        || (ps.seen & (P_SCHEME | P_PATH))
+            != (P_SCHEME | P_PATH)) {' \
+  'tag=rfc8441-4:no-authority'
+
+plant_lib h2-accept-the-setting-from-a-client src/http/h2conn.c \
+  '      if (c->role == GHTTP_H2_SERVER) {
+        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
+  '      if (c->role == GHTTP_H2_SERVER && 0) {
+        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
+  'explains nothing'
+
+plant_harness h2-xc-reference-not-told-to-enable-it tools/oracle/diff_h2.py \
+  '    groups = [({}, [c for c in cases if c.get("arg") != "xc"]),
+              (XC_ENV, [c for c in cases if c.get("arg") == "xc"])]' \
+  '    groups = [({}, [c for c in cases if c.get("arg") != "xc"]),
+              ({}, [c for c in cases if c.get("arg") == "xc"])]' \
+  'did not accept an Extended CONNECT where it was enabled'
 
 # ---- WebSocket (story 3c): the same, against diff_ws.py -------------------------
 
@@ -336,6 +382,44 @@ plant_harness ws-reference-answers-nothing tools/oracle/diff_ws.py \
 
 # ---- normalising' \
   'wsproto did not read a good stream as a server'
+
+# ---- WebSocket over HTTP/2 (story 3d): the interoperability check --------------
+
+DIFF_SCRIPT=interop_ws_h2.py
+PROBE_NAME=ws_h2_probe
+# A planted defect that makes a run hang must not hold the gate for minutes.
+export GHTTP_INTEROP_TIMEOUT=40
+rm -rf "$SCRATCH/control.log"
+if ! run_diff "$SCRATCH/control"; then
+  printf 'check-oracle-gate: the CONTROL copy fails the WebSocket-over-HTTP/2 interoperability check, so no\n' >&2
+  printf 'result below would mean anything. Its log:\n' >&2
+  tail -30 "$SCRATCH/control.log" >&2
+  exit 1
+fi
+printf 'check-oracle-gate: WebSocket-over-HTTP/2 control passes\n'
+
+plant_lib ws-h2-adapter-never-ends-the-stream src/http/ws_h2.c \
+  '  if (st == GHTTP_WS_STATE_CLOSED || st == GHTTP_WS_STATE_FAILED || a->remote_ended) {' \
+  '  if (st == GHTTP_WS_STATE_FAILED || a->remote_ended) {' \
+  'interoperability check FAILED'
+
+plant_lib ws-h2-client-sends-a-key src/http/ws_handshake.c \
+  '  if (r == GHTTP_OK && !h2) {
+    r = ghttp_headers_add(h, "Sec-WebSocket-Key", key);' \
+  '  if (r == GHTTP_OK) {
+    r = ghttp_headers_add(h, "Sec-WebSocket-Key", key);' \
+  'interoperability check FAILED'
+
+plant_lib ws-h2-server-answers-101 src/http/ws_handshake.c \
+  '  result->status = h2 ? 200 : 101;' \
+  '  result->status = 200;
+  if (h2) { (void)ghttp_response_set_status(response, 101, "Switching Protocols"); }' \
+  'interoperability check FAILED'
+
+plant_harness ws-h2-control-blind tools/oracle/interop_ws_h2.py \
+  '    ra, rb, ea, eb = run_pair(a, b, corrupt_at=4000)' \
+  '    ra, rb, ea, eb = run_pair(a, b, corrupt_at=None)' \
+  'cannot see a corrupted stream'
 
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-oracle-gate: FAILED\033[0m\n' >&2

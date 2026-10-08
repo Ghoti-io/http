@@ -661,9 +661,9 @@ def _where(frames, pos):
     return "end"
 
 
-def generated(seed, count):
+def generated(seed, count, bases=None, arg="-", tag="gen"):
     rng = random.Random(seed)
-    bases = _bases()
+    bases = _bases() if bases is None else bases
     seen = set()
     out = []
     specials = [0, 1, 2, 4, 5, 0x7f, 0x80, 0xff, 0x20, 0x3a, 0x0a, 0x0d, 0x40]
@@ -731,7 +731,95 @@ def generated(seed, count):
         if data == stream or (op, where, data) in seen:
             continue
         seen.add((op, where, data))
-        out.append(("gen:%s@%s" % (op, where), "h2", "-", data))
+        out.append(("%s:%s@%s" % (tag, op, where), "h2", arg, data))
+    return out
+
+
+def xreq(*extra, method=b"CONNECT", protocol=b"websocket", path=b"/chat", scheme=b"https",
+         authority=b"server.example.com"):
+    """An Extended CONNECT request (RFC 8441 section 4), in the order of its examples."""
+    f = [(b":method", method)]
+    if protocol is not None:
+        f.append((b":protocol", protocol))
+    if scheme is not None:
+        f.append((b":scheme", scheme))
+    if path is not None:
+        f.append((b":path", path))
+    if authority is not None:
+        f.append((b":authority", authority))
+    return f + list(extra)
+
+
+WS_FIELDS = [(b"sec-websocket-protocol", b"chat, superchat"), (b"sec-websocket-extensions", b"permessage-deflate"),
+             (b"sec-websocket-version", b"13"), (b"origin", b"http://www.example.com")]
+
+
+def _xc_bases():
+    """Valid Extended CONNECT client streams to mutate (arg xc)."""
+    b = []
+    b.append(("xc-websocket", [settings(), hdrs(1, xreq(*WS_FIELDS), END_HEADERS), frame(DATA, 0, 1, b"\x81\x85abcd12345"), frame(DATA, END_STREAM, 1, b"")]))
+    b.append(("xc-two-tunnels", [settings(), hdrs(1, xreq(), END_HEADERS), hdrs(3, xreq(path=b"/other"), END_HEADERS), frame(DATA, 0, 3, b"abc"), frame(RST_STREAM, 0, 1, u32(8)), frame(DATA, END_STREAM, 3, b"")]))
+    b.append(("xc-plain-connect", [settings(), hdrs(1, [(b":method", b"CONNECT"), (b":authority", b"h:443")], END_HEADERS), frame(DATA, END_STREAM, 1, b"tunnel")]))
+    b.append(("xc-ended", [settings(), hdrs(1, xreq(), END_HEADERS | END_STREAM)]))
+    return b
+
+
+def generated_xc(seed, count):
+    return generated(seed + 77, count, _xc_bases(), "xc", "gen")
+
+
+def extconnect():
+    """Hand-written Extended CONNECT cases (RFC 8441): `arg` xc is a server that sent the setting."""
+    out = []
+
+    def add(tag, data, arg="xc"):
+        out.append(("rfc8441-" + tag, "h2", arg, data))
+
+    O = OPEN
+    # section 3: the setting
+    for v in (0, 1, 2, 0xffffffff):
+        add("3:client-sends-setting-%d" % v, PREFACE + settings([(8, v)]) + GET(), "xc")
+    add("3:client-sends-setting-1-then-0", PREFACE + settings([(8, 1)]) + settings([(8, 0)]) + GET(), "xc")
+    # section 4: the request
+    add("4:websocket", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, 0, 1, b"hello") + frame(DATA, END_STREAM, 1, b""))
+    add("4:websocket-ended-with-headers", O + hdrs(1, xreq()))
+    add("4:rfc-example", O + hdrs(1, xreq(*WS_FIELDS), END_HEADERS))
+    add("4:websocket-setting-off", O + hdrs(1, xreq(), END_HEADERS), "-")
+    add("4:websocket-setting-off-then-get", O + hdrs(1, xreq(), END_HEADERS) + GET(3), "-")
+    for pr in (b"connect-udp", b"h2c", b"x-foo/1", b"WebSocket", b"a/b/c", b"/b", b"a/", b"web socket", b"a,b",
+               b"", b"w" * 64, b"w" * 65, b"w" * 200, b"w" * 5000):
+        add("4:protocol-%s" % (pr.decode()[:20].replace("/", "slash").replace(" ", "sp").replace(",", "comma") or "empty").encode().decode(),
+            O + hdrs(1, xreq(protocol=pr), END_HEADERS))
+    for m in (b"GET", b"POST", b"OPTIONS", b"connect"):
+        add("4:protocol-on-%s" % m.decode(), O + hdrs(1, xreq(method=m), END_HEADERS))
+    add("4:no-path", O + hdrs(1, xreq(path=None), END_HEADERS))
+    add("4:no-scheme", O + hdrs(1, xreq(scheme=None), END_HEADERS))
+    add("4:no-authority", O + hdrs(1, xreq(authority=None), END_HEADERS))
+    add("4:empty-path", O + hdrs(1, xreq(path=b""), END_HEADERS))
+    add("4:path-without-slash", O + hdrs(1, xreq(path=b"chat"), END_HEADERS))
+    add("4:path-asterisk", O + hdrs(1, xreq(path=b"*"), END_HEADERS))
+    add("4:authority-userinfo", O + hdrs(1, xreq(authority=b"u@server.example.com"), END_HEADERS))
+    add("4:host-differs", O + hdrs(1, xreq((b"host", b"other.example.com")), END_HEADERS))
+    add("4:host-same", O + hdrs(1, xreq((b"host", b"server.example.com")), END_HEADERS))
+    add("4:duplicate-protocol", O + hdrs(1, [(b":method", b"CONNECT"), (b":protocol", b"websocket"), (b":protocol", b"websocket"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"h")], END_HEADERS))
+    add("4:protocol-after-regular-field", O + hdrs(1, [(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"h"), (b"x", b"1"), (b":protocol", b"websocket")], END_HEADERS))
+    add("4:protocol-uppercase-name", O + hdrs(1, [(b":method", b"CONNECT"), (b":Protocol", b"websocket"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"h")], END_HEADERS))
+    add("4:plain-connect", O + hdrs(1, [(b":method", b"CONNECT"), (b":authority", b"h:443")], END_HEADERS) + frame(DATA, END_STREAM, 1, b"x"))
+    add("4:plain-connect-with-scheme", O + hdrs(1, [(b":method", b"CONNECT"), (b":scheme", b"https"), (b":authority", b"h:443")], END_HEADERS))
+    add("4:plain-connect-with-path", O + hdrs(1, [(b":method", b"CONNECT"), (b":path", b"/"), (b":authority", b"h:443")], END_HEADERS))
+    add("4:connect-scheme-path-no-protocol", O + hdrs(1, [(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"h:443")], END_HEADERS))
+    # the tunnel
+    add("4:tunnel-content-length", O + hdrs(1, xreq((b"content-length", b"2")), END_HEADERS) + frame(DATA, END_STREAM, 1, b"far more than two"))
+    add("4:tunnel-data-then-end", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, 0, 1, b"a") + frame(DATA, 0, 1, b"b") + frame(DATA, END_STREAM, 1, b"c"))
+    add("4:tunnel-trailers", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, 0, 1, b"a") + hdrs(1, [(b"x-t", b"1")]))
+    add("4:tunnel-reset", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, 0, 1, b"partial") + frame(RST_STREAM, 0, 1, u32(8)))
+    add("4:tunnel-data-after-end", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, END_STREAM, 1, b"a") + frame(DATA, 0, 1, b"b"))
+    add("4:tunnel-data-after-reset", O + hdrs(1, xreq(), END_HEADERS) + frame(RST_STREAM, 0, 1, u32(8)) + frame(DATA, 0, 1, b"b"))
+    add("4:tunnel-window-update", O + hdrs(1, xreq(), END_HEADERS) + frame(WINDOW_UPDATE, 0, 1, u32(1000)) + frame(DATA, END_STREAM, 1, b"a"))
+    add("4:tunnel-padded-data", O + hdrs(1, xreq(), END_HEADERS) + frame(DATA, PADDED | END_STREAM, 1, b"\x02ab\0\0"))
+    add("4:three-tunnels", O + b"".join(hdrs(i, xreq(path=b"/%d" % i), END_HEADERS) for i in (1, 3, 5)) + frame(DATA, END_STREAM, 3, b"x"))
+    add("4:tunnel-then-get", O + hdrs(1, xreq(), END_HEADERS) + GET(3) + frame(DATA, END_STREAM, 1, b"x"))
+    add("4:tunnel-in-continuation", O + frame(HEADERS, 0, 1, block(xreq())[:20]) + frame(CONTINUATION, END_HEADERS, 1, block(xreq())[20:]))
     return out
 
 
@@ -765,10 +853,11 @@ def generated_hd(seed, count):
     return out
 
 
-def all_cases(seed=1, count=40000, hd_count=6000, he_count=400):
+def all_cases(seed=1, count=40000, hd_count=6000, he_count=400, xc_count=3000):
     """Every case with ids assigned: dicts of id, kind, arg, tag, data."""
     rng = random.Random(seed)
-    raw = hand() + hand_hd() + rfc_vectors() + hand_he() + generated_he(rng, he_count) + generated_hd(seed, hd_count) + generated(seed, count)
+    raw = (hand() + extconnect() + hand_hd() + rfc_vectors() + hand_he() + generated_he(rng, he_count)
+           + generated_hd(seed, hd_count) + generated(seed, count) + generated_xc(seed, xc_count))
     cases = []
     seen = set()
     for tag, kind, arg, data in raw:

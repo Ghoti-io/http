@@ -31,18 +31,23 @@
 # The tag is `deb13-N`: Debian 13 fixes the base, N moves whenever the image's
 # contents can differ. deb13-2 added the three HTTP/2 references (nghttp2, h2,
 # x/net/http2); deb13-3 added the three WebSocket ones (wsproto, websockets,
-# gorilla/websocket). The earlier references are the same pins as in deb13-1
+# gorilla/websocket); deb13-4 made the nghttp2 and h2 drivers able to enable
+# Extended CONNECT (RFC 8441; Go's x/net has its own switch, GODEBUG) and added
+# the interoperability drivers of tools/oracle/interop_ws_h2.py (a Go tunnel
+# echo and client, and h2 with websockets as a WebSocket client and server). The earlier references are the same pins as in deb13-1
 # and deb13-2.
 #
 # Building it:
 #   make oracle-build
 
-llhttp	localhost/ghoti-http-oracle-refs:deb13-3	llhttp 9.2.1	The parser inside Node, driven through its HTTPParser binding, lenient flags off
-h11	localhost/ghoti-http-oracle-refs:deb13-3	h11 0.16.0	Sans-I/O HTTP/1.1 in Python; 0.16.0 is the release that closed the bare-LF chunk terminator hole
-gohttp	localhost/ghoti-http-oracle-refs:deb13-3	go net/http go1.24.4	http.ReadRequest and http.ReadResponse and the body framing behind them
-nghttp2	localhost/ghoti-http-oracle-refs:deb13-3	nghttp2 1.64.0	libnghttp2's server session, and its HPACK encoder and decoder, linked statically
-h2	localhost/ghoti-http-oracle-refs:deb13-3	h2 4.4.1 (hpack 4.2.0, hyperframe 6.1.0)	Python sans-I/O HTTP/2 (h2) with its own HPACK (hpack) and framing (hyperframe) libraries
-gox2	localhost/ghoti-http-oracle-refs:deb13-3	x/net/http2 v0.50.0 (go1.24.4)	Go's golang.org/x/net/http2 server, and its hpack encoder and decoder
-wsproto	localhost/ghoti-http-oracle-refs:deb13-3	wsproto 1.3.2 (h11 0.16.0)	Python sans-I/O WebSocket (RFC 6455, permessage-deflate) on h11; the frame protocol and its extension, and the opening handshake
-websockets	localhost/ghoti-http-oracle-refs:deb13-3	websockets 17.2	Python WebSocket's sans-I/O protocol layer (frames, handshake, permessage-deflate), with the I/O layer's message assembly and UTF-8 check done by the driver as the I/O layer does it
-gows	localhost/ghoti-http-oracle-refs:deb13-3	gorilla/websocket v1.5.3 (go1.24.4)	Go's gorilla/websocket server and client, driven over a net.Conn of the driver's own; permessage-deflate without context takeover only
+llhttp	localhost/ghoti-http-oracle-refs:deb13-4	llhttp 9.2.1	The parser inside Node, driven through its HTTPParser binding, lenient flags off
+h11	localhost/ghoti-http-oracle-refs:deb13-4	h11 0.16.0	Sans-I/O HTTP/1.1 in Python; 0.16.0 is the release that closed the bare-LF chunk terminator hole
+gohttp	localhost/ghoti-http-oracle-refs:deb13-4	go net/http go1.24.4	http.ReadRequest and http.ReadResponse and the body framing behind them
+nghttp2	localhost/ghoti-http-oracle-refs:deb13-4	nghttp2 1.64.0	libnghttp2's server session, and its HPACK encoder and decoder, linked statically
+h2	localhost/ghoti-http-oracle-refs:deb13-4	h2 4.4.1 (hpack 4.2.0, hyperframe 6.1.0)	Python sans-I/O HTTP/2 (h2) with its own HPACK (hpack) and framing (hyperframe) libraries
+gox2	localhost/ghoti-http-oracle-refs:deb13-4	x/net/http2 v0.50.0 (go1.24.4)	Go's golang.org/x/net/http2 server, and its hpack encoder and decoder
+wsproto	localhost/ghoti-http-oracle-refs:deb13-4	wsproto 1.3.2 (h11 0.16.0)	Python sans-I/O WebSocket (RFC 6455, permessage-deflate) on h11; the frame protocol and its extension, and the opening handshake
+websockets	localhost/ghoti-http-oracle-refs:deb13-4	websockets 17.2	Python WebSocket's sans-I/O protocol layer (frames, handshake, permessage-deflate), with the I/O layer's message assembly and UTF-8 check done by the driver as the I/O layer does it
+gows	localhost/ghoti-http-oracle-refs:deb13-4	gorilla/websocket v1.5.3 (go1.24.4)	Go's gorilla/websocket server and client, driven over a net.Conn of the driver's own; permessage-deflate without context takeover only
+gox2tunnel	localhost/ghoti-http-oracle-refs:deb13-4	x/net/http2 v0.50.0 tunnel (go1.24.4)	Go's x/net/http2 as an Extended CONNECT tunnel server (an echo) and client, driven over stdin and stdout
+h2ws	localhost/ghoti-http-oracle-refs:deb13-4	websockets 17.2 over h2 4.4.1	h2 (Python) with websockets' sans-I/O Protocol as a WebSocket client and server over an Extended CONNECT stream
