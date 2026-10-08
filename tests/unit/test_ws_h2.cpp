@@ -1,3 +1,23 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io HTTP.
+ *
+ * Ghoti.io HTTP is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io HTTP is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file
  *
@@ -7,6 +27,8 @@
  *
  * Copyright 2026 by Corey Pennycuff
  */
+
+#include <list>
 
 #include "test_helpers.h"
 #include "h2_helpers.h"
@@ -320,7 +342,8 @@ struct End {
   bool accepted = false;
   int refused = 0;
   bool deflate = false;
-  bool unmasked_server_is_bug = false;
+  bool no_pump = false;  // give the adapter the events and nothing else
+  std::string seen_scheme, seen_authority, seen_target;
 
   End(GHTTP_H2Role r, const GHTTP_H2Limits * lim = nullptr, bool deflate_on = false)
       : role(r), deflate(deflate_on) {
@@ -376,6 +399,9 @@ struct End {
   void on_event(const GHTTP_H2Event & ev) {
     if (ev.type == GHTTP_H2_EVENT_HEADERS && role == GHTTP_H2_SERVER && !ad) {
       const GHTTP_Request * q = ghttp_h2_conn_request(h2);
+      seen_scheme = ev.scheme ? ev.scheme : "-";
+      seen_authority = ev.authority ? ev.authority : "-";
+      seen_target = ghttp_request_target(q);
       GHTTP_Response * resp;
       ASSERT_EQ(ghttp_response_create(nullptr, &resp), GHTTP_OK);
       GHTTP_WsServerResult sr;
@@ -421,7 +447,7 @@ struct End {
         if (ev.type != GHTTP_H2_EVENT_NEED_MORE) {
           h2events.push_back(std::to_string(ev.type));
           on_event(ev);
-          ws_events();
+          if (!no_pump) ws_events();
         }
       } while (ev.type != GHTTP_H2_EVENT_NEED_MORE);
       if (bytes.empty()) break;
@@ -712,7 +738,8 @@ TEST(WsH2EndToEnd, EveryAllocationFailingInTurnIsOomOrTheSameAnswerAndNeverALeak
         if (r != GHTTP_OK) { *out = r; break; }
         log += "H;";
       } else if (ev.type == GHTTP_H2_EVENT_DATA && ad) {
-        ghttp_ws_h2_input(ad, &ev);
+        r = ghttp_ws_h2_input(ad, &ev);
+        if (r != GHTTP_OK) { *out = r; break; }
         GHTTP_WsEvent we;
         do {
           r = ghttp_ws_h2_next(ad, &we);
@@ -752,6 +779,440 @@ TEST(WsH2EndToEnd, EveryAllocationFailingInTurnIsOomOrTheSameAnswerAndNeverALeak
     }
   }
   EXPECT_GT(oom, 0u);
+}
+
+
+// ---------------------------------------------------------------------------
+// The adapter's API, the cases it must refuse, and how it learns the stream or
+// the connection is gone
+// ---------------------------------------------------------------------------
+
+namespace {
+
+GHTTP_H2Event data_event(uint32_t stream, const std::string & d, bool end = false) {
+  // The event points at the bytes: keep them for the life of the test run.
+  static std::list<std::string> keep;
+  keep.push_back(d);
+  GHTTP_H2Event e;
+  memset(&e, 0, sizeof(e));
+  e.size = sizeof(e);
+  e.type = GHTTP_H2_EVENT_DATA;
+  e.stream_id = stream;
+  e.data = reinterpret_cast<const uint8_t *>(keep.back().data());
+  e.data_len = d.size();
+  e.end_stream = end;
+  return e;
+}
+
+GHTTP_H2Event plain_event(GHTTP_H2EventType t, uint32_t stream, uint32_t code = 0, uint32_t last = 0) {
+  GHTTP_H2Event e;
+  memset(&e, 0, sizeof(e));
+  e.size = sizeof(e);
+  e.type = t;
+  e.stream_id = stream;
+  e.error_code = code;
+  e.last_stream_id = last;
+  return e;
+}
+
+}  // namespace
+
+TEST(WsH2Adapter, CreateRefusesWhatIsNotAnActiveTunnelOfTheRightRoleWithItsHeadersSent) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  GHTTP_WsH2 * a = nullptr;
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, nullptr, 1, p.c.ws, &a), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, 1, nullptr, &a), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, 1, p.c.ws, nullptr), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, 0, p.c.ws, &a), GHTTP_ERR_INVALID) << "stream 0";
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, 99, p.c.ws, &a), GHTTP_ERR_INVALID) << "no such stream";
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, p.c.stream, p.s.ws, &a), GHTTP_ERR_INVALID)
+      << "a server WebSocket on a client connection";
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.s.h2, p.s.stream, p.c.ws, &a), GHTTP_ERR_INVALID)
+      << "a client WebSocket on a server connection";
+  EXPECT_EQ(a, nullptr);
+  // A stream that is not a tunnel: an ordinary GET.
+  GHTTP_Request * q = nullptr;
+  ASSERT_EQ(ghttp_request_create(nullptr, &q), GHTTP_OK);
+  ASSERT_EQ(ghttp_request_set_target(q, "/plain"), GHTTP_OK);
+  ASSERT_EQ(ghttp_headers_add(ghttp_request_headers(q), "host", "h"), GHTTP_OK);
+  uint32_t id = 0;
+  ASSERT_EQ(ghttp_h2_conn_send_request(p.c.h2, q, "https", 0, &id), GHTTP_OK);
+  ghttp_request_destroy(q);
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, p.c.h2, id, p.c.ws, &a), GHTTP_ERR_INVALID) << "not a tunnel";
+}
+
+TEST(WsH2Adapter, ACreateBeforeTheServerSentItsResponseIsRefused) {
+  GHTTP_H2Limits sl = srv_limits();
+  End c(GHTTP_H2_CLIENT), s(GHTTP_H2_SERVER, &sl);
+  run(c, s);
+  c.open();
+  // The server has read the request but its handshake handler is not run yet:
+  // feed by hand, without the harness answering.
+  std::string bytes = c.take();
+  size_t off = 0;
+  GHTTP_H2Event ev;
+  do {
+    size_t used = 0;
+    ASSERT_EQ(ghttp_h2_conn_feed(s.h2, bytes.data() + off, bytes.size() - off, &used, &ev), GHTTP_OK);
+    off += used;
+  } while (ev.type != GHTTP_H2_EVENT_HEADERS && off < bytes.size());
+  ASSERT_EQ(ev.type, GHTTP_H2_EVENT_HEADERS);
+  GHTTP_WsNegotiated n;
+  ghttp_ws_negotiated_default(&n);
+  GHTTP_WsConn * ws = nullptr;
+  ASSERT_EQ(ghttp_ws_conn_create(nullptr, GHTTP_WS_SERVER, nullptr, &n, &ws), GHTTP_OK);
+  GHTTP_WsH2 * a = nullptr;
+  EXPECT_EQ(ghttp_ws_h2_create(nullptr, s.h2, ev.stream_id, ws, &a), GHTTP_ERR_INVALID)
+      << "no DATA may go before the response";
+  ghttp_ws_conn_destroy(ws);
+}
+
+TEST(WsH2Adapter, ASecondDataEventBeforeNextIsRefusedAndTheFirstIsKept) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  std::string f = text("one", true);
+  GHTTP_H2Event e1 = data_event(p.s.stream, f);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &e1), GHTTP_OK);
+  GHTTP_H2Event e2 = data_event(p.s.stream, text("two", true));
+  EXPECT_EQ(ghttp_ws_h2_input(p.s.ad, &e2), GHTTP_ERR_INVALID);
+  GHTTP_WsEvent we;
+  ASSERT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_OK);
+  ASSERT_EQ(we.type, GHTTP_WS_EVENT_TEXT);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(we.data), we.data_len), "one");
+  ASSERT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_OK);
+  EXPECT_EQ(we.type, GHTTP_WS_EVENT_NEED_MORE);
+  EXPECT_EQ(ghttp_ws_h2_input(p.s.ad, &e2), GHTTP_OK) << "once it has been read to the end";
+}
+
+TEST(WsH2Adapter, TheDataIsCopiedSoItMayBeReadAfterTheEventsBufferIsGone) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  std::string f = text("copied", true);
+  GHTTP_H2Event e = data_event(p.s.stream, f);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &e), GHTTP_OK);
+  f.assign(f.size(), '\0');  // what the h2 connection's buffer becomes after the next feed
+  GHTTP_WsEvent we;
+  ASSERT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_OK);
+  ASSERT_EQ(we.type, GHTTP_WS_EVENT_TEXT);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(we.data), we.data_len), "copied");
+}
+
+TEST(WsH2Adapter, NextClearsTheEventWhenTheCodecFails) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  GHTTP_H2Event e = data_event(p.s.stream, text("x", false));  // unmasked at a server
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &e), GHTTP_OK);
+  GHTTP_WsEvent we;
+  memset(&we, 0xaa, sizeof(we));
+  EXPECT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_ERR_CORRUPT);
+  EXPECT_EQ(we.type, GHTTP_WS_EVENT_NEED_MORE);
+  EXPECT_EQ(we.data, nullptr);
+  EXPECT_EQ(we.data_len, 0u);
+  EXPECT_EQ(we.size, sizeof(we));
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1002);
+}
+
+TEST(WsH2Adapter, AStreamTheServerDidNotProcessEndsTheWebSocketAbnormally) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  GHTTP_H2Event e = plain_event(GHTTP_H2_EVENT_STREAM_UNPROCESSED, p.c.stream, GHTTP_H2_REFUSED_STREAM);
+  ASSERT_EQ(ghttp_ws_h2_input(p.c.ad, &e), GHTTP_OK);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1006);
+  EXPECT_TRUE(st.reset);
+  EXPECT_EQ(st.reset_code, static_cast<uint32_t>(GHTTP_H2_REFUSED_STREAM));
+}
+
+TEST(WsH2Adapter, AGoawayBelowTheClientsStreamIsTheSameAndAboveItIsNot) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  GHTTP_H2Event above = plain_event(GHTTP_H2_EVENT_GOAWAY, 0, 0, p.c.stream);
+  ASSERT_EQ(ghttp_ws_h2_input(p.c.ad, &above), GHTTP_OK);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_OPEN) << "the stream was processed";
+  GHTTP_H2Event below = plain_event(GHTTP_H2_EVENT_GOAWAY, 0, 0, p.c.stream - 1);
+  ASSERT_EQ(ghttp_ws_h2_input(p.c.ad, &below), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1006);
+  // A server is told nothing by a GOAWAY about a stream the client opened.
+  GHTTP_H2Event at_server = plain_event(GHTTP_H2_EVENT_GOAWAY, 0, 0, 0);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &at_server), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_OPEN);
+}
+
+TEST(WsH2Adapter, AConnectionErrorTheCallerReportsEndsTheWebSocketAndStopsTheOutput) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  EXPECT_EQ(ghttp_ws_h2_connection_failed(p.c.ad, GHTTP_OK), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_h2_connection_failed(nullptr, GHTTP_ERR_CORRUPT), GHTTP_ERR_INVALID);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_OPEN) << "before it is told, it cannot know";
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.c.ws, GHTTP_WS_MESSAGE_TEXT, "late", 4), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_connection_failed(p.c.ad, GHTTP_ERR_CORRUPT), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1006);
+  EXPECT_TRUE(st.connection_failed);
+  EXPECT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  EXPECT_TRUE(p.c.take().empty()) << "nothing is sent on a failed connection";
+  GHTTP_H2Event d = data_event(p.c.stream, text("x", false));
+  EXPECT_EQ(ghttp_ws_h2_input(p.c.ad, &d), GHTTP_OK) << "dropped";
+  GHTTP_WsEvent we;
+  ASSERT_EQ(ghttp_ws_h2_next(p.c.ad, &we), GHTTP_OK);
+  EXPECT_EQ(we.type, GHTTP_WS_EVENT_NEED_MORE);
+}
+
+TEST(WsH2Adapter, AResetAfterTheClosingHandshakeCompletedLeavesItClosed) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  ASSERT_EQ(ghttp_ws_conn_close(p.c.ws, 1000, "bye", 3), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  run(p.c, p.s);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  ASSERT_EQ(st.state, GHTTP_WS_H2_CLOSED);
+  GHTTP_H2Event rs = plain_event(GHTTP_H2_EVENT_STREAM_RESET, p.s.stream, GHTTP_H2_CANCEL);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &rs), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_input(p.c.ad, &rs), GHTTP_OK);
+  for (End * e : {&p.s, &p.c}) {
+    ASSERT_EQ(ghttp_ws_h2_status(e->ad, &st), GHTTP_OK);
+    EXPECT_EQ(st.state, GHTTP_WS_H2_CLOSED);
+    EXPECT_EQ(st.code, 0);
+  }
+  ASSERT_EQ(ghttp_ws_h2_connection_failed(p.s.ad, GHTTP_ERR_IO), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_CLOSED) << "nor does the connection dying afterwards";
+}
+
+TEST(WsH2Adapter, AnEndStreamWhileClosingWithNoReplyIsAbnormal) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  ASSERT_EQ(ghttp_ws_conn_close(p.s.ws, 1000, "bye", 3), GHTTP_OK);  // the server's Close; nobody answers
+  GHTTP_H2Event e = data_event(p.s.stream, "", true);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &e), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_conn_state(p.s.ws), GHTTP_WS_STATE_CLOSING);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1006);
+}
+
+TEST(WsH2Adapter, AStreamTheApplicationEndedItselfIsNotAnError) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  ASSERT_EQ(ghttp_h2_conn_reset_stream(p.c.h2, p.c.stream, GHTTP_H2_CANCEL), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.c.ws, GHTTP_WS_MESSAGE_TEXT, "x", 1), GHTTP_OK);
+  EXPECT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  EXPECT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  // The other way: the application ends its side with END_STREAM and keeps pumping.
+  Pair q;
+  ASSERT_TRUE(q.c.accepted && q.s.accepted);
+  size_t acc = 0;
+  ASSERT_EQ(ghttp_h2_conn_send_data(q.c.h2, q.c.stream, nullptr, 0, 1, &acc), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_conn_send_message(q.c.ws, GHTTP_WS_MESSAGE_TEXT, "x", 1), GHTTP_OK);
+  EXPECT_EQ(ghttp_ws_h2_pump(q.c.ad), GHTTP_OK) << "the send is refused as INVALID, which is not the caller's problem";
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(q.c.ad, &st), GHTTP_OK);
+  EXPECT_TRUE(st.local_ended);
+  EXPECT_EQ(ghttp_ws_h2_pump(q.c.ad), GHTTP_OK);
+}
+
+TEST(WsH2Adapter, AWindowUpdateAloneReleasesHeldOutputWithoutAnExplicitPump) {
+  GHTTP_H2Limits sl = srv_limits();
+  sl.initial_window_size = 200;
+  GHTTP_H2Limits cl = limits();
+  cl.initial_window_size = 200;
+  Pair p(false, 0, &sl, &cl);
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  p.c.no_pump = p.s.no_pump = true;
+  std::string m = ws_lorem(5000, 2);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.c.ws, GHTTP_WS_MESSAGE_TEXT, m.data(), m.size()), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  size_t held = ghttp_ws_conn_output_size(p.c.ws);
+  ASSERT_GT(held, 0u);
+  // The server's WINDOW_UPDATEs, as bytes, through the h2 connection and the adapter's input alone.
+  p.c.feed(window_update(0, 100000) + window_update(p.c.stream, 100000));
+  EXPECT_LT(ghttp_ws_conn_output_size(p.c.ws), held) << "released by the event";
+  EXPECT_EQ(ghttp_ws_conn_output_size(p.c.ws), 0u);
+}
+
+TEST(WsH2Adapter, ASettingsWindowGrowthAloneReleasesHeldOutputWithoutAnExplicitPump) {
+  GHTTP_H2Limits sl = srv_limits();
+  sl.initial_window_size = 200;
+  Pair p(false, 0, &sl, nullptr);
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  p.c.no_pump = true;
+  std::string m = ws_lorem(5000, 2);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.c.ws, GHTTP_WS_MESSAGE_TEXT, m.data(), m.size()), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  size_t held = ghttp_ws_conn_output_size(p.c.ws);
+  ASSERT_GT(held, 0u);
+  p.c.feed(settings({{GHTTP_H2_SETTINGS_INITIAL_WINDOW_SIZE, 60000}}));
+  EXPECT_LT(ghttp_ws_conn_output_size(p.c.ws), held);
+  EXPECT_EQ(ghttp_ws_conn_output_size(p.c.ws), 0u);
+}
+
+TEST(WsH2Adapter, HeldOutputIsSentBeforeTheStreamIsEndedWhenThePeerHalfClosed) {
+  GHTTP_H2Limits sl = srv_limits();
+  sl.initial_window_size = 200;
+  Pair p(false, 0, &sl, nullptr);
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  p.c.no_pump = true;
+  std::string m = ws_lorem(5000, 2);
+  ASSERT_EQ(ghttp_ws_conn_send_message(p.c.ws, GHTTP_WS_MESSAGE_TEXT, m.data(), m.size()), GHTTP_OK);
+  GHTTP_H2Event end = data_event(p.c.stream, "", true);  // the server's END_STREAM
+  ASSERT_EQ(ghttp_ws_h2_input(p.c.ad, &end), GHTTP_OK);
+  ASSERT_EQ(ghttp_ws_h2_pump(p.c.ad), GHTTP_OK);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_GT(ghttp_ws_conn_output_size(p.c.ws), 0u) << "held back by the window";
+  EXPECT_FALSE(st.local_ended) << "the stream must not be ended over data still to be sent";
+  p.c.feed(window_update(p.c.stream, 100000));
+  ASSERT_EQ(ghttp_ws_h2_status(p.c.ad, &st), GHTTP_OK);
+  EXPECT_EQ(ghttp_ws_conn_output_size(p.c.ws), 0u);
+  EXPECT_TRUE(st.local_ended) << "ended once the data has gone";
+  // On the wire: all of the message's frame, and only then the END_STREAM.
+  size_t total = 0;
+  bool ended_last = false;
+  for (const OutFrame & f : parse_frames(p.c.take())) {
+    if (f.type != GHTTP_H2_DATA || f.stream != p.c.stream) continue;
+    EXPECT_FALSE(ended_last) << "DATA after END_STREAM";
+    total += f.payload.size();
+    if (f.flags & END_STREAM) ended_last = true;
+  }
+  EXPECT_GE(total, m.size());
+  EXPECT_TRUE(ended_last);
+}
+
+TEST(WsH2Adapter, AnEndStreamThatCameWithDataTakesEffectOnlyWhenTheDataIsRead) {
+  Pair p;
+  ASSERT_TRUE(p.c.accepted && p.s.accepted);
+  GHTTP_H2Event e = data_event(p.s.stream, text("last", true), true);
+  ASSERT_EQ(ghttp_ws_h2_input(p.s.ad, &e), GHTTP_OK);
+  GHTTP_WsH2Status st;
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_FALSE(st.remote_ended) << "the data has not been read";
+  EXPECT_EQ(st.state, GHTTP_WS_H2_OPEN);
+  GHTTP_WsEvent we;
+  ASSERT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_OK);
+  ASSERT_EQ(we.type, GHTTP_WS_EVENT_TEXT);
+  ASSERT_EQ(ghttp_ws_h2_next(p.s.ad, &we), GHTTP_OK);
+  EXPECT_EQ(we.type, GHTTP_WS_EVENT_NEED_MORE);
+  ASSERT_EQ(ghttp_ws_h2_status(p.s.ad, &st), GHTTP_OK);
+  EXPECT_TRUE(st.remote_ended);
+  EXPECT_EQ(st.state, GHTTP_WS_H2_ABNORMAL);
+  EXPECT_EQ(st.code, 1006);
+}
+
+// ---------------------------------------------------------------------------
+// Handshake corners
+// ---------------------------------------------------------------------------
+
+TEST(WsH2Handshake, TheProtocolNameIsMatchedIgnoringCase) {
+  GHTTP_Request * q = h2_request("CONNECT", "WebSocket");
+  EXPECT_EQ(ghttp_ws_is_h2_request(q), 1);
+  Served s(q);
+  EXPECT_EQ(s.res.accepted, 1);
+  ghttp_request_destroy(q);
+  GHTTP_Request * other = h2_request("CONNECT", "websocket2");
+  EXPECT_EQ(ghttp_ws_is_h2_request(other), 0);
+  ghttp_request_destroy(other);
+  EXPECT_EQ(ghttp_ws_is_h2_request(nullptr), 0);
+}
+
+TEST(WsH2Handshake, ANullRequestOrResponseIsInvalidAndNotACrash) {
+  GHTTP_Response * resp;
+  ASSERT_EQ(ghttp_response_create(nullptr, &resp), GHTTP_OK);
+  GHTTP_WsServerResult r;
+  EXPECT_EQ(ghttp_ws_server_handshake_h2(nullptr, nullptr, resp, &r), GHTTP_ERR_INVALID);
+  GHTTP_Request * q = h2_request();
+  EXPECT_EQ(ghttp_ws_server_handshake_h2(q, nullptr, nullptr, &r), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_ws_server_handshake_h2(q, nullptr, resp, nullptr), GHTTP_ERR_INVALID);
+  ghttp_request_destroy(q);
+  ghttp_response_destroy(resp);
+}
+
+TEST(WsH2ClientHandshake, AnAbsoluteFormTargetGivesSchemeAuthorityAndPath_Rfc8441_4) {
+  GHTTP_H2Limits sl = srv_limits();
+  End c(GHTTP_H2_CLIENT), s(GHTTP_H2_SERVER, &sl);
+  c.copt.target = "https://server.example.com/chat";
+  c.copt.host = "server.example.com";
+  run(c, s);
+  c.open();
+  run(c, s);
+  ASSERT_TRUE(c.accepted && s.accepted);
+  EXPECT_EQ(s.seen_scheme, "https");
+  EXPECT_EQ(s.seen_authority, "server.example.com");
+  EXPECT_EQ(s.seen_target, "/chat");
+}
+
+TEST(WsH2ClientHandshake, AnAsteriskOrAuthorityFormTargetIsInvalidAndTheRequestIsUntouched) {
+  GHTTP_WsClientOptions o;
+  ghttp_ws_client_options_default(&o);
+  o.host = "h";
+  for (const char * target : {"*", "host:443", "", "http:/x"}) {
+    o.target = target;
+    GHTTP_Request * q;
+    ASSERT_EQ(ghttp_request_create(nullptr, &q), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_target(q, "/marker"), GHTTP_OK);
+    ASSERT_EQ(ghttp_headers_add(ghttp_request_headers(q), "x-marker", "1"), GHTTP_OK);
+    GHTTP_WsClientHandshake * hs = nullptr;
+    EXPECT_EQ(ghttp_ws_client_handshake_create_h2(nullptr, &o, q, &hs), GHTTP_ERR_INVALID) << target;
+    EXPECT_EQ(hs, nullptr);
+    EXPECT_STREQ(ghttp_request_target(q), "/marker") << target;
+    EXPECT_STREQ(ghttp_request_method(q), "GET");
+    EXPECT_EQ(ghttp_headers_count(ghttp_request_headers_const(q)), 1u);
+    EXPECT_EQ(ghttp_request_protocol(q), nullptr);
+    ghttp_request_destroy(q);
+  }
+}
+
+TEST(WsH2ClientHandshake, AFailureLeavesTheRequestUntouchedOrFresh) {
+  GHTTP_WsClientOptions o;
+  ghttp_ws_client_options_default(&o);
+  o.host = "h";
+  const char * protos[] = {"chat", "superchat"};
+  o.subprotocols = protos;
+  o.subprotocol_count = 2;
+  o.enable_deflate = 1;
+  FailingAllocator counter(static_cast<size_t>(-1));
+  {
+    GHTTP_Request * q;
+    ASSERT_EQ(ghttp_request_create(nullptr, &q), GHTTP_OK);
+    GHTTP_WsClientHandshake * hs = nullptr;
+    ASSERT_EQ(ghttp_ws_client_handshake_create_h2(counter.get(), &o, q, &hs), GHTTP_OK);
+    ghttp_ws_client_handshake_destroy(hs);
+    ghttp_request_destroy(q);
+  }
+  size_t total = counter.requests();
+  for (size_t k = 0; k <= total; k++) {
+    FailingAllocator fa(k, 0);
+    GHTTP_Request * q;
+    ASSERT_EQ(ghttp_request_create(nullptr, &q), GHTTP_OK);
+    ASSERT_EQ(ghttp_request_set_target(q, "/marker"), GHTTP_OK);
+    GHTTP_WsClientHandshake * hs = nullptr;
+    GHTTP_Result r = ghttp_ws_client_handshake_create_h2(fa.get(), &o, q, &hs);
+    if (r != GHTTP_OK) {
+      std::string t = ghttp_request_target(q);
+      EXPECT_TRUE(t == "/marker" || (t == "/" && ghttp_headers_count(ghttp_request_headers_const(q)) == 0))
+          << k << " " << t;
+      EXPECT_STREQ(ghttp_request_method(q), t == "/" ? "GET" : ghttp_request_method(q));
+      EXPECT_EQ(ghttp_request_protocol(q), nullptr) << k;
+    }
+    ghttp_ws_client_handshake_destroy(hs);
+    ghttp_request_destroy(q);
+    EXPECT_EQ(fa.live(), 0u) << k;
+  }
 }
 
 int main(int argc, char ** argv) {

@@ -139,9 +139,14 @@ typedef struct GHTTP_H2Settings {
   uint32_t initial_window_size;     ///< Default 65535.
   uint32_t max_frame_size;          ///< Default 16384.
   uint32_t max_header_list_size;    ///< Default UINT32_MAX: no limit.
-  /** SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): 0 or 1; default 0. */
+  /**
+   * SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): 0 or 1; default 0. Taken out of
+   * the reserved members, so that the size and the offsets of this struct are
+   * what they were.
+   */
   uint32_t enable_connect_protocol;
-  uint64_t reserved[4];
+  uint32_t reserved32;
+  uint64_t reserved[3];
 } GHTTP_H2Settings;
 
 /** The protocol's initial values (section 6.5.2). */
@@ -234,24 +239,28 @@ typedef struct GHTTP_H2Limits {
   /** Length of an interval. */
   uint32_t interval_ms;
 
-  // Extended CONNECT (RFC 8441).
+  /** Non-zero: window credit is returned only by ghttp_h2_conn_consume(). */
+  int manual_flow_control;
+
+  // Extended CONNECT (RFC 8441). These two were taken out of the reserved
+  // members: the size and the offsets of this struct are unchanged (for
+  // `size`, a caller built before them leaves them at the defaults).
   /**
    * A server: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL = 1 and accept a
-   * `:protocol`. Default 0 (the setting is not sent and `:protocol` is
-   * malformed), so a server behaves as before until the application opts in.
-   * A client that sets it fails ghttp_h2_conn_create() with GHTTP_ERR_INVALID:
-   * only a server sends the setting.
+   * `:protocol`. 0 or 1, anything else is GHTTP_ERR_INVALID. Default 0 (the
+   * setting is not sent and `:protocol` is malformed), so a server behaves as
+   * before until the application opts in. A client that sets it fails
+   * ghttp_h2_conn_create() with GHTTP_ERR_INVALID: only a server sends the
+   * setting.
    */
   int enable_connect_protocol;
   /**
-   * The longest `:protocol` accepted, in octets. A longer one is a stream error
-   * ENHANCE_YOUR_CALM. The default holds any registered Upgrade token.
+   * The longest `:protocol` accepted, in octets; at least 1 (0 is
+   * GHTTP_ERR_INVALID, as for the neighbouring caps). A longer one is a stream
+   * error ENHANCE_YOUR_CALM. The default holds any registered Upgrade token.
    */
   size_t max_protocol_bytes;
-
-  /** Non-zero: window credit is returned only by ghttp_h2_conn_consume(). */
-  int manual_flow_control;
-  uint64_t reserved[4];
+  uint64_t reserved[3];
 } GHTTP_H2Limits;
 
 #define GHTTP_H2_DEFAULT_MAX_HEADER_LIST_BYTES 65536u
@@ -332,7 +341,6 @@ typedef struct GHTTP_H2Event {
   uint32_t stream_id;
   int end_stream;           ///< HEADERS, DATA: the peer's last frame on the stream.
   int interim;              ///< HEADERS: a 1xx response.
-  int tunnel;               ///< HEADERS: the stream is a tunnel (see "Tunnels").
   uint32_t error_code;      ///< STREAM_RESET, STREAM_ERROR, GOAWAY.
   uint32_t last_stream_id;  ///< GOAWAY.
   uint32_t increment;       ///< WINDOW_UPDATE.
@@ -342,9 +350,23 @@ typedef struct GHTTP_H2Event {
    *  or NULL when absent. Valid until the next feed. */
   const char * scheme;
   const char * authority;
-  /** HEADERS at a server: the `:protocol` of an Extended CONNECT, NUL-terminated, or NULL. Valid until the next feed. */
+  /**
+   * HEADERS at a server: the `:protocol` of an Extended CONNECT, NUL-terminated,
+   * or NULL. Valid until the next feed. (With `tunnel`, taken out of the reserved
+   * members, so that the offsets of this struct did not move; its size is
+   * unchanged where a pointer is 8 octets.)
+   */
   const char * protocol;
-  uint64_t reserved[4];
+  /**
+   * HEADERS: the request was a CONNECT (at a server), or the response was a 2xx
+   * to a CONNECT (at a client). It does not mean the application has accepted
+   * anything: a server that then refuses the CONNECT with a final non-2xx
+   * response takes the stream out of tunnel mode (ghttp_h2_conn_stream_mode()),
+   * and a client's refused CONNECT (any other status) never reports `tunnel`.
+   */
+  int tunnel;
+  uint32_t reserved32;
+  uint64_t reserved[2];
 } GHTTP_H2Event;
 
 typedef struct GHTTP_H2Conn GHTTP_H2Conn;
@@ -428,16 +450,21 @@ GHTTP_API void ghttp_h2_conn_tick(GHTTP_H2Conn * conn, uint64_t now_ms);
  * target gave none. Field names are lower-cased; a field that HTTP/2 forbids
  * (RFC 9113 section 8.2.2) is GHTTP_ERR_INVALID, never silently dropped.
  *
+ * A request with a `:protocol` (ghttp_request_set_protocol()) is an Extended
+ * CONNECT: its method must be CONNECT and its target origin-form or
+ * absolute-form.
+ *
  * @param scheme for the :scheme, unless the target names one or the method is
  *   CONNECT; NULL means "https".
  * @param[out] stream_id The new stream's identifier.
- * A request with a `:protocol` (ghttp_request_set_protocol()) is an Extended
- * CONNECT: its method must be CONNECT and its target origin-form or
- * absolute-form; see ghttp_h2_conn_can_send_extended_connect().
- *
  * @return GHTTP_ERR_LIMIT when the peer's SETTINGS_MAX_CONCURRENT_STREAMS or
  *   MAX_HEADER_LIST_SIZE would be exceeded, or too much output is queued:
- *   nothing was sent, try again later. GHTTP_ERR_INVALID after GOAWAY.
+ *   nothing was sent, try again later. GHTTP_ERR_INVALID after GOAWAY, for a
+ *   request that cannot be sent, and **for a request with a `:protocol` before
+ *   the peer's SETTINGS have enabled it**: the one INVALID that is not a bug in
+ *   the request, and the result vocabulary has no other word for it. Ask
+ *   ghttp_h2_conn_can_send_extended_connect() first; it is true once the
+ *   server's SETTINGS (the GHTTP_H2_EVENT_SETTINGS event) have said so.
  */
 GHTTP_API GHTTP_Result ghttp_h2_conn_send_request(GHTTP_H2Conn * conn,
     const GHTTP_Request * request, const char * scheme, int end_stream,
@@ -513,6 +540,17 @@ GHTTP_API void ghttp_h2_conn_local_settings(
  * request with GHTTP_ERR_INVALID before that.
  */
 GHTTP_API int ghttp_h2_conn_can_send_extended_connect(const GHTTP_H2Conn * conn);
+
+/** Which end this connection is. */
+GHTTP_API GHTTP_H2Role ghttp_h2_conn_role(const GHTTP_H2Conn * conn);
+
+/**
+ * Whether this end has sent the headers that let it send DATA on the stream:
+ * the request (a client) or the final response (a server). 0 for a stream that
+ * is not active.
+ */
+GHTTP_API int ghttp_h2_conn_stream_headers_sent(
+    const GHTTP_H2Conn * conn, uint32_t stream_id);
 
 /** Whether ghttp_h2_conn_send_request() would be accepted now. */
 GHTTP_API int ghttp_h2_conn_can_open_stream(const GHTTP_H2Conn * conn);

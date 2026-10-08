@@ -246,6 +246,9 @@ GHTTP_API GHTTP_Result ghttp_ws_conn_finish(const GHTTP_WsConn * conn);
 GHTTP_API GHTTP_Result ghttp_ws_conn_error(
     const GHTTP_WsConn * conn, uint16_t * code, const char ** reason);
 
+/** Which end this connection is. GHTTP_ERR_INVALID for a NULL argument. */
+GHTTP_API GHTTP_Result ghttp_ws_conn_role(const GHTTP_WsConn * conn, GHTTP_WsRole * role);
+
 /** Where the closing handshake stands. */
 GHTTP_API GHTTP_WsState ghttp_ws_conn_state(const GHTTP_WsConn * conn);
 

@@ -34,8 +34,8 @@
 # gorilla/websocket); deb13-4 made the nghttp2 and h2 drivers able to enable
 # Extended CONNECT (RFC 8441; Go's x/net has its own switch, GODEBUG) and added
 # the interoperability drivers of tools/oracle/interop_ws_h2.py (a Go tunnel
-# echo and client, and h2 with websockets as a WebSocket client and server). The earlier references are the same pins as in deb13-1
-# and deb13-2.
+# echo and client, and h2 with websockets as a WebSocket client and server). The
+# earlier references are the same pins as in deb13-1, deb13-2 and deb13-3.
 #
 # Building it:
 #   make oracle-build

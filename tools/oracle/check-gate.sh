@@ -120,10 +120,25 @@ expect_red() {  # name dir needle [forbidden]
 
 # GATE_ONLY="name name": run only those plants (the controls still run). For
 # re-running the few that a change to the gate itself touched, not for a verdict.
+SEEN_PLANTS=""
 wanted() {
+  SEEN_PLANTS="$SEEN_PLANTS $1"
   [ -z "${GATE_ONLY:-}" ] && return 0
   case " $GATE_ONLY " in *" $1 "*) return 0;; esac
   return 1
+}
+
+# With GATE_ONLY set, a name that no plant has is an error and not a quiet pass
+# of nothing; the plants that were skipped are listed so that a typo is findable.
+check_only() {
+  [ -z "${GATE_ONLY:-}" ] && return 0
+  for want in $GATE_ONLY; do
+    case " $SEEN_PLANTS " in *" $want "*) ;; *)
+      printf '\033[0;31mcheck-oracle-gate: GATE_ONLY names "%s", which is no plant. Plants:%s\033[0m\n' \
+        "$want" "$SEEN_PLANTS" >&2
+      fail=1 ;;
+    esac
+  done
 }
 
 # plant_lib <name> <file> <old> <new> <needle> [forbidden]
@@ -420,6 +435,8 @@ plant_harness ws-h2-control-blind tools/oracle/interop_ws_h2.py \
   '    ra, rb, ea, eb = run_pair(a, b, corrupt_at=4000)' \
   '    ra, rb, ea, eb = run_pair(a, b, corrupt_at=None)' \
   'cannot see a corrupted stream'
+
+check_only
 
 if [ $fail -ne 0 ]; then
   printf '\033[0;31mcheck-oracle-gate: FAILED\033[0m\n' >&2

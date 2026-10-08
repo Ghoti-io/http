@@ -788,8 +788,11 @@ def extconnect():
     add("4:websocket-setting-off-then-get", O + hdrs(1, xreq(), END_HEADERS) + GET(3), "-")
     for pr in (b"connect-udp", b"h2c", b"x-foo/1", b"WebSocket", b"a/b/c", b"/b", b"a/", b"web socket", b"a,b",
                b"", b"w" * 64, b"w" * 65, b"w" * 200, b"w" * 5000):
-        add("4:protocol-%s" % (pr.decode()[:20].replace("/", "slash").replace(" ", "sp").replace(",", "comma") or "empty").encode().decode(),
-            O + hdrs(1, xreq(protocol=pr), END_HEADERS))
+        # A run of one letter is named by its length: 64 is the limit and agrees
+        # with every reference; 65 and above is the library's own cap.
+        name = ("w%d" % len(pr)) if pr and pr == b"w" * len(pr) and len(pr) > 1 else (
+            pr.decode()[:20].replace("/", "slash").replace(" ", "sp").replace(",", "comma") or "empty")
+        add("4:protocol-%s" % name, O + hdrs(1, xreq(protocol=pr), END_HEADERS))
     for m in (b"GET", b"POST", b"OPTIONS", b"connect"):
         add("4:protocol-on-%s" % m.decode(), O + hdrs(1, xreq(method=m), END_HEADERS))
     add("4:no-path", O + hdrs(1, xreq(path=None), END_HEADERS))

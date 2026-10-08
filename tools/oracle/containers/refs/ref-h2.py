@@ -61,7 +61,6 @@ import h2.config
 import h2.connection
 import h2.events
 import h2.settings
-import h2.settings
 from h2.connection import ConnectionState
 
 if len(sys.argv) > 1 and sys.argv[1] == "--version":

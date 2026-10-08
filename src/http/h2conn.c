@@ -507,7 +507,8 @@ static GHTTP_Result normalise_limits(GHTTP_H2Limits * dst, const GHTTP_H2Limits 
       || dst->interval_ms == 0
       // Only a server sends SETTINGS_ENABLE_CONNECT_PROTOCOL (checked by the
       // caller, which knows the role); a flag is 0 or 1.
-      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)) {
+      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)
+      || dst->max_protocol_bytes == 0) {
     return GHTTP_ERR_INVALID;
   }
   return GHTTP_OK;
@@ -1601,6 +1602,15 @@ static uint32_t count_local_streams(const GHTTP_H2Conn * c) {
   return n;
 }
 
+GHTTP_H2Role ghttp_h2_conn_role(const GHTTP_H2Conn * c) {
+  return c ? c->role : GHTTP_H2_CLIENT;
+}
+
+int ghttp_h2_conn_stream_headers_sent(const GHTTP_H2Conn * c, uint32_t id) {
+  const Stream * s = c ? stream_find_const(c, id) : NULL;
+  return s && s->sent_headers;
+}
+
 int ghttp_h2_conn_can_send_extended_connect(const GHTTP_H2Conn * c) {
   return c && c->peer.enable_connect_protocol == 1
       && ghttp_h2_conn_can_open_stream(c);
@@ -1772,6 +1782,11 @@ GHTTP_Result ghttp_h2_conn_send_response(GHTTP_H2Conn * c, uint32_t stream_id,
   }
   if (!interim) {
     s->sent_headers = true;
+    if (s->connect && (status < 200 || status > 299)) {
+      // A refused CONNECT is not a tunnel: what the client sends after it is
+      // message content, as at a client whose CONNECT was refused.
+      s->mode = GHTTP_H2_STREAM_MESSAGE;
+    }
   }
   if (end_stream) {
     s->local_ended = true;

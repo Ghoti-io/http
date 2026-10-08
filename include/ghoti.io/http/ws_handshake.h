@@ -390,7 +390,15 @@ GHTTP_API void ghttp_ws_client_handshake_destroy(GHTTP_WsClientHandshake * hands
  * `Sec-WebSocket-Key`, so nothing is drawn from the kernel generator and
  * @c options->nonce is ignored. Send it with ghttp_h2_conn_send_request() (the
  * `:scheme` is that function's argument) after the server's SETTINGS have
- * enabled the protocol; finish with ghttp_ws_client_handshake_finish_h2().
+ * enabled the protocol (ghttp_h2_conn_can_send_extended_connect()); finish with
+ * ghttp_ws_client_handshake_finish_h2().
+ *
+ * @return GHTTP_OK; GHTTP_ERR_INVALID for a NULL argument, a missing host, a
+ *   value that cannot be a field, or a target that is not an Extended CONNECT's
+ *   (origin-form or absolute-form: "*" and an authority-form "host:port" are
+ *   refused before @p request is touched); GHTTP_ERR_LIMIT, GHTTP_ERR_OOM. After
+ *   a failure that comes later, @p request is left as a fresh request: GET, "/",
+ *   no fields, no `:protocol`.
  */
 GHTTP_API GHTTP_Result ghttp_ws_client_handshake_create_h2(
     const GHTTP_Allocator * allocator, const GHTTP_WsClientOptions * options,

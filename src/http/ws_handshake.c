@@ -555,8 +555,12 @@ static GHTTP_Result server_handshake(bool h2, const GHTTP_Request * request,
     return refuse(response, result, 431, "Request Header Fields Too Large",
         "the handshake is larger than the limit");
   }
+  const char * method = ghttp_request_method(request);
+  if (!method) {
+    return refuse(response, result, 400, "Bad Request", "the request has no method");
+  }
   if (h2) {
-    if (strcmp(ghttp_request_method(request), "CONNECT") != 0) {
+    if (strcmp(method, "CONNECT") != 0) {
       return refuse(response, result, 405, "Method Not Allowed",
           "the method is not CONNECT");
     }
@@ -566,7 +570,7 @@ static GHTTP_Result server_handshake(bool h2, const GHTTP_Request * request,
           "the :protocol is not websocket");
     }
   } else {
-    if (strcmp(ghttp_request_method(request), "GET") != 0) {
+    if (strcmp(method, "GET") != 0) {
       return refuse(response, result, 405, "Method Not Allowed",
           "the method is not GET");
     }
@@ -805,7 +809,8 @@ GHTTP_Result ghttp_ws_server_handshake_h2(const GHTTP_Request * request,
 
 int ghttp_ws_is_h2_request(const GHTTP_Request * request) {
   const char * protocol = request ? ghttp_request_protocol(request) : NULL;
-  return protocol && strcmp(ghttp_request_method(request), "CONNECT") == 0
+  const char * method = request ? ghttp_request_method(request) : NULL;
+  return protocol && method && strcmp(method, "CONNECT") == 0
       && ghttp_ieq(protocol, strlen(protocol), "websocket");
 }
 
@@ -861,6 +866,17 @@ static GHTTP_Result client_create(bool h2, const GHTTP_Allocator * allocator,
   if ((options->subprotocol_count && !options->subprotocols)
       || (options->extension_count && !options->extensions)) {
     return GHTTP_ERR_INVALID;
+  }
+  if (h2) {
+    // An Extended CONNECT's target is a :path or an absolute-form target that
+    // gives :scheme, :authority and :path; "*" and an authority-form target are
+    // not (ghttp_h2_conn_send_request() would refuse them), so say so before
+    // touching the caller's request.
+    GHTTP_TargetForm form;
+    if (ghttp_target_classify("GET", options->target ? options->target : "/", &form) != GHTTP_OK
+        || (form != GHTTP_TARGET_ORIGIN && form != GHTTP_TARGET_ABSOLUTE)) {
+      return GHTTP_ERR_INVALID;
+    }
   }
   if (!allocator) {
     allocator = ghttp_allocator_default();
@@ -1031,6 +1047,13 @@ static GHTTP_Result client_create(bool h2, const GHTTP_Allocator * allocator,
   }
   if (r != GHTTP_OK) {
     ghttp_ws_client_handshake_destroy(hs);
+    if (h2) {
+      // Leave the caller's request as a fresh one, not half of a handshake.
+      ghttp_headers_clear(h);
+      (void)ghttp_request_set_method(request, "GET");
+      (void)ghttp_request_set_target(request, "/");
+      (void)ghttp_request_set_protocol(request, NULL);
+    }
     return r;
   }
   *out = hs;

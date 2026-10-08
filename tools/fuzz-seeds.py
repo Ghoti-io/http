@@ -146,6 +146,12 @@ def main(root):
     write(w, "small-window.seed", bytes([2, 3, 0x0f]) + b"x" * 91 + bytes([0x8f]) + b"y" * 91 + bytes([0x40]))
     write(w, "small-window-deflate.seed", bytes([3, 4, 0x0e]) + b"abc" * 90 + bytes([0xc0]))
     write(w, "abrupt.seed", bytes([4, 5, 0x03]) + b"abc" + bytes([0x40]))
+    # hostile mode (byte 0 bit 3): the operations are described in fuzz_ws_h2.cpp
+    write(w, "hostile-junk.seed", bytes([8, 7, 0x02]) + b"\x81\x85abcd12345\x00\x01" + bytes([0x12]) + b"\xff" * 18 + bytes([0x60]))
+    write(w, "hostile-half-close.seed", bytes([8, 8, 0x20, 0x71, 0x60]))
+    write(w, "hostile-reset.seed", bytes([8, 9, 0x60, 0x40, 0x61]))
+    write(w, "hostile-reset-late.seed", bytes([8, 10, 0x60, 0x71, 0x51, 0x60]))
+    write(w, "hostile-frame-after-close.seed", bytes([8, 11, 0x71, 0x60]) + bytes([0x02]) + b"\x81\x00" * 5)
     write(w, "ping.seed", bytes([0, 6, 0x35]) + b"ping!" + bytes([0x95]) + b"pong?" + bytes([0x40]))
 
 

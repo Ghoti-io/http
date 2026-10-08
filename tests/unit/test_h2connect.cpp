@@ -1,3 +1,23 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io HTTP.
+ *
+ * Ghoti.io HTTP is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io HTTP is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 /**
  * @file
  *
@@ -650,6 +670,166 @@ TEST(H2ConnectRequestObject, TheProtocolIsPartOfTheRequestLineAndTheH1WriterRefu
   EXPECT_EQ(ghttp_write_request_head(b, r), GHTTP_OK);
   ghttp_buffer_destroy(b);
   ghttp_request_destroy(r);
+}
+
+
+// ---------------------------------------------------------------------------
+// Corners found in review
+// ---------------------------------------------------------------------------
+
+// The request object is reused for every request on a connection: the
+// `:protocol` of one must not survive into the next.
+TEST(H2ConnectRequest, TheProtocolOfOneRequestIsNotTheNextOnesOnTheSameConnection) {
+  Srv o;
+  ASSERT_EQ(o.request(1, ws_request()).size(), 1u);
+  EXPECT_STREQ(ghttp_request_protocol(ghttp_h2_conn_request(o.s.c)), "websocket");
+  EXPECT_EQ(ghttp_ws_is_h2_request(ghttp_h2_conn_request(o.s.c)), 1);
+  ASSERT_EQ(o.request(3, request_list("GET", "/after")).size(), 1u);
+  EXPECT_EQ(ghttp_request_protocol(ghttp_h2_conn_request(o.s.c)), nullptr);
+  EXPECT_EQ(ghttp_ws_is_h2_request(ghttp_h2_conn_request(o.s.c)), 0);
+  ASSERT_EQ(o.request(5, ws_request()).size(), 1u);
+  ASSERT_EQ(o.request(7, {{":method", "CONNECT"}, {":authority", "h:443"}}).size(), 1u);
+  EXPECT_EQ(ghttp_request_protocol(ghttp_h2_conn_request(o.s.c)), nullptr)
+      << "a plain CONNECT after an Extended one";
+  EXPECT_EQ(ghttp_ws_is_h2_request(ghttp_h2_conn_request(o.s.c)), 0);
+}
+
+// ghttp_request_assign is what the HTTP/1.1 parser (and the h2 reader) uses to
+// replace the request line.
+extern "C" GHTTP_Result ghttp_request_assign(GHTTP_Request * request, const char * method,
+    size_t method_len, const char * target, size_t target_len, int minor);
+
+TEST(H2ConnectRequestObject, ReplacingTheRequestLineClearsTheProtocol) {
+  GHTTP_Request * r;
+  ASSERT_EQ(ghttp_request_create(nullptr, &r), GHTTP_OK);
+  ASSERT_EQ(ghttp_request_set_protocol(r, "websocket"), GHTTP_OK);
+  ASSERT_EQ(ghttp_request_assign(r, "GET", 3, "/x", 2, 1), GHTTP_OK);
+  EXPECT_EQ(ghttp_request_protocol(r), nullptr);
+  ghttp_request_destroy(r);
+  // And the parser, which reuses its request for the next message.
+  GHTTP_Parser * p = nullptr;
+  ASSERT_EQ(ghttp_parser_create(GHTTP_PARSE_REQUEST, nullptr, nullptr, &p), GHTTP_OK);
+  std::string two = "GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n";
+  size_t off = 0;
+  int heads = 0;
+  for (int guard = 0; guard < 20 && off <= two.size(); guard++) {
+    size_t used = 0;
+    GHTTP_Event ev;
+    ASSERT_EQ(ghttp_parser_feed(p, two.data() + off, two.size() - off, &used, &ev), GHTTP_OK);
+    off += used;
+    if (ev == GHTTP_EVENT_HEAD) {
+      GHTTP_Request * req = const_cast<GHTTP_Request *>(ghttp_parser_request(p));
+      ASSERT_NE(req, nullptr);
+      EXPECT_EQ(ghttp_request_protocol(req), nullptr) << "head " << heads;
+      ASSERT_EQ(ghttp_request_set_protocol(req, "websocket"), GHTTP_OK);
+      heads++;
+    }
+    if (ev == GHTTP_EVENT_NEED_MORE) break;
+  }
+  EXPECT_EQ(heads, 2);
+  ghttp_parser_destroy(p);
+}
+
+TEST(H2ConnectTunnel, ARefusedConnectIsNotATunnelAtEitherEnd) {
+  Srv o;
+  ASSERT_EQ(o.request(1, ws_request()).size(), 1u);
+  ASSERT_EQ(o.request(3, ws_request()).size(), 1u);
+  auto reply = [&](uint32_t id, int status) {
+    GHTTP_Response * r;
+    ASSERT_EQ(ghttp_response_create(nullptr, &r), GHTTP_OK);
+    ASSERT_EQ(ghttp_response_set_status(r, status, ""), GHTTP_OK);
+    ASSERT_EQ(ghttp_h2_conn_send_response(o.s.c, id, r, 0), GHTTP_OK);
+    ghttp_response_destroy(r);
+  };
+  GHTTP_H2StreamMode mode;
+  reply(1, 200);
+  ASSERT_EQ(ghttp_h2_conn_stream_mode(o.s.c, 1, &mode), GHTTP_OK);
+  EXPECT_EQ(mode, GHTTP_H2_STREAM_TUNNEL);
+  reply(3, 426);
+  ASSERT_EQ(ghttp_h2_conn_stream_mode(o.s.c, 3, &mode), GHTTP_OK);
+  EXPECT_EQ(mode, GHTTP_H2_STREAM_MESSAGE) << "a refused CONNECT is a message again";
+  // At a client: the refusal never reports `tunnel`.
+  GHTTP_H2Limits sl = server_limits();
+  Side c(GHTTP_H2_CLIENT);
+  Side s(GHTTP_H2_SERVER, &sl);
+  pump(c, s);
+  GHTTP_Request * q = ws_connect_request();
+  uint32_t id = 0;
+  ASSERT_EQ(ghttp_h2_conn_send_request(c.c, q, "https", 0, &id), GHTTP_OK);
+  ghttp_request_destroy(q);
+  pump(c, s);
+  GHTTP_Response * r;
+  ASSERT_EQ(ghttp_response_create(nullptr, &r), GHTTP_OK);
+  ASSERT_EQ(ghttp_response_set_status(r, 426, ""), GHTTP_OK);
+  ASSERT_EQ(ghttp_h2_conn_send_response(s.c, id, r, 1), GHTTP_OK);
+  ghttp_response_destroy(r);
+  std::string wire = s.unsent();
+  GHTTP_H2Event ev;
+  size_t used = 0;
+  ASSERT_EQ(ghttp_h2_conn_feed(c.c, wire.data(), wire.size(), &used, &ev), GHTTP_OK);
+  while (ev.type != GHTTP_H2_EVENT_HEADERS) {
+    size_t u2 = 0;
+    std::string rest = wire.substr(used);
+    ASSERT_EQ(ghttp_h2_conn_feed(c.c, rest.data(), rest.size(), &u2, &ev), GHTTP_OK);
+    used += u2;
+    ASSERT_NE(ev.type, GHTTP_H2_EVENT_NEED_MORE);
+  }
+  EXPECT_EQ(ev.tunnel, 0);
+}
+
+TEST(H2ConnectTunnel, AnEmptyFinalFrameFromANullPointerIsAcceptedAndWritesNoGarbage) {
+  Srv o;
+  ASSERT_EQ(o.request(1, ws_request()).size(), 1u);
+  GHTTP_Response * r;
+  ASSERT_EQ(ghttp_response_create(nullptr, &r), GHTTP_OK);
+  ASSERT_EQ(ghttp_response_set_status(r, 200, ""), GHTTP_OK);
+  ASSERT_EQ(ghttp_h2_conn_send_response(o.s.c, 1, r, 0), GHTTP_OK);
+  ghttp_response_destroy(r);
+  o.wrote();
+  size_t acc = 99;
+  // NULL with a length of 0: no pointer arithmetic on it (the sanitizers see this).
+  ASSERT_EQ(ghttp_h2_conn_send_data(o.s.c, 1, nullptr, 0, 1, &acc), GHTTP_OK);
+  EXPECT_EQ(acc, 0u);
+  auto fs = o.wrote();
+  ASSERT_EQ(fs.size(), 1u);
+  EXPECT_EQ(fs[0].type, GHTTP_H2_DATA);
+  EXPECT_EQ(fs[0].flags & END_STREAM, END_STREAM);
+  EXPECT_TRUE(fs[0].payload.empty());
+}
+
+TEST(H2ConnectLimits, TheNewLimitsAreValidatedLikeTheirNeighbours) {
+  GHTTP_H2Conn * c = nullptr;
+  GHTTP_H2Limits l = limits();
+  l.max_protocol_bytes = 0;
+  EXPECT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_ERR_INVALID);
+  EXPECT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_CLIENT, &l, &c), GHTTP_ERR_INVALID);
+  l = limits();
+  for (int bad : {2, -1, 1000}) {
+    l.enable_connect_protocol = bad;
+    EXPECT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_ERR_INVALID) << bad;
+  }
+  l.enable_connect_protocol = 1;
+  l.max_protocol_bytes = 1;
+  ASSERT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_OK);
+  ghttp_h2_conn_destroy(c);
+}
+
+TEST(H2ConnectLimits, ACallerBuiltBeforeTheNewFieldsLeavesThemAtTheDefaults) {
+  // The size field gates what is read: a caller whose struct ends before the
+  // new members (an older build) cannot have meant them.
+  GHTTP_H2Limits l = limits();
+  l.size = offsetof(GHTTP_H2Limits, enable_connect_protocol);
+  l.enable_connect_protocol = 1;  // beyond the size it declared
+  l.max_protocol_bytes = 0;
+  GHTTP_H2Conn * c = nullptr;
+  ASSERT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_OK);
+  GHTTP_H2Settings local;
+  ghttp_h2_conn_local_settings(c, &local);
+  EXPECT_EQ(local.enable_connect_protocol, 0u);
+  ghttp_h2_conn_destroy(c);
+  // And the new members took their room from the reserved ones.
+  static_assert(offsetof(GHTTP_H2Limits, manual_flow_control) < offsetof(GHTTP_H2Limits, enable_connect_protocol),
+      "the new limits come after the old members");
 }
 
 int main(int argc, char ** argv) {

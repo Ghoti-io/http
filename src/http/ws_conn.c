@@ -348,6 +348,14 @@ GHTTP_Result ghttp_ws_conn_error(
   return c->failed;
 }
 
+GHTTP_Result ghttp_ws_conn_role(const GHTTP_WsConn * c, GHTTP_WsRole * role) {
+  if (!c || !role) {
+    return GHTTP_ERR_INVALID;
+  }
+  *role = c->role;
+  return GHTTP_OK;
+}
+
 GHTTP_WsState ghttp_ws_conn_state(const GHTTP_WsConn * c) {
   if (!c || c->failed != GHTTP_OK) {
     return GHTTP_WS_STATE_FAILED;

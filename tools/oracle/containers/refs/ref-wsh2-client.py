@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-3.0-only
+#
+# Copyright (C) 2026 Corey Pennycuff
+#
+# This file is part of Ghoti.io HTTP.
+#
+# Ghoti.io HTTP is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License version 3 as
+# published by the Free Software Foundation.
+#
+# Ghoti.io HTTP is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+# License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """A WebSocket client over HTTP/2 (RFC 8441): h2 and websockets, as the reference.
 
     ref-wsh2-client.py [--deflate] SIZE...
@@ -25,9 +42,14 @@ if len(sys.argv) > 1 and sys.argv[1] == "--version":
     sys.exit(0)
 
 
-def canned_response(extensions):
+def canned_response(extensions, subprotocol):
+    # Only what the server said travels into the canned response: the key's accept
+    # value is the RFC's (RFC 8441 has none), and the subprotocol and the
+    # extensions are the h2 response's own.
     lines = ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade",
-             "Sec-WebSocket-Accept: %s" % C.RFC_ACCEPT, "Sec-WebSocket-Protocol: chat"]
+             "Sec-WebSocket-Accept: %s" % C.RFC_ACCEPT]
+    if subprotocol:
+        lines.append("Sec-WebSocket-Protocol: %s" % subprotocol)
     if extensions:
         lines.append("Sec-WebSocket-Extensions: %s" % extensions)
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
@@ -94,6 +116,10 @@ def main(argv):
                         C.log("the response carries", name)
                         return 1
                 exts = hd.get("sec-websocket-extensions")
+                if hd.get("sec-websocket-protocol") != "chat":
+                    C.log("the server did not echo the subprotocol chosen from the offer: %r"
+                          % (hd.get("sec-websocket-protocol"),))
+                    return 1
                 factories = [C.ClientPerMessageDeflateFactory()] if deflate else None
                 proto = C.ClientProtocol(C.parse_uri("ws://server.example.com/chat"),
                                          max_size=C.MAX_SIZE, extensions=factories,
@@ -102,7 +128,7 @@ def main(argv):
                 proto.key = C.RFC_KEY
                 proto.send_request(request)
                 proto.data_to_send()
-                proto.receive_data(canned_response(exts))
+                proto.receive_data(canned_response(exts, hd.get("sec-websocket-protocol")))
                 proto.events_received()
                 proto.data_to_send()
                 if proto.state is not C.OPEN:

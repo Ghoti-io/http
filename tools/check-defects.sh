@@ -552,12 +552,14 @@ plant ws-h2-refusal-carries-connection src/http/ws_handshake.c testWs_h2 \
 
 plant ws-h2-abrupt-end-not-1006 src/http/ws_h2.c testWs_h2 \
   'WsH2EndToEnd.AnEndStreamBeforeTheCloseIsAnAbnormalClosure1006' \
-  '  } else if (a->remote_ended) {
-    s->state = GHTTP_WS_H2_ABNORMAL;
-    s->code = 1006;' \
-  '  } else if (a->remote_ended) {
-    s->state = GHTTP_WS_H2_CLOSED;
-    s->code = 0;'
+  '    s->state = GHTTP_WS_H2_ABNORMAL;
+    s->code = 1006;
+  } else {
+    s->state = GHTTP_WS_H2_OPEN;' \
+  '    s->state = GHTTP_WS_H2_CLOSED;
+    s->code = 0;
+  } else {
+    s->state = GHTTP_WS_H2_OPEN;'
 
 plant ws-h2-no-end-stream-after-close src/http/ws_h2.c testWs_h2 \
   'WsH2EndToEnd.TheClosingHandshakeEndsBothSidesCleanlyAndTheStreamsAreGone' \
@@ -566,9 +568,145 @@ plant ws-h2-no-end-stream-after-close src/http/ws_h2.c testWs_h2 \
 
 plant ws-h2-reset-not-reported src/http/ws_h2.c testWs_h2 \
   'WsH2EndToEnd.AResetMidMessageIsAbnormalWithTheCodeReported' \
-  '        a->reset = true;
-        a->reset_code = ev->error_code;' \
-  '        a->reset_code = ev->error_code;'
+  'static void stream_gone(GHTTP_WsH2 * a, uint32_t code) {
+  a->reset = true;' \
+  'static void stream_gone(GHTTP_WsH2 * a, uint32_t code) {'
+
+# Extended CONNECT, the review round: the branches and mappings a first pass of
+# plants left unguarded.
+plant h2-protocol-second-token-unchecked src/http/util.c testH2connect \
+  'H2ConnectRequest.EachMalformedFormIsAStreamErrorNotAConnectionError' \
+  '  return ghttp_is_token(s, first) && ghttp_is_token(slash + 1, n - first - 1);' \
+  '  return ghttp_is_token(s, first);'
+
+plant h2-client-may-enable-connect-protocol src/http/h2conn.c testH2connect \
+  'H2ConnectSetting.AClientCannotEnableItAndTheLimitIsAFlag' \
+  '  if (r == GHTTP_OK && role == GHTTP_H2_CLIENT && c->limits.enable_connect_protocol) {' \
+  '  if (r == GHTTP_OK && role == GHTTP_H2_CLIENT && c->limits.enable_connect_protocol && 0) {'
+
+plant h2-protocol-limit-maps-to-the-wrong-error src/http/h2conn.c testH2connect \
+  'H2ConnectRequest.AHugeProtocolIsStoppedAtItsLimit' \
+  '    if (r == GHTTP_ERR_LIMIT) {
+      return stream_error(c, id, GHTTP_H2_ENHANCE_YOUR_CALM, HOW_SENT_RST);' \
+  '    if (r == GHTTP_ERR_LIMIT) {
+      return stream_error(c, id, GHTTP_H2_PROTOCOL_ERROR, HOW_SENT_RST);'
+
+plant h2-refused-connect-stays-a-tunnel src/http/h2conn.c testH2connect \
+  'H2ConnectTunnel.ARefusedConnectIsNotATunnelAtEitherEnd' \
+  '    if (s->connect && (status < 200 || status > 299)) {' \
+  '    if (s->connect && (status < 200 || status > 299) && 0) {'
+
+plant h2-protocol-bytes-zero-accepted src/http/h2conn.c testH2connect \
+  'H2ConnectLimits.TheNewLimitsAreValidatedLikeTheirNeighbours' \
+  '      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)
+      || dst->max_protocol_bytes == 0) {' \
+  '      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)) {'
+
+plant h2-connect-flag-not-0-or-1-accepted src/http/h2conn.c testH2connect \
+  'H2ConnectLimits.TheNewLimitsAreValidatedLikeTheirNeighbours' \
+  '      || (dst->enable_connect_protocol != 0 && dst->enable_connect_protocol != 1)
+      || dst->max_protocol_bytes == 0) {' \
+  '      || dst->max_protocol_bytes == 0) {'
+
+plant h2-request-line-keeps-the-protocol src/http/message.c testH2connect \
+  'H2ConnectRequest.TheProtocolOfOneRequestIsNotTheNextOnesOnTheSameConnection' \
+  '  // A new request line is a new request: it has no :protocol until one is set.
+  gcu_allocator_free(r->allocator, r->protocol);
+  r->protocol = NULL;' \
+  '  // A new request line is a new request: it has no :protocol until one is set.'
+
+plant h2-event-does-not-say-tunnel src/http/h2conn.c testH2connect \
+  'H2ConnectRequest.TheEventSaysTunnelAndProtocol' \
+  '    c->ev.tunnel = info.connect;' \
+  '    c->ev.tunnel = 0;'
+
+plant ws-h2-protocol-name-case-sensitive src/http/ws_handshake.c testWs_h2 \
+  'WsH2Handshake.TheProtocolNameIsMatchedIgnoringCase' \
+  '    if (!protocol || !ghttp_ieq(protocol, strlen(protocol), "websocket")) {' \
+  '    if (!protocol || strcmp(protocol, "websocket") != 0) {'
+
+plant ws-h2-is-request-case-sensitive src/http/ws_handshake.c testWs_h2 \
+  'WsH2Handshake.TheProtocolNameIsMatchedIgnoringCase' \
+  '      && ghttp_ieq(protocol, strlen(protocol), "websocket");' \
+  '      && strcmp(protocol, "websocket") == 0;'
+
+plant ws-h2-pump-ends-the-stream-over-held-data src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.HeldOutputIsSentBeforeTheStreamIsEndedWhenThePeerHalfClosed' \
+  '    if (accepted < n) {
+      return GHTTP_OK;  // held back by a window or the output limit; it stays queued
+    }' \
+  '    if (accepted < n) {
+      break;  // PLANTED: on to the end of the stream with data still queued
+    }'
+
+plant ws-h2-end-stream-with-data-ignored src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.AnEndStreamThatCameWithDataTakesEffectOnlyWhenTheDataIsRead' \
+  '        } else {
+          a->pending_end = true;
+        }' \
+  '        } else {
+          a->pending_end = false;
+        }'
+
+plant ws-h2-reset-after-close-undoes-it src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.AResetAfterTheClosingHandshakeCompletedLeavesItClosed' \
+  '  if (st == GHTTP_WS_STATE_CLOSED) {
+    // The closing handshake completed' \
+  '  if (st == GHTTP_WS_STATE_CLOSED && !a->reset) {
+    // The closing handshake completed'
+
+plant ws-h2-connection-failure-not-reported src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.AConnectionErrorTheCallerReportsEndsTheWebSocketAndStopsTheOutput' \
+  '  } else if (a->reset || a->conn_failed != GHTTP_OK) {' \
+  '  } else if (a->reset) {'
+
+plant ws-h2-pump-retries-an-ended-stream src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.AStreamTheApplicationEndedItselfIsNotAnError' \
+  '    if (r == GHTTP_ERR_INVALID) {
+      // The application ended or reset the stream itself' \
+  '    if (r == GHTTP_ERR_INVALID && 0) {
+      // The application ended or reset the stream itself'
+
+plant ws-h2-settings-event-does-not-pump src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.ASettingsWindowGrowthAloneReleasesHeldOutputWithoutAnExplicitPump' \
+  '      // A larger SETTINGS_INITIAL_WINDOW_SIZE opens the window of every stream.
+      return ghttp_ws_h2_pump(a);' \
+  '      // A larger SETTINGS_INITIAL_WINDOW_SIZE opens the window of every stream.
+      return GHTTP_OK;'
+
+plant ws-h2-goaway-below-the-stream-ignored src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.AGoawayBelowTheClientsStreamIsTheSameAndAboveItIsNot' \
+  '      if (ghttp_h2_conn_role(a->h2) == GHTTP_H2_CLIENT && a->stream_id > ev->last_stream_id) {' \
+  '      if (ghttp_h2_conn_role(a->h2) == GHTTP_H2_CLIENT && a->stream_id > ev->last_stream_id && 0) {'
+
+plant ws-h2-create-ignores-the-role src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.CreateRefusesWhatIsNotAnActiveTunnelOfTheRightRoleWithItsHeadersSent' \
+  '      || (ghttp_h2_conn_role(h2) == GHTTP_H2_CLIENT) != (role == GHTTP_WS_CLIENT)
+' \
+  '
+'
+
+plant ws-h2-create-ignores-unsent-headers src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.ACreateBeforeTheServerSentItsResponseIsRefused' \
+  '      || !ghttp_h2_conn_stream_headers_sent(h2, stream_id)) {' \
+  '      || 0) {'
+
+plant ws-h2-second-data-event-accepted src/http/ws_h2.c testWs_h2 \
+  'WsH2Adapter.ASecondDataEventBeforeNextIsRefusedAndTheFirstIsKept' \
+  '      if (ghttp_buffer_size(a->pending) > 0 || a->pending_end) {' \
+  '      if (0) {'
+
+plant ws-h2-absolute-target-refused src/http/ws_handshake.c testWs_h2 \
+  'WsH2ClientHandshake.AnAbsoluteFormTargetGivesSchemeAuthorityAndPath_Rfc8441_4' \
+  '        || (form != GHTTP_TARGET_ORIGIN && form != GHTTP_TARGET_ABSOLUTE)) {' \
+  '        || (form != GHTTP_TARGET_ORIGIN)) {'
+
+plant ws-h2-target-not-checked-up-front src/http/ws_handshake.c testWs_h2 \
+  'WsH2ClientHandshake.AnAsteriskOrAuthorityFormTargetIsInvalidAndTheRequestIsUntouched' \
+  '  if (h2) {
+    // An Extended CONNECT'"'"'s target is a :path' \
+  '  if (0) {
+    // An Extended CONNECT'"'"'s target is a :path'
 
 # The generated HPACK tables are checked against the RFC by a gate of their
 # own, not by a unit test: plant a changed Huffman code in a copy and require
