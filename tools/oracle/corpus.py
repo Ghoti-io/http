@@ -815,7 +815,7 @@ def all_cases(seed=1, count=2500, fuzz_dir=None):
 
 def dump(path, cases):
     """The corpus in http_probe's input format, both ways of feeding it: one
-    line per (case, split). tools/xarch/http.sh and tools/xwin/http.sh run the
+    line per (case, split). suite/tools/xarch/http.sh and suite/tools/xwin/http.sh run the
     probe built for each target over this file."""
     with open(path, "w") as out:
         for c in cases:
