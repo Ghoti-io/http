@@ -34,7 +34,9 @@
  * SETTINGS have said so. Such a stream, like a plain CONNECT, is a
  * GHTTP_H2_STREAM_TUNNEL: see "Tunnels" below. The codec checks the syntax of
  * the `:protocol` and reports it; what it means (`websocket`, for the WebSocket
- * of ws_h2.h) is the application's.
+ * of ws_h2.h) is the application's. The setting is a server's: from a client the
+ * value 1 is a connection error, and the value 0 (which some libraries send in
+ * every first SETTINGS) is ignored.
  *
  * Only the prior-knowledge start (RFC 9113 section 3.3) exists: the client
  * connection preface "PRI * HTTP/2.0", then SETTINGS. The `Upgrade: h2c` path

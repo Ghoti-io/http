@@ -126,13 +126,28 @@ TEST(H2ConnectSetting, AClientCannotEnableItAndTheLimitIsAFlag) {
   EXPECT_EQ(ghttp_h2_conn_create(nullptr, GHTTP_H2_SERVER, &l, &c), GHTTP_ERR_INVALID);
 }
 
-TEST(H2ConnectSetting, AClientThatSendsItIsAProtocolError_Rfc8441_3) {
-  for (uint32_t v : {0u, 1u}) {
-    GHTTP_H2Limits sl = server_limits();
+TEST(H2ConnectSetting, AClientThatSendsOneIsAProtocolError_Rfc8441_3) {
+  GHTTP_H2Limits sl = server_limits();
+  Side s(GHTTP_H2_SERVER, &sl);
+  s.feed(client_open({{GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 1}}));
+  EXPECT_NE(s.result, GHTTP_OK);
+  EXPECT_EQ(goaway_code_of(s.frames()), GHTTP_H2_PROTOCOL_ERROR);
+}
+
+TEST(H2ConnectSetting, AClientThatSendsZeroIsIgnored_Rfc8441_3) {
+  // Python's h2 sends it in every client's first SETTINGS.
+  for (bool enabled : {true, false}) {
+    GHTTP_H2Limits sl = server_limits(enabled);
     Side s(GHTTP_H2_SERVER, &sl);
-    s.feed(client_open({{GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL, v}}));
-    EXPECT_NE(s.result, GHTTP_OK) << v;
-    EXPECT_EQ(goaway_code_of(s.frames()), GHTTP_H2_PROTOCOL_ERROR) << v;
+    s.feed(client_open({{GHTTP_H2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 0}}) + settings_ack());
+    EXPECT_EQ(s.result, GHTTP_OK) << enabled;
+    EXPECT_EQ(s.events, (Events{"SETTINGS", "SETTINGS_ACK"})) << enabled;
+    GHTTP_H2Settings peer;
+    ghttp_h2_conn_peer_settings(s.c, &peer);
+    EXPECT_EQ(peer.enable_connect_protocol, 0u) << "no state change";
+    s.feed(headers(1, Block()(ws_request())));
+    // Whether the request is then accepted is the server's own setting alone.
+    EXPECT_EQ(s.result, GHTTP_OK);
   }
 }
 

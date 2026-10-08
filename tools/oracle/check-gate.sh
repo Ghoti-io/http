@@ -304,10 +304,10 @@ plant_lib h2-accept-protocol-without-authority src/http/h2msg.c \
   'tag=rfc8441-4:no-authority'
 
 plant_lib h2-accept-the-setting-from-a-client src/http/h2conn.c \
-  '      if (c->role == GHTTP_H2_SERVER) {
-        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
-  '      if (c->role == GHTTP_H2_SERVER && 0) {
-        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
+  '        if (v == 1) {
+          return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL = 1");' \
+  '        if (v == 7) {
+          return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL = 1");' \
   'explains nothing'
 
 plant_harness h2-xc-reference-not-told-to-enable-it tools/oracle/diff_h2.py \

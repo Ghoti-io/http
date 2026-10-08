@@ -1139,7 +1139,13 @@ static GHTTP_Result apply_peer_setting(
         return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL is neither 0 nor 1");
       }
       if (c->role == GHTTP_H2_SERVER) {
-        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");
+        // Only a server's setting. A client's 1 claims what it cannot offer;
+        // its 0 is what some libraries (Python h2) put in every first SETTINGS,
+        // says nothing, and is ignored.
+        if (v == 1) {
+          return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL = 1");
+        }
+        break;
       }
       if (v == 0 && c->peer.enable_connect_protocol == 1) {
         return proto(c, "SETTINGS_ENABLE_CONNECT_PROTOCOL changed from 1 to 0");

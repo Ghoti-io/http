@@ -138,6 +138,8 @@ def scenarios(probe):
                   ours(probe, "server"), h2ws("client", *(flag + SIZES))))
         s.append(("websockets+h2 serves, this library is the client, messages of every size%s" % d,
                   h2ws("server"), ours(probe, "client", *(flag + SIZES))))
+    s.append(("this library serves, an unmodified h2 client (its SETTINGS carry ENABLE_CONNECT_PROTOCOL=0), 1 octet",
+              ours(probe, "server"), h2ws("client", "1")))
     s.append(("this library serves an echo tunnel, Go's x/net/http2 is the client (1 MiB)",
               ours(probe, "server", "--raw"), go("client", str(1 << 20))))
     s.append(("Go's x/net/http2 serves an echo tunnel, this library is the client (1 MiB)",

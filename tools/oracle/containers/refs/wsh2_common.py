@@ -82,31 +82,19 @@ class Pipe:
         self.end_after = set()
 
     def start_client(self):
-        """Open the connection as a client, without SETTINGS_ENABLE_CONNECT_PROTOCOL.
+        """Open the connection as a client, as h2 does, unmodified.
 
-        h2 puts every setting it knows in its first SETTINGS frame, this one
-        (value 0) included. RFC 8441 makes it a server's setting and this
-        library, as a server, takes one from a client as a connection error
-        (story 3d, tested and in the differential as a ref-lenient case), so a
-        client that sends it cannot be interoperated with by design. The
-        driver therefore removes that one entry from the bytes h2 produced:
-        the only edit, and it is of the first frame only.
+        h2 puts every setting it knows in its first SETTINGS frame, including
+        ENABLE_CONNECT_PROTOCOL with the value 0. RFC 8441 makes it a server's
+        setting; this library, as a server, ignores a client's 0 (and refuses a
+        1), so the bytes go out as h2 wrote them. The driver checks that the
+        entry is there, so that the scenario is the one it claims to be.
         """
         self.c.initiate_connection()
         data = self.c.data_to_send()
-        out = bytearray(data[:24])  # the connection preface
-        off = 24
-        while off + 9 <= len(data):
-            length = int.from_bytes(data[off:off + 3], "big")
-            ftype, flags = data[off + 3], data[off + 4]
-            payload = data[off + 9:off + 9 + length]
-            if ftype == 4 and not flags & 1:
-                kept = b"".join(payload[i:i + 6] for i in range(0, len(payload), 6)
-                                if int.from_bytes(payload[i:i + 2], "big") != 8)
-                payload = kept
-            out += len(payload).to_bytes(3, "big") + data[off + 3:off + 9] + payload
-            off += 9 + length
-        self.out.write(bytes(out))
+        if b"\x00\x08\x00\x00\x00\x00" not in data:
+            raise SystemExit("h2 did not send ENABLE_CONNECT_PROTOCOL=0: the scenario is not what it says")
+        self.out.write(data)
         self.out.flush()
 
     def flush(self):

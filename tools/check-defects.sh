@@ -447,11 +447,11 @@ plant ws-bytes-after-close-not-refused src/http/ws_conn.c testWs_conn \
 # tunnel that ignores END_STREAM, a key accepted over HTTP/2 - and the rest of
 # the rules RFC 8441 adds, each one condition removed.
 plant h2-connect-setting-accepted-from-client src/http/h2conn.c testH2connect \
-  'H2ConnectSetting.AClientThatSendsItIsAProtocolError_Rfc8441_3' \
-  '      if (c->role == GHTTP_H2_SERVER) {
-        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");' \
-  '      if (c->role == GHTTP_H2_SERVER && 0) {
-        return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL");'
+  'H2ConnectSetting.AClientThatSendsOneIsAProtocolError_Rfc8441_3' \
+  '        if (v == 1) {
+          return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL = 1");' \
+  '        if (v == 7) {
+          return proto(c, "a client sent SETTINGS_ENABLE_CONNECT_PROTOCOL = 1");'
 
 plant h2-connect-setting-above-one-accepted src/http/h2conn.c testH2connect \
   'H2ConnectSetting.AValueAboveOneIsAProtocolError_Rfc8441_3' \
