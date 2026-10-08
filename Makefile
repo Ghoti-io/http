@@ -1125,16 +1125,29 @@ oracle-version: ## Print which references would answer, and fail if any would no
 
 check-oracle: ## Fail unless every disagreement with the references is explained (HTTP/1.1, HTTP/2 and WebSocket)
 ifeq ($(OS_NAME), Linux)
+# The probes compile here. The reference containers do not start here: the
+# build container records the gate, and install.sh runs it on the host.
+# GHOTI_ORACLE_REPLAY drops the probes so that host make does not compile
+# them again with the host compiler.
+ifeq ($(GHOTI_ORACLE_REPLAY),1)
+check-oracle:
+else
 check-oracle: $(HTTP_PROBE) $(H2_PROBE) $(WS_PROBE)
-	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
-		python3 $(ORACLE)/oracle_run.py llhttp,h11,gohttp -- \
-		python3 $(ORACLE)/diff.py --probe $(HTTP_PROBE) $(ORACLE_ARGS)
-	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
-		python3 $(ORACLE)/oracle_run.py nghttp2,h2,gox2 -- \
-		python3 $(ORACLE)/diff_h2.py --probe $(H2_PROBE) $(ORACLE_H2_ARGS)
-	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
-		python3 $(ORACLE)/oracle_run.py wsproto,websockets,gows -- \
-		python3 $(ORACLE)/diff_ws.py --probe $(WS_PROBE) $(ORACLE_WS_ARGS)
+endif
+	@set -e; \
+	if [ -n "$$GHOTI_BUILD_CONTAINER" ]; then \
+		printf '%s\n' 'http check-oracle' >> "$$GHOTI_ORACLE_GATES"; \
+	else \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+			python3 $(ORACLE)/oracle_run.py llhttp,h11,gohttp -- \
+			python3 $(ORACLE)/diff.py --probe $(HTTP_PROBE) $(ORACLE_ARGS); \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+			python3 $(ORACLE)/oracle_run.py nghttp2,h2,gox2 -- \
+			python3 $(ORACLE)/diff_h2.py --probe $(H2_PROBE) $(ORACLE_H2_ARGS); \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" GHOTI_ORACLE_REQUIRED=1 \
+			python3 $(ORACLE)/oracle_run.py wsproto,websockets,gows -- \
+			python3 $(ORACLE)/diff_ws.py --probe $(WS_PROBE) $(ORACLE_WS_ARGS); \
+	fi
 else
 # No probe is built: it is POSIX C, and the references are containers.
 	@printf "check-oracle: skipped (Linux only)\n"

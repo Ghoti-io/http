@@ -646,7 +646,10 @@ static void run_hs(const char * id, const char * arg, const unsigned char * data
 static void run_hc(const char * id, const char * arg, const unsigned char * data, size_t len) {
   Spec spec;
   parse_spec(arg, &spec);
-  static const uint8_t NONCE[16] = "the sample nonce";  // the RFC 6455 section 1.3 key
+  // 16 bytes, the RFC 6455 section 1.3 key. A string literal is 17 with the
+  // NUL, which GCC 16 rejects under -Werror=unterminated-string-initialization.
+  static const uint8_t NONCE[16] = {
+      't', 'h', 'e', ' ', 's', 'a', 'm', 'p', 'l', 'e', ' ', 'n', 'o', 'n', 'c', 'e'};
   GHTTP_WsClientOptions opt;
   ghttp_ws_client_options_default(&opt);
   GHTTP_WsLimits lim;
