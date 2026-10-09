@@ -25,7 +25,7 @@ MAKE_CMD="${1:?usage: check-defects.sh <make> <build-dir> [make args]}"
 BUILD_DIR="${2:?usage: check-defects.sh <make> <build-dir> [make args]}"
 shift 2
 # Kept in a variable: inside a function "$@" is the function's own arguments.
-MARGS="-j${GHOTI_CHECK_JOBS:-$(nproc 2>/dev/null || echo 4)} $*"
+MARGS="-j${GHOTI_CHECK_JOBS:-$(n=$(nproc 2>/dev/null || echo 4); [ "$n" -gt 4 ] && n=4; echo "$n")} $*"
 
 # The parent make's flags (a jobserver whose descriptors this shell does not
 # have, -j, variable overrides) would only confuse the nested makes; what they

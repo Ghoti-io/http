@@ -27,7 +27,7 @@ set -u
 MAKE_CMD="${1:?usage: check-gate.sh <make> <build-dir> [make args]}"
 BUILD_DIR="${2:?usage: check-gate.sh <make> <build-dir> [make args]}"
 shift 2
-MARGS="-j${GHOTI_CHECK_JOBS:-$(nproc 2>/dev/null || echo 4)} $*"
+MARGS="-j${GHOTI_CHECK_JOBS:-$(n=$(nproc 2>/dev/null || echo 4); [ "$n" -gt 4 ] && n=4; echo "$n")} $*"
 unset MAKEFLAGS MFLAGS
 
 ROOT=$(pwd)
