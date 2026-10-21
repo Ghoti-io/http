@@ -623,8 +623,8 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 #
 # So ask the compiler instead of the flag list: compile a violation with the
 # real $(CFLAGS) and require the diagnostic. That reads the level the command
-# line resolves to, which no review of the spelling can do. The design is the
-# chron session's.
+# line resolves to, which no review of the spelling can do. The design is
+# chron's.
 #
 # The probe pins the level at exactly 1. Measured on it: level 1 reports it,
 # and levels 0, 2 and 3 are all silent.
@@ -643,8 +643,8 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 # Written the obvious way, `*(int *)&local`, this gate would pass with the
 # warning at level 3 and certify nothing - row four is reported at every
 # level from 1 up. A later tidy-up that "simplifies" the probe therefore
-# silently removes the only thing it measures. The chron session hit this as
-# a live near-miss in their own control. Measured here rather than argued:
+# silently removes the only thing it measures. chron hit this as
+# a live near-miss in its own control. Measured here rather than argued:
 # with the probe rewritten as `*(int *)&l`, `make
 # EXTRA_CFLAGS=-Wstrict-aliasing=3 check-aliasing` exits 0 - the one case the
 # gate exists to catch, passing green.
@@ -667,7 +667,7 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 # second row - a known object through a variable. The first row is no use as a
 # probe at all, since it fires at every level from 1 up. Change the probe if
 # the level ever changes, or the gate silently stops measuring. Axes isolated
-# by the chron and image sessions, reproduced here.
+# in chron and image, reproduced here.
 #
 # Two further limits bound what a green run may be said to mean.
 # Level 3 is not blind in general - it catches row four - so this library's
@@ -676,7 +676,7 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 # had, eleven times. And nothing catches row five at any level, including 1:
 # a clean run here is not evidence about punning laundered through a void *
 # variable, which is the spelling real code reaches for most readily.
-# Enumerated by the chron session, reproduced here.
+# Enumerated in chron, reproduced here.
 #
 # So a silent probe has three different causes and they want opposite fixes,
 # which is why the failure branch *measures* the cause rather than naming the
@@ -702,7 +702,7 @@ check-aliasing: ## Fail if the strict-aliasing warning is not actually armed
 # exits 1 and prints nothing, and a flag string gcc rejects produces the same
 # empty output from a zero-length variable - so the exit status and a
 # non-empty level are both checked before the number is believed. That trap
-# is the chron session's, hit twice in one hour from opposite directions.
+# is chron's, hit twice in one hour from opposite directions.
 #
 # The clean file is the control and it does two jobs. It must compile *and* be
 # silent: if both files failed for an unrelated reason - a bad -I, a missing

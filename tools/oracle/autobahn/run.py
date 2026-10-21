@@ -89,7 +89,7 @@ INFORMATIONAL of 433). The server direction passed 4 of 12 runs; in the others
 log lines of about 445) without writing index.json, so the run FAILS with "the
 suite wrote no index.json" and never reports a wrong answer. Measured: the
 echo server is alive, the container's exit code is 0 and OOMKilled is false, the
-report directory's location (/tmp or not) does not matter, memcap and a manual
+report directory's location (/tmp or not) does not matter, a memory cap and a manual
 `podman run` against a standalone server behave the same, and the cases that
 were run all behaved as expected. Not explained; a run that passes is complete.
 
